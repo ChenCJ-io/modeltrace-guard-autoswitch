@@ -107,7 +107,7 @@ test('weak evidence, wrong route, missing retries and stale route versions canno
   }
 });
 
-test('one verified fallback changes only the route and retains thread, history, and original work', () => {
+test('one verified fallback stops monitoring while retaining its route, thread, history, and original work', () => {
   const state = evidenceState(), originalSession = state.session, history = structuredClone(state.samples);
   assert.equal(queueAutoSwitch(state, 100), true);
   assert.match(controlContext(state, '/tmp/fixture'), /authorized one automatic/);
@@ -123,6 +123,10 @@ test('one verified fallback changes only the route and retains thread, history, 
   finishVerification(state, canary(state), checkpoint, 130);
   assert.equal(state.taskHalt, null); assert.equal(state.autoSwitch.phase, 'switched');
   assert.equal(state.autoSwitch.route, 'fallback'); assert.equal(state.autoSwitch.revision, 2);
+  assert.equal(state.enabled, false); assert.equal(state.autoSwitch.enabled, false);
+  assert.equal(state.monitoringStoppedReason, 'personal_route');
+  assert.equal(state.pending, null); assert.equal(state.forceProbe, false); assert.equal(state.nextTools, null);
+  assert.equal(state.missed, 0, 'a successful canary is not abandoned when monitoring stops');
   assert.equal(state.session, originalSession); assert.deepEqual(state.samples, history);
   assert.equal(queueAutoSwitch(state, 140), false, 'no recursive failover');
 });

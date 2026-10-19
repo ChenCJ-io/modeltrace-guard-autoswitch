@@ -1,6 +1,6 @@
 # ModelTrace Guard Autoswitch
 
-基于 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork，在原有 Codex 指纹监测上增加**按会话授权、验证后恢复的单向路由切换**。上游作者 xqy2006；fork 扩展由 ChenCJ-io 维护。版本 `0.2.0`，来源与许可证见 [UPSTREAM.md](docs/UPSTREAM.md)。
+基于 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork，在原有 Codex 指纹监测上增加**按会话授权、验证后恢复的单向路由切换**。上游作者 xqy2006；fork 扩展由 ChenCJ-io 维护。版本 `0.2.1`，来源与许可证见 [UPSTREAM.md](docs/UPSTREAM.md)。
 
 ## 原理
 
@@ -12,7 +12,7 @@
 
 网关为新建、未启用策略的会话选择 Official。明确启用自动切换后，网关为该会话把模型映射成 `ccs-key/model`，由 CCSwitch 选中 API2。插件不读取凭据存储、不解析或保存登录 token；作为 HTTP 中间层，网关会接收认证头，并只转发给本机 CCSwitch。它不修改 CCSwitch 数据库或全局 provider。
 
-监测沿用上游的原生冻结快照：首次指纹异常立即告知并暂停工作，再从同一快照独立复测。只有首检与至少 3 次有效复测全部为强差异信号（`difference_signal` 或 `repeated_difference`）、每次源路由证据匹配且会话已授权，才尝试 Official。弱排序分歧仍走原有告警、复测和停工流程，不触发自动切换。备用路由的 canary 必须同时具有真实 `completed` 回执和兼容指纹，成功后才解除暂停并继续原任务；失败保留停工状态。一次授权执行一次单向切换，不会自动切回 API2。未授权会话保留上游停工行为。
+监测沿用上游的原生冻结快照：首次指纹异常立即告知并暂停工作，再从同一快照独立复测。只有首检与至少 3 次有效复测全部为强差异信号（`difference_signal` 或 `repeated_difference`）、每次源路由证据匹配且会话已授权，才尝试 Official。弱排序分歧仍走原有告警、复测和停工流程，不触发自动切换。备用路由的 canary 必须同时具有真实 `completed` 回执和兼容指纹，成功后才解除暂停并继续原任务，同时停止该会话的监测和自动切换，清空后续探针排期；失败保留停工状态。一次授权执行一次单向切换，不会自动切回 API2。未授权会话保留上游停工行为。
 
 ## 安装与接入
 
@@ -52,7 +52,17 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs status --session SESSI
 
 `enable` 要求该 thread 已有网关回执且原生 `account/read` 返回 ChatGPT 认证，再为它开启监测和 API2 源路由。授权包含“满足切换条件并验证成功后继续原任务”，无须每次重新请求许可。暂停期间仍需报告异常；canary 失败不能靠普通 `resume` 命令自动绕过。
 
-`disable --session SESSION_UUID` 仅关闭自动切换策略，保留已选路由、已有 halt 和持续监测；停止监测使用 `guard.mjs stop`。`gateway-status` 查看代理状态；`gateway-stop` 会停止代理，依赖它的会话后续请求将无法通过，直到网关重新启动。
+`disable --session SESSION_UUID` 同时关闭自动切换与监测，取消排队中的探针和复测，保留已选路由、已有 halt 与历史证据。`gateway-status` 查看代理状态；`gateway-stop` 会停止代理，依赖它的会话后续请求将无法通过，直到网关重新启动。
+
+个人订阅的默认行为：
+
+- 初始使用 Official、未显式 `enable`：不启动检测，不产生额外探针推理。
+- 公司切入 Official：只运行切换前的一次备用验证，通过后停止自动探针；重开同一会话不会重新开启。
+- 安装本身不启用任何会话；不同会话和不同 Codex 配置分别管理。
+- 未开启监测且没有待处理告警、暂停或清理时，逐工具 hook 仅读取状态，省去锁和写盘；本地 hook 进程仍有少量开销。
+- 手动诊断仍可通过明确请求 `guard.mjs start` 开启，自动流程不会代为重启个人检测。
+
+v0.2.0 已经切到个人但仍在监测的记录，会在升级后的第一次 hook 或状态写入时自动停止排期；既有 halt 和历史保留。`status` 分别返回 `monitoringEnabled`、`monitoringStoppedReason` 和路由策略，避免把“停止检测”误解为“停止代理”。
 
 数据默认独立保存在 `${CODEX_HOME:-~/.codex}/modeltrace-guard-autoswitch`；旧插件的数据目录与监测状态保持独立。本机网关地址含访问 capability，属于本地凭据，不应提交到 Git 或公开分享。
 

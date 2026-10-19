@@ -52,7 +52,7 @@ test('real gateway CLI process starts once, reports metadata only, and shuts dow
   assert.equal((await invoke('gateway-stop')).stopped, false);
 });
 
-test('disable retains the chosen route and halt; halted tasks can call only exact management commands', async t => {
+test('disable stops monitoring but retains the chosen route and halt; only exact management commands bypass the guard', async t => {
   const directory = await mkdtemp(path.join(tmpdir(), 'autoswitch-disable-')), session = randomUUID();
   t.after(() => rm(directory, { recursive: true, force: true }));
   await withState(directory, session, s => {
@@ -60,7 +60,10 @@ test('disable retains the chosen route and halt; halted tasks can call only exac
   });
   const disabled = await runAutoSwitch(['disable', '--data-dir', directory, '--session', session], {});
   assert.equal(disabled.autoSwitch.enabled, false); assert.equal(disabled.autoSwitch.route, 'fallback');
-  assert.equal(disabled.taskHalt.id, 'new-halt'); assert.equal((await readState(directory, session)).enabled, true);
+  assert.equal(disabled.taskHalt.id, 'new-halt'); assert.equal((await readState(directory, session)).enabled, false);
+  assert.equal(disabled.monitoringEnabled, false);
+  const status = await runAutoSwitch(['status', '--data-dir', directory, '--session', session], {});
+  assert.equal(status.monitoringEnabled, false); assert.equal(status.monitoringStoppedReason, 'autoswitch_disabled');
   const entry = path.join(ROOT, 'scripts', 'autoswitch.mjs');
   const allowed = cmd => isControlCommand({ tool_name: 'Bash', tool_input: { command: cmd } });
   assert.equal(allowed(`node '${entry}' disable --session ${session}`), true);

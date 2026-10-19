@@ -26,7 +26,10 @@ async function backgroundNotice(event, directory, session, confirmationId) {
   return withState(directory, session, (state) => {
     if (state.autoSwitch?.noticePending) {
       state.autoSwitch.noticePending = false;
-      return injected(event, 'ModelTrace AutoSwitch: fallback verification completed successfully and this same thread now uses the authorized official route. Tell the user briefly and continue the original task. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.');
+      const monitoring = state.enabled
+        ? 'Diagnostic monitoring is currently enabled again; its probes use the personal subscription. Automatic switching remains stopped.'
+        : 'Automatic monitoring and switching are stopped; no further probes are scheduled on the personal subscription.';
+      return injected(event, `ModelTrace AutoSwitch: fallback verification completed successfully and this same thread now uses the authorized official route. ${monitoring} Tell the user briefly and continue the original task only if it is still requested. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.`);
     }
     const alerts = pendingAlerts(state).filter((alert) => alert.lastDeliveryTurn !== (state.turn || 'no-turn')).slice(0, 5);
     if (alerts.length) {
@@ -56,6 +59,7 @@ export async function handleBackgroundHook(event, directory, env = process.env, 
     || !BACKGROUND_EVENTS.includes(event.hook_event_name)) return {};
   const output = await handleHook(event, directory, undefined, undefined, { background: true });
   const observed = await readState(directory, event.session_id);
+  if (!observed?.enabled && !observed?.taskHalt && !pendingAlerts(observed).length && !observed?.autoSwitch?.noticePending) return output;
   if (observed?.autoSwitch?.phase === 'switch_pending' && !pendingAlerts(observed).length) {
     await withState(directory, event.session_id, state => beginVerification(state, Date.now()), BACKGROUND_STATE_LOCK);
   }
@@ -110,7 +114,8 @@ export async function waitForConfirmation(directory, session, id, { timeoutMs = 
   } while (true);
   return { ...summarize(state, directory), waiting: state.enabled && (state.confirmation.status === 'active' || isRecoveryActive(state)) && !pendingAlerts(state).length,
     notificationContext: notificationContext(state, directory), controlContext: controlContext(state, directory),
-    agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : state.autoSwitch?.phase === 'switched' ? 'autoswitch_verified' : pendingAlerts(state).length ? 'notify_user_now'
+    agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : pendingAlerts(state).length ? 'notify_user_now'
       : state.confirmation.status === 'active' ? 'wait_for_background_retries'
+        : state.autoSwitch?.phase === 'switched' && state.autoSwitch.haltId === id ? 'autoswitch_verified'
         : state.confirmation.status === 'completed' ? 'confirmation_completed' : 'report_coverage_gap' };
 }

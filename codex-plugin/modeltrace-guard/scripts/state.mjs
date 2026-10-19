@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { LANGUAGES } from './prompts.mjs';
 import { compactHistory } from './history.mjs';
 import { removeSnapshot } from './fork-snapshot.mjs';
-import { failAutoSwitch, haltBlocksProbe } from './switch-policy.mjs';
+import { failAutoSwitch, haltBlocksProbe, stopMonitoringOnPersonalRoute } from './switch-policy.mjs';
 export { validateNumbers } from './probe-output.mjs';
 
 export const DEFAULTS = Object.freeze({
@@ -174,6 +174,17 @@ export function abandon(state, now, reason) {
   state.lastOutcome = 'coverage_gap';
 }
 
+export function stopMonitoring(state, now, reason) {
+  abandon(state, now, reason);
+  interruptConfirmation(state, now, reason);
+  state.enabled = false;
+  state.forceProbe = false;
+  state.nextTools = null;
+  state.nextAt = null;
+  state.monitoringStoppedReason = reason;
+  record(state, 'monitoring_stopped', now, { reason });
+}
+
 export function segment(state, now, reason, draw = randomInt) {
   failAutoSwitch(state, now, reason);
   abandon(state, now, reason);
@@ -334,6 +345,9 @@ export async function withState(directory, session, callback, { lockTimeoutMs = 
       delete state.budgetNoticeSent;
       record(state, 'configuration_migrated', Date.now(), { previous, config: { ...config }, previousOutcome });
     }
+    // v0.2.0 kept probing after a successful fallback. Apply the new default
+    // once before any hook can schedule another probe; keep history and halts.
+    stopMonitoringOnPersonalRoute(state, Date.now());
     const result = await callback(state);
     if (state.forkSnapshot && (!state.probeRun || !processAlive(state.probeRun.pid))
       && (!state.enabled || haltBlocksProbe(state) || (state.confirmation?.status !== 'active' && !state.pending))) {

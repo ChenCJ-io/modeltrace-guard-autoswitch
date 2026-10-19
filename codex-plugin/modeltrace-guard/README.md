@@ -1,6 +1,6 @@
 # ModelTrace Guard Autoswitch
 
-此目录是独立 fork 插件（0.2.0）。自动切换的安装、CLI 和接入说明以 [项目 README](../../README.md) 为准；下文保留上游监测原理，安装入口已替换。
+此目录是独立 fork 插件（0.2.1）。自动切换的安装、CLI 和接入说明以 [项目 README](../../README.md) 为准；下文保留上游监测原理，安装入口已替换。自动切入个人并验证成功后会停止探针；`autoswitch.mjs disable` 同时停监测并保留路由，普通 `guard.mjs start` 只用于用户明确要求的诊断。
 
 作者：xqy2006。
 

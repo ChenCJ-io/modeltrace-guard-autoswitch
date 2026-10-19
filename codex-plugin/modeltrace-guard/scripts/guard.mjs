@@ -7,12 +7,12 @@ import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
-import { beginVerification, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
+import { beginVerification, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
 export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
-  interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK,
+  interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK, stopMonitoring,
 } from './state.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -130,6 +130,14 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
   if (event.agent_id || event.parent_session_id) return {};
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
   if (!supported.includes(event.hook_event_name)) return {};
+  if (['PreToolUse', 'PostToolUse', 'Stop'].includes(event.hook_event_name)) {
+    // A settled, disabled monitor needs no per-tool heartbeat/fsync. Keep the
+    // full guard path for alerts, halts, cleanup, verification and upgrades.
+    let observed;
+    try { observed = await readState(directory, event.session_id); } catch { /* Let the normal state/error path handle unreadable evidence. */ }
+    if (observed && !observed.enabled && !observed.taskHalt && !observed.pending && !observed.probeRun && !observed.forkSnapshot
+      && !pendingAlerts(observed).length && !observed.autoSwitch?.noticePending && !needsPersonalMonitoringStop(observed)) return {};
+  }
   return withState(directory, event.session_id, async (state) => {
     const hook = event.hook_event_name;
     state.lastHookAt = now;
@@ -190,6 +198,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     if (!currentTurn && !['PreToolUse', 'PostToolUse'].includes(hook)) return deliver({});
     // Notifications survive stop, compaction and plugin upgrades. Disabling new
     // sampling must not make an already detected discrepancy disappear.
+    if (!state.enabled && hook === 'SessionStart' && ['compact', 'clear', 'resume', 'startup'].includes(event.source)) state.compacting = false;
     if (!state.enabled && hook !== 'Stop') return deliver({});
     if (!state.enabled && !waiting.length) return deliver({});
     const previousCheck = state.lastSampleAt || state.startedAt || state.createdAt;
@@ -406,15 +415,12 @@ export async function run(args, env = process.env, receipt = null) {
     }
     if (command === 'stop') {
       failAutoSwitch(state, now, 'monitoring_stopped');
-      abandon(state, now, 'monitoring_stopped');
-      interruptConfirmation(state, now, 'monitoring_stopped');
-      state.enabled = false;
+      stopMonitoring(state, now, 'monitoring_stopped');
       if (!state.probeRun) { await removeSnapshot(directory, state.forkSnapshot); state.forkSnapshot = null; }
-      record(state, 'monitoring_stopped', now);
       return summarize(state, directory, now);
     }
     if (command === 'configure' && !state.enabled) throw new Error('Monitoring is not active; start it first');
-    if (command === 'start') state.runtimePaused = false;
+    if (command === 'start') { state.runtimePaused = false; state.monitoringStoppedReason = null; }
     if (options.name !== undefined) setTaskName(state, options.name, now);
     state.workspaceName ||= workspaceName(process.cwd());
     // Hooks may have created a disabled record before the plugin was updated.

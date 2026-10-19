@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { mkdir, readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { digest, readState, record, withState, segment, schedule } from './state.mjs';
+import { digest, readState, record, withState, segment, stopMonitoring } from './state.mjs';
 
 const execute = promisify(execFile);
 export const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
@@ -14,6 +14,8 @@ const strong = sample => ['difference_signal', 'repeated_difference'].includes(s
 export const isVerification = state => state?.autoSwitch?.phase === 'verifying' && state.pending?.kind === 'fallback_verification';
 export const isRecoveryActive = state => Boolean(state?.enabled && state.autoSwitch?.enabled && ['switch_pending', 'verifying'].includes(state.autoSwitch.phase));
 export const haltBlocksProbe = state => Boolean(state?.taskHalt && !isVerification(state));
+export const needsPersonalMonitoringStop = state => state?.autoSwitch?.phase === 'switched'
+  && state.autoSwitch.route === 'fallback' && state.autoSwitch.monitoringStoppedAt == null;
 export const configPath = directory => path.join(directory, 'gateway-config.json');
 export const runtimePath = directory => path.join(directory, 'gateway-runtime.json');
 
@@ -188,6 +190,14 @@ export function failAutoSwitch(state, now, reason) {
   record(state, 'autoswitch_failed', now, { reason, haltId: state.autoSwitch.haltId });
 }
 
+export function stopMonitoringOnPersonalRoute(state, now) {
+  if (!needsPersonalMonitoringStop(state)) return false;
+  stopMonitoring(state, now, 'personal_route');
+  state.autoSwitch.enabled = false;
+  state.autoSwitch.monitoringStoppedAt = now;
+  return true;
+}
+
 export function finishVerification(state, sample, checkpoint, now) {
   const p = state.autoSwitch;
   if (checkpoint.kind !== 'fallback_verification') return false;
@@ -201,7 +211,11 @@ export function finishVerification(state, sample, checkpoint, now) {
   p.receipt = { requestId: r.requestId, threadId: r.threadId, finishedAt: r.finishedAt, prediction: sample.prediction };
   record(state, 'autoswitch_verified', now, { haltId: state.taskHalt.id, requestId: r.requestId, sourceProvider: p.sourceProvider, fallbackProvider: p.fallbackProvider });
   state.taskHalt = null;
-  state.epoch++; state.forceProbe = false; schedule(state, now);
+  // This checkpoint already completed successfully; do not count stopping
+  // personal-route monitoring as an abandoned or missed verification.
+  state.pending = null;
+  state.epoch++;
+  stopMonitoringOnPersonalRoute(state, now);
   return true;
 }
 

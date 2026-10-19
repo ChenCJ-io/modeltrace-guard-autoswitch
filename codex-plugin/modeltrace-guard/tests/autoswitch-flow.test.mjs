@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -194,6 +194,9 @@ test('four bound source mismatches queue a fresh fallback canary and wait until 
   assert.equal(current.autoSwitch.phase, 'switched');
   assert.equal(current.autoSwitch.route, 'fallback');
   assert.equal(current.autoSwitch.revision, 2);
+  assert.equal(current.enabled, false); assert.equal(current.autoSwitch.enabled, false);
+  assert.equal(current.monitoringStoppedReason, 'personal_route');
+  assert.equal(current.pending, null); assert.equal(current.nextTools, null); assert.equal(current.forceProbe, false);
   assert.equal(current.taskHalt, null);
   assert.equal(current.probeRun, null);
   assert.equal(current.forkSnapshot, null);
@@ -208,6 +211,22 @@ test('four bound source mismatches queue a fresh fallback canary and wait until 
   await f.request(f.sibling);
   assert.deepEqual(f.upstreamRequests.slice(-2).map(row => [row.threadId, row.route]), [[f.session, 'fallback'], [f.sibling, 'fallback']]);
   assert.equal(await readState(f.directory, f.sibling), null, 'another thread never acquires this policy');
+  // Even a new runtime, user turn or many work completions must not spend
+  // further personal-subscription inference after the one verification.
+  for (const hook of ['SessionStart', 'UserPromptSubmit', 'PreCompact', 'SessionStart']) {
+    await handleBackgroundHook({ session_id: f.session, hook_event_name: hook,
+      source: hook === 'SessionStart' ? 'resume' : undefined, turn_id: 'personal-turn' }, f.directory, {}, {
+      connect: async () => assert.fail('personal monitoring must not open an inference runtime'),
+    });
+  }
+  const bytes = await readFile(sessionPath(f.directory, f.session), 'utf8');
+  for (let i = 0; i < 40; i++) {
+    await handleHook({ session_id: f.session, hook_event_name: 'PreToolUse', tool_name: 'Bash' }, f.directory);
+    assert.deepEqual(await f.background(), {});
+  }
+  assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), bytes, 'settled disabled hooks are read-only');
+  assert.equal((await f.state()).issued, 5); assert.equal(f.forks.length, 5);
+  assert.equal((await f.state()).autoSwitch.route, 'fallback');
 });
 
 test('a completed fallback request with an incompatible fingerprint retains the original halt and source route', async t => {

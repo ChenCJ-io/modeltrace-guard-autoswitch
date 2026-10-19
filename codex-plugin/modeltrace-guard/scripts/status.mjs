@@ -21,6 +21,7 @@ export function summarize(state, directory, now = Date.now()) {
   const fallbackDate = new Date(startedAt).toLocaleString('zh-CN', { hour12: false });
   return {
     enabled: state.enabled, status, fingerprintStatus: outcome, fingerprintDisplayStatus,
+    monitoringStoppedReason: state.monitoringStoppedReason || null,
     taskName: state.taskName || null, codexTaskName: state.codexTaskName || null,
     displayName: state.taskName || state.codexTaskName || `未命名任务${state.workspaceName ? `（${state.workspaceName}）` : ''} · ${fallbackDate}`,
     workspaceName: state.workspaceName || null, startedAt, enabledAt: state.enabledAt || state.startedAt || null,

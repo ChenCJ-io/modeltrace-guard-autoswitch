@@ -7,7 +7,7 @@ import { realpathSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
-import { dataDirectory, readState, withState, abandon } from './state.mjs';
+import { dataDirectory, readState, withState, stopMonitoring } from './state.mjs';
 import { openAppServer, codexExecutable } from './app-server-client.mjs';
 import { sourceSettings } from './fork-snapshot.mjs';
 import { requireTrustedGuard } from './fork-runner.mjs';
@@ -100,7 +100,8 @@ export async function runAutoSwitch(args, env = process.env) {
     configure: 'configure --source-provider ID --fallback-provider ID [--cc-switch-dir PATH] [--port 15722]',
     launch: 'launch [--resume THREAD_ID] (interactive native Codex; no global config edits)',
     enable: 'enable [--session THREAD_ID] (after one successful request through the gateway, using native ChatGPT login)',
-    scope: 'Per thread, one authorized API provider → official fallback. No automatic switch-back.', dataDirectory: directory };
+    disable: 'Stop automatic switching and monitoring; keep the current route and any halt',
+    scope: 'Per thread, one authorized API provider → official fallback. Monitoring stops after verified fallback. No automatic switch-back.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);
   if (command === 'configure') {
     const current = await gatewayStatus(directory).catch(() => ({ running: false }));
@@ -143,14 +144,16 @@ export async function runAutoSwitch(args, env = process.env) {
   if (!UUID.test(session || '') || (env.CODEX_THREAD_ID && session !== env.CODEX_THREAD_ID)) throw new Error('Use the current native thread ID');
   if (command === 'status') {
     const state = await readState(directory, session);
-    return { session, autoSwitch: state?.autoSwitch || null, taskHalt: state?.taskHalt || null,
+    return { session, monitoringEnabled: state?.enabled === true, monitoringStoppedReason: state?.monitoringStoppedReason || null,
+      autoSwitch: state?.autoSwitch || null, taskHalt: state?.taskHalt || null,
       gateway: await gatewayStatus(directory).catch(() => ({ running: false, reason: 'not_configured' })) };
   }
   if (command === 'disable') return withState(directory, session, state => {
-    failAutoSwitch(state, Date.now(), 'autoswitch_disabled');
-    if (state.pending?.kind === 'fallback_verification') abandon(state, Date.now(), 'autoswitch_disabled');
+    const now = Date.now();
+    failAutoSwitch(state, now, 'autoswitch_disabled');
+    stopMonitoring(state, now, 'autoswitch_disabled');
     if (state.autoSwitch) state.autoSwitch.enabled = false;
-    return { autoSwitch: state.autoSwitch || null, routeUnchanged: true, taskHalt: state.taskHalt || null };
+    return { autoSwitch: state.autoSwitch || null, monitoringEnabled: false, routeUnchanged: true, taskHalt: state.taskHalt || null };
   });
   const { bank } = await loadArtifacts();
   const legacy = await readState(env.MODELTRACE_GUARD_DATA || path.join(env.CODEX_HOME || path.join(homedir(), '.codex'), 'modeltrace-guard'), session);

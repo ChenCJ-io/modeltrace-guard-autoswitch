@@ -2,7 +2,7 @@
 
 本仓库是 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork。基线为 upstream `main` 的提交 [`6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2`](https://github.com/xqy2006/ModelTrace/commit/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2)。上游作者为 **xqy2006**，自动切换扩展由 **ChenCJ-io** 维护；本 fork 不代表上游发布或官方 Codex、CCSwitch 项目。
 
-仓库根 [LICENSE](../LICENSE) 与插件附带 LICENSE 保留原始 MIT 许可证及 `Copyright (c) 2026 xqy2006`。插件 manifest 保留上游 author，package contributors 另列 fork 维护者；新包版本为 `0.2.0`。
+仓库根 [LICENSE](../LICENSE) 与插件附带 LICENSE 保留原始 MIT 许可证及 `Copyright (c) 2026 xqy2006`。插件 manifest 保留上游 author，package contributors 另列 fork 维护者；新包版本为 `0.2.1`。
 
 ## 保留内容
 
@@ -18,7 +18,7 @@
 | 项目 | 本 fork |
 | --- | --- |
 | Marketplace | `modeltrace-autoswitch` |
-| 插件名与版本 | `modeltrace-guard-autoswitch` / `0.2.0` |
+| 插件名与版本 | `modeltrace-guard-autoswitch` / `0.2.1` |
 | 源码目录 | 保留 `codex-plugin/modeltrace-guard/`，便于比较与同步上游 |
 | 默认数据目录 | `${CODEX_HOME:-~/.codex}/modeltrace-guard-autoswitch`，与上游目录独立 |
 | 路由范围 | 本机网关按 thread 隔离，只读 CCSwitch 聚合配置 |
@@ -28,6 +28,8 @@
 
 首检与至少 3 次追加复测必须全部为 `difference_signal` 或 `repeated_difference`，才有资格进入切换验证；弱排序分歧只沿用原有告警、复测和停工流程。canary 失败继续停工，成功后不自动切回源路由。已授权策略不要求每次另请许可；未授权会话仍按上游规则等待用户明确恢复。路由证据证明的是本地请求路径与回执关联，指纹仍不能证明供应商内部实际模型身份。
 
-`disable` 仅关闭自动切换策略，不改变已选路由、不解除 halt，也不停止持续监测；`gateway-stop` 则停止代理。网关处理 zstd 请求需要 Node 的 `zstdDecompress`，推荐 Node 24+ 或具备该能力的 22.15+；普通监测仍支持 Node 18+。`launch --resume` 不承诺迁移旧 API2 会话的认证和加密历史。
+`disable` 同时停止自动切换、探针与复测，不改变已选路由、不解除 halt；`gateway-stop` 则停止代理。网关处理 zstd 请求需要 Node 的 `zstdDecompress`，推荐 Node 24+ 或具备该能力的 22.15+；普通监测仍支持 Node 18+。`launch --resume` 不承诺迁移旧 API2 会话的认证和加密历史。
 
 本 fork 的使用与限制以 [根 README](../README.md) 和随插件分发的技能为准。单元测试、协议模拟和评分 parity 只证明对应离线检查通过，不能当作真实供应商端到端验收或准确率评估。发布前须按实际运行环境检查路由、信任、认证、恢复与失败保留停工的行为。
+
+0.2.1：个人备用验证通过后关闭监测与切换策略，保留路由和成功通知；旧版已切入个人的记录首次写入时收敛到停止监测。默认未启用的个人会话不产生探针，空闲的逐工具 hooks 避免重复锁和状态写盘。
