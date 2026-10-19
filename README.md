@@ -1,110 +1,80 @@
-# ModelTrace
+# ModelTrace Guard Autoswitch
 
-ModelTrace 是一个本地运行的主动模型归因工具。它通过三条独立的长整数生成挑战提取输出指纹，在统一候选库中自动判断模型家族和具体版本。
+基于 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork，在原有 Codex 指纹监测上增加**按会话授权、验证后恢复的单向路由切换**。上游作者 xqy2006；fork 扩展由 ChenCJ-io 维护。版本 `0.2.0`，来源与许可证见 [UPSTREAM.md](docs/UPSTREAM.md)。
 
-## 运行
-
-```powershell
-python -m pip install -r requirements.txt
-python start.py
-```
-
-页面地址为 `http://127.0.0.1:7860/`。
-
-## GitHub Pages
-
-`static/index.html` 是不依赖后端的手动测试版本，归因计算和指纹库读取都在浏览器本地完成。仓库附带的 GitHub Actions 会将 `static/` 部署到 GitHub Pages。
-
-## 使用
-
-- **手动测试**：复制三条挑战，分别发送给同一个待测模型，再粘贴每次完整输出。
-- **API 自动测试**：填写 Base URL、API Key 和模型名。程序会自动尝试 OpenAI Chat Completions 与 Anthropic Messages 格式，以三份有效回答为目标完成归因。
-- **指纹库管理**：可以新建指纹库，或通过 API 为现有指纹库添加模型指纹。
-
-API Key 只用于当前页面发起请求，不写入磁盘。
-自动采集会在对应的 `*_reference.jsonl` 中保存实际 user prompt、base prompt、system prompt 和 user prefix；拟合后的 `*_bank.json` 与 `unified_bank.json` 只保存统计指纹和校准参数。
-
-## 指纹方法
-
-### Codex 任务内监测插件
-
-[ModelTrace Guard](codex-plugin/modeltrace-guard/README.md) 按工具调用次数，在后台从原 Codex 任务的冻结快照分别 fork 进行普通检测和异常复测，测后清理临时分支。正常结果静默保存，主任务无需等待检测。用户可调整工具间隔、复测次数（默认 3）、有效期和十种语言，不设每轮或任务累计探针上限。网页仪表盘提供完整历史分页和实时提醒；首次不一致要求智能体告知并暂停工作，额外复测全部不一致时停止原任务并拦截后续受支持的工作工具。探针由 Codex 自身生成并消耗对应推理额度，评分使用插件附带的 ModelTrace 指纹库，页面刷新不消耗模型额度。
-
-安装后在 Codex CLI 的 `/hooks` 中审阅并信任插件 hooks，再在目标任务中开启监测。安装、配置和结果解释详见[插件使用说明](codex-plugin/modeltrace-guard/README.md)。
-
-### 核心算法
-
-所有模型使用同一个全局特征空间、同一套特征与权重：
+## 原理
 
 ```text
-0.75 × 去除环境方向后的 Hellinger 模型中心相似度
-+ 0.25 × 有序块数字序列特征
+原生 Codex（ChatGPT 登录）
+  → 本机网关（按 thread 隔离）
+  → CCSwitch 聚合：OpenAI Official 为默认，API2 为成员
 ```
 
-建库时使用共享环境的平均偏移估计主要干扰方向。归因时先从数字分布和有序特征中投影掉这些方向，再同时与全部模型中心比较。三份回答分别评分后取平均，并使用与查询数量对应的校准温度转换为概率。
+网关为新建、未启用策略的会话选择 Official。明确启用自动切换后，网关为该会话把模型映射成 `ccs-key/model`，由 CCSwitch 选中 API2。插件不读取凭据存储、不解析或保存登录 token；作为 HTTP 中间层，网关会接收认证头，并只转发给本机 CCSwitch。它不修改 CCSwitch 数据库或全局 provider。
 
-具体模型概率由一次全局 softmax 得到，家族概率是该家族下各模型概率之和：
+监测沿用上游的原生冻结快照：首次指纹异常立即告知并暂停工作，再从同一快照独立复测。只有首检与至少 3 次有效复测全部为强差异信号（`difference_signal` 或 `repeated_difference`）、每次源路由证据匹配且会话已授权，才尝试 Official。弱排序分歧仍走原有告警、复测和停工流程，不触发自动切换。备用路由的 canary 必须同时具有真实 `completed` 回执和兼容指纹，成功后才解除暂停并继续原任务；失败保留停工状态。一次授权执行一次单向切换，不会自动切回 API2。未授权会话保留上游停工行为。
 
-```text
-P(具体模型) = softmax(β × 全局模型得分)
-P(模型家族) = Σ P(该家族中的具体模型)
+## 安装与接入
+
+网关建议使用 **Node.js 24+**，或提供 `node:zlib.zstdDecompress` 的 Node.js 22.15+；缺少该函数时，zstd 请求返回 HTTP 415。普通指纹监测的最低要求仍为 Node.js 18+。还需要支持原生 fork 和受信任 hooks 的 Codex 运行时、带 `sha3()` 函数的 `sqlite3` 命令，以及 CCSwitch **4.0.15 聚合模式**。
+
+通过 CCSwitch 界面把 OpenAI Official 设为聚合默认，把 API2 加入聚合成员。配置与网关就绪检查通过 `sqlite3 -readonly` 获取身份标记、监听地址和配置摘要。SQLite 在库内计算摘要，密钥值不会返回给插件；任一 provider 配置变化都会暂停路由。备用只接受连接配置为空、没有保存 API Key 的原生 Official 卡。
+
+在本仓库根目录安装本地插件：
+
+```sh
+npm run build
+codex plugin marketplace add .
+codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch
 ```
 
-结果是当前候选库内、均匀先验下的闭集概率。未收录模型仍会被归到最相似的现有候选。
+在 Codex CLI 的 `/hooks` 中审阅并信任插件 hooks，再加载插件。安装本身不会开启监测或自动切换。不要跳过信任检查；探针只能在无工具的临时 fork 内运行。
 
-## 项目结构
+以下命令在仓库根运行。Provider ID 从自己的 CCSwitch 配置中选择，示例不含任何账户信息：
 
-```text
-app.py              Web 接口
-fingerprint.py      指纹提取与归因
-bank_builder.py     指纹库构建与概率校准
-challenge_suite.py  自动建库挑战
-enrollment.py       API 调用与指纹采集
-rebuild_unified_bank.py  重建统一全局库
-data/               参考数据与指纹库
-static/             页面资源
-templates/          页面模板
+```sh
+AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
+node "$AUTOSWITCH" inspect
+node "$AUTOSWITCH" configure --source-provider API2_ID --fallback-provider OFFICIAL_ID
+node "$AUTOSWITCH" gateway-start
+node "$AUTOSWITCH" launch
+# 尝试重新附着已有会话：node "$AUTOSWITCH" launch --resume SESSION_UUID
 ```
 
-## 指纹库说明
+`configure` 的可选参数为 `--cc-switch-dir PATH`（默认 `~/.cc-switch`）和 `--port N`（默认 `15722`）；上游地址从 CCSwitch 配置读取。`launch` 检查原生 ChatGPT 登录后，仅为此次 Codex 进程传入 `model_provider="openai"` 与本机网关 `openai_base_url`，不修改全局配置。当前会话不能热接入网关；可尝试重新附着同一 thread，或新开会话，无须重启整个应用。`--resume` 不迁移旧 API2 会话的认证与加密历史，不能保证它可继续使用；以实际认证和成功回执检查为准，失败时需新建官方认证会话。
 
-项目中现有指纹库共包含两个模型家族、18 个模型：
+进入接入网关的会话、完成一次原生请求后，明确请求使用本插件开启自动切换，或在已授权的目标会话中运行：
 
-```
-gpt-5.4
-gpt-5.5
-gpt-5.6-luna
-gpt-5.6-terra
-gpt-5.6-sol
-gpt-6-astra
-gpt-6-sol
-gpt-6-luna
-claude-haiku-4-5-20251001
-claude-haiku-5-5
-claude-sonnet-4-6
-claude-sonnet-5
-claude-sonnet-5-5
-claude-opus-4-6
-claude-opus-4-7
-claude-opus-4-8
-claude-opus-5
-claude-opus-5-5
+```sh
+node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs enable --session SESSION_UUID
+node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs status --session SESSION_UUID
 ```
 
-GPT 采集自官方订阅 Codex，Claude 采集自 [OAIPro](https://api.oaipro.com/)。
+`enable` 要求该 thread 已有网关回执且原生 `account/read` 返回 ChatGPT 认证，再为它开启监测和 API2 源路由。授权包含“满足切换条件并验证成功后继续原任务”，无须每次重新请求许可。暂停期间仍需报告异常；canary 失败不能靠普通 `resume` 命令自动绕过。
 
-## 声明
+`disable --session SESSION_UUID` 仅关闭自动切换策略，保留已选路由、已有 halt 和持续监测；停止监测使用 `guard.mjs stop`。`gateway-status` 查看代理状态；`gateway-stop` 会停止代理，依赖它的会话后续请求将无法通过，直到网关重新启动。
 
-测试结果仅供参考，并非判断模型的决定性证据
+数据默认独立保存在 `${CODEX_HOME:-~/.codex}/modeltrace-guard-autoswitch`；旧插件的数据目录与监测状态保持独立。本机网关地址含访问 capability，属于本地凭据，不应提交到 Git 或公开分享。
 
-注意该项目为归因工具，只对指纹库内的模型尽可能去判断属于哪种模型，若待测模型不在指纹库中，得到任何结果都是有可能的
+## 验证
 
-目前已知因系统提示词严重影响模型偏好，在Claude Code中得到的测试结果存在较大偏差，建议不要在Claude Code中测试
+```sh
+npm test
+npm run build
+node -p 'typeof require("node:zlib").zstdDecompress'
+MODELTRACE_PYTHON=python3 npm run check
+node codex-plugin/modeltrace-guard/scripts/guard.mjs doctor
+```
 
-## 致谢
+zstd 检查应输出 `function`。`npm run check` 先检查分发元数据，再运行 `verify-parity.mjs` 比对 Python/JavaScript 评分；`MODELTRACE_PYTHON` 指定的解释器必须已安装 NumPy（可从 `requirements.txt` 安装）。仅有 Node 或另一个 Python 环境中的依赖不足以运行 parity。`doctor --fork true` 另可检查原生 fork、hook 与清理就绪状态，会创建临时分支但不生成探针。离线测试不证明真实供应商路由或自动恢复已在你的环境中成功；接入结果以实际状态、路由证据与 canary 回执为准。
 
-感谢 [hanlinwenyuan/hlwy-ai-checker](https://github.com/hanlinwenyuan/hlwy-ai-checker)。该项目较早将语言模型的随机数字生成偏差用于第三方 API 渠道一致性检查，为 ModelTrace 提供了重要参考。
+## 当前限制
 
+- 指纹结果是候选库内的相似性判断，不能证明真实后端身份或“降智”。同快照与多语言误报率尚未独立校准，重复结果也可能相关。
+- 只支持本期实现的原生 Responses 请求链路；独立的 web search、images 等端点会明确失败，不承诺完整端点兼容。加密历史可能不可移植，无法保证跨路由无损续接。
+- 不能立即取消已经运行的工具或请求；受支持工作工具的暂停在 hook 边界生效。网关需要保持运行，独立会话的原生认证和可用性仍受本地 Codex、CCSwitch 与供应商状态影响。
+- 不自动改 CCSwitch 配置、不自动切回 API2、不迁移旧监测状态。官方默认/API2 成员配置通过 CCSwitch 界面完成；首次 hook 信任仍须按 Codex 原生机制由用户审阅。
 
+上游的网页归因工具、指纹库与离线评分器仍保留；其历史说明及本 fork 的差异见 [UPSTREAM.md](docs/UPSTREAM.md)。
 
-[LINUX DO](https://linux.do/)
+本插件与上游监测器不能同时监测同一 thread；`enable` 会检查上游状态和新插件的 hook 信任。多个 Codex 配置沿用各自原生 `CODEX_HOME`，数据互相隔离；请在个人订阅已登录的配置环境中运行接入命令。

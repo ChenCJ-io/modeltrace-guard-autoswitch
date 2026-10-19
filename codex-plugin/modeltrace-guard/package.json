@@ -1,10 +1,11 @@
 {
-  "name": "modeltrace-guard",
-  "version": "0.1.7",
+  "name": "modeltrace-guard-autoswitch",
+  "version": "0.2.0",
   "author": "xqy2006",
+  "contributors": ["ChenCJ-io"],
   "private": true,
   "type": "module",
   "engines": { "node": ">=18" },
-  "scripts": { "test": "node --test --test-concurrency=1 tests/*.test.mjs", "doctor": "node scripts/guard.mjs doctor" },
+  "scripts": { "test": "node --test --test-concurrency=1 tests/*.test.mjs", "doctor": "node scripts/guard.mjs doctor", "autoswitch": "node scripts/autoswitch.mjs" },
   "license": "MIT"
 }

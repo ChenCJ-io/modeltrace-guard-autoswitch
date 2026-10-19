@@ -1,11 +1,13 @@
 import { randomInt } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
+import { beginVerification, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
 export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
@@ -40,6 +42,8 @@ export function challengeContext(state, directory) {
 }
 
 export function controlContext(state, directory) {
+  const switching = switchControlContext(state, directory, ROOT);
+  if (switching) return switching;
   if (state.taskHalt) return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
   const batch = state.confirmation;
   if (batch?.status === 'active') {
@@ -63,7 +67,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /guard\.mjs['"\s]+(?:start|submit|probe|wait|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label)\b/.test(command);
+  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
@@ -76,6 +80,16 @@ export function isControlCommand(event) {
   const words = command.match(/'[^']*'|"[^"]*"|[^\s'"]+/g) || [];
   const tokens = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
   if (tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
+  if (path.resolve(tokens[1]) === path.join(ROOT, 'scripts', 'autoswitch.mjs')) {
+    if (!['status', 'disable', 'gateway-status', 'gateway-stop'].includes(tokens[2]) || (tokens.length - 3) % 2) return false;
+    const seen = new Set();
+    for (let i = 3; i < tokens.length; i += 2) {
+      const key = tokens[i];
+      if (seen.has(key) || !['--data-dir', ...(['status', 'disable'].includes(tokens[2]) ? ['--session'] : [])].includes(key)) return false;
+      seen.add(key);
+    }
+    return true;
+  }
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
   if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
@@ -106,7 +120,7 @@ async function busyHookFallback(event, directory, error) {
   const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
   if (!notice) return {};
   const continueOnce = !event.stop_hook_active && state.stopTurn !== (state.turn || 'no-turn')
-    && (waiting.length || state.confirmation?.status === 'active');
+    && (waiting.length || state.confirmation?.status === 'active' || isRecoveryActive(state));
   return { systemMessage: notice, ...(continueOnce ? { decision: 'block', reason: notificationContext(state, directory) || control } : {}) };
 }
 
@@ -124,6 +138,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     const currentTurn = setTurn(state, event.turn_id);
     if (currentTurn && ['SessionStart', 'UserPromptSubmit'].includes(hook)) { state.runtimePaused = false; state.runtimeEndedAt = null; }
     if (currentTurn && hook === 'SessionStart' && ['startup', 'resume'].includes(event.source)) {
+      failAutoSwitch(state, now, 'runtime_resumed');
       requestCleanupSweep(directory);
       state.runtimeStartedAt = now; state.runtimeEndedAt = null; state.lastWorkHookAt = null;
       if (state.enabled) {
@@ -134,7 +149,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     }
     if (currentTurn && hook === 'SessionEnd') state.runtimeEndedAt = now;
     if (currentTurn && typeof event.transcript_path === 'string' && path.isAbsolute(event.transcript_path)) state.transcriptPath = event.transcript_path;
-    if (state.forkSnapshot && !state.probeRun && (!state.enabled || state.taskHalt || (state.confirmation?.status !== 'active' && !state.pending))) {
+    if (state.forkSnapshot && !state.probeRun && (!state.enabled || haltBlocksProbe(state) || (state.confirmation?.status !== 'active' && !state.pending))) {
       await removeSnapshot(directory, state.forkSnapshot); state.forkSnapshot = null;
     }
     if (state.probeRun && !processAlive(state.probeRun.pid)) {
@@ -180,6 +195,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     const previousCheck = state.lastSampleAt || state.startedAt || state.createdAt;
     state.maxObservedGapSeconds = Math.max(state.maxObservedGapSeconds, (now - previousCheck) / 1000);
     if (hook === 'Interrupt' || hook === 'SessionEnd') {
+      failAutoSwitch(state, now, hook === 'Interrupt' ? 'user_interrupted' : 'session_ended');
       state.runtimePaused = true;
       abandon(state, now, hook === 'Interrupt' ? 'user_interrupted' : 'session_ended');
       interruptConfirmation(state, now, hook === 'Interrupt' ? 'user_interrupted' : 'session_ended');
@@ -187,6 +203,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       return {};
     }
     if (hook === 'PreCompact') {
+      failAutoSwitch(state, now, 'context_compaction');
       abandon(state, now, 'context_compaction');
       interruptConfirmation(state, now, 'context_compaction');
       state.compacting = true;
@@ -217,7 +234,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       }
       // Normal probes never delay the final answer or lose ownership at Stop.
       // Only an actionable alert/confirmation warrants a bounded continuation.
-      if (waiting.length || state.confirmation?.status === 'active') {
+      if (waiting.length || state.confirmation?.status === 'active' || isRecoveryActive(state)) {
         state.stopTurn = state.turn || 'no-turn';
         return deliver({ decision: 'block', reason: controlContext(state, directory) || notificationContext(state, directory) }, true);
       }
@@ -321,8 +338,9 @@ export async function run(args, env = process.env, receipt = null) {
   const now = Date.now();
   if (command === 'acknowledge') return withState(directory, session, (state) => {
     const result = acknowledgeAlerts(state, options.alert?.split(','), now);
+    beginVerification(state, now);
     if (state.confirmation?.status === 'active') issue(state, now);
-    return { ...result, ...summarize(state, directory, now), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null, controlContext: controlContext(state, directory), agentAction: state.taskHalt ? 'stop_and_notify_user' : null };
+    return { ...result, ...summarize(state, directory, now), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null, controlContext: controlContext(state, directory), agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : null };
   });
   if (command === 'label') return withState(directory, session, (state) => { setTaskName(state, options.name, now); return summarize(state, directory, now); });
   if (command === 'submit') {
@@ -364,12 +382,15 @@ export async function run(args, env = process.env, receipt = null) {
       state.lastOutcome = sample.outcome;
       record(state, 'probe_scored', now, { challenge: p.id, outcome: sample.outcome, prediction: sample.prediction });
       schedule(state, now);
-      const alert = queueAlert(state, sample);
-      updateConfirmation(state, sample, p, now);
+      const verification = finishVerification(state, sample, p, now);
+      const alert = verification ? null : queueAlert(state, sample);
+      if (!verification) updateConfirmation(state, sample, p, now);
+      queueAutoSwitch(state, now);
       if (state.taskHalt && alert) { alert.level = 'confirmed_mismatch'; alert.retryCount = state.taskHalt.retryCount; alert.predictions = state.taskHalt.predictions; }
+      if (alert && state.autoSwitch?.phase === 'switch_pending') alert.autoSwitchPending = true;
       if (state.confirmation?.status === 'active') issue(state, now);
       const { numbers: omitted, ...publicSample } = sample;
-      return { accepted: true, sample: publicSample, warning: WARNING, userNotice: alert ? userNotice(alert) : null, agentAction: state.taskHalt ? 'stop_and_notify_user' : alert ? 'notify_user_now' : state.confirmation?.status === 'active' ? 'complete_retries' : null, notification: alert, notificationContext: alert ? notificationContext(state, directory, [alert]) : null, confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, controlContext: controlContext(state, directory), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null };
+      return { accepted: true, sample: publicSample, warning: WARNING, userNotice: alert ? userNotice(alert) : null, agentAction: isRecoveryActive(state) ? (alert ? 'notify_user_now' : 'wait_for_route_verification') : state.taskHalt ? 'stop_and_notify_user' : alert ? 'notify_user_now' : state.confirmation?.status === 'active' ? 'complete_retries' : null, notification: alert, notificationContext: alert ? notificationContext(state, directory, [alert]) : null, confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, controlContext: controlContext(state, directory), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null };
     }, receipt.stateOptions);
   }
   const patch = {};
@@ -384,6 +405,7 @@ export async function run(args, env = process.env, receipt = null) {
       return summarize(state, directory, now);
     }
     if (command === 'stop') {
+      failAutoSwitch(state, now, 'monitoring_stopped');
       abandon(state, now, 'monitoring_stopped');
       interruptConfirmation(state, now, 'monitoring_stopped');
       state.enabled = false;
@@ -437,4 +459,4 @@ export async function main(args = process.argv.slice(2)) {
   finally { dispatchQueuedCleanups(); }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

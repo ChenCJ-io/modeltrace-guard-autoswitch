@@ -1,18 +1,18 @@
 {
-  "name": "modeltrace-guard",
-  "version": "0.1.7",
-  "description": "Background Codex model fingerprint monitoring with disposable forks of a frozen task snapshot.",
+  "name": "modeltrace-guard-autoswitch",
+  "version": "0.2.0",
+  "description": "Independent ModelTrace fork with opt-in per-thread route switching after repeated strong fingerprint differences and a verified fallback canary.",
   "author": {
     "name": "xqy2006"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "ModelTrace Guard",
-    "shortDescription": "后台探针 · 网页仪表盘 · 差异主动提醒",
-    "longDescription": "按工作工具调用次数，在后台从原任务冻结快照分别 fork 进行检测与复测，测后清理临时分支。正常结果静默保存，不等待探针即可继续原工作。使用 ModelTrace 离线指纹库；首次不一致主动提醒并暂停工作，默认额外复测 3 次（可配置），全部不一致时要求停止任务并拦截后续工作工具。提供网页仪表盘、历史分页和桌面提醒。探针使用 Codex 已配置的账户与模型并消耗推理额度。",
-    "developerName": "xqy2006",
+    "displayName": "ModelTrace Guard Autoswitch",
+    "shortDescription": "原生指纹监测 · 授权会话切换 · 回执验证",
+    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护自动切换扩展。保留冻结快照、独立无工具采样、异常提醒和停工保护；仅为明确授权的会话，在首检及至少 3 次追加复测全部为强差异且源路由证据有效后，尝试从 CCSwitch 聚合成员切到官方默认路由。弱排序分歧不触发自动切换。备用路由须返回真实 completed 回执并通过兼容指纹检查才解除暂停；失败保持停工。沿用原生认证，探针消耗对应推理额度。指纹不是后端身份或降智证明。",
+    "developerName": "xqy2006 · fork: ChenCJ-io",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "为当前任务开启 ModelTrace Guard，使用随机间隔采样，并告诉我如何调整探测频率。"
+    "defaultPrompt": "检查 ModelTrace Guard Autoswitch 的本地路由和监测状态，说明如何为当前会话明确启用自动切换。"
   }
 }

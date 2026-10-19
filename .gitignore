@@ -4,3 +4,16 @@ __pycache__/
 *.log
 .venv/
 node_modules/
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage/
+dist/
+.local/
+gateway-config.json
+gateway-runtime.json
+_bindings/
+_receipts/
+_history/
+_fork_cleanup/

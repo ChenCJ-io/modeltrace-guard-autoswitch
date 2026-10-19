@@ -371,7 +371,7 @@ test('checksum bank and scorer are valid and packaged GPT/o-series families are 
 
 test('stable data path is shared between hooks and task shell even with PLUGIN_DATA differences', () => {
   assert.equal(dataDirectory(null, {}), dataDirectory(null, { PLUGIN_DATA: 'some-version-specific-dir' }));
-  assert.equal(dataDirectory('/explicit', { MODELTRACE_GUARD_DATA: '/env' }), path.resolve('/explicit'));
+  assert.equal(dataDirectory('/explicit', { MODELTRACE_AUTOSWITCH_DATA: '/env' }), path.resolve('/explicit'));
 });
 
 test('CLI rejects typos instead of silently ignoring user frequency settings', async () => {
@@ -415,7 +415,7 @@ test('exact bundled hook launcher works in native shell with spaced paths', asyn
   const command = config.hooks.PostToolUse[0].hooks[0].command;
   const spacedRoot = path.join(dir, 'plugin source with spaces');
   await cp(ROOT, spacedRoot, { recursive: true });
-  const env = { ...process.env, PLUGIN_ROOT: spacedRoot, MODELTRACE_GUARD_DATA: dir, CODEX_THREAD_ID: session };
+  const env = { ...process.env, PLUGIN_ROOT: spacedRoot, MODELTRACE_AUTOSWITCH_DATA: dir, CODEX_THREAD_ID: session };
   const result = spawnSync(command, { shell: true, input: JSON.stringify(event('SessionStart')), encoding: 'utf8', env, timeout: 10000 });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {});

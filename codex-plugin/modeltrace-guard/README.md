@@ -1,4 +1,6 @@
-# ModelTrace Guard
+# ModelTrace Guard Autoswitch
+
+此目录是独立 fork 插件（0.2.0）。自动切换的安装、CLI 和接入说明以 [项目 README](../../README.md) 为准；下文保留上游监测原理，安装入口已替换。
 
 作者：xqy2006。
 
@@ -9,15 +11,15 @@
 在终端运行：
 
 ```powershell
-codex plugin marketplace add xqy2006/ModelTrace
-codex plugin add modeltrace-guard@modeltrace
+codex plugin marketplace add .
+codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch
 ```
 
 也可先下载源码，在 ModelTrace 仓库根运行：
 
 ```powershell
 codex plugin marketplace add .
-codex plugin add modeltrace-guard@modeltrace
+codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch
 ```
 
 市场入口为仓库根的 `.agents/plugins/marketplace.json`，插件位于 `codex-plugin/modeltrace-guard/`，清单为该目录下的 `.codex-plugin/plugin.json`。
@@ -103,7 +105,7 @@ API Key 登录、自定义服务地址、代理和自定义 CA 配置继续使�
 
 首次候选不一致立即写入提醒，要求智能体先告诉用户“预期 X，指纹第一候选 Y”，再确认已告知。之后后台连续完成用户设定的 N 次复测，不等待普通间隔，也不递归再开启一组。复测期间原任务暂停工作；智能体可执行返回的 `wait --confirmation <ID>` 等待进度，每次最多 30 秒。该命令只读取进度，不执行探针。复测不一致时仍需先告知并确认，匹配结果则自动推进下一次复测。所有 N 次均不一致才锁定任务；其中任一次相符则本组不触发停止，但异常记录保留。缺失、无效、超时或中断不计为不一致。
 
-任务锁定后 `PreToolUse` 拒绝后续受支持的工作工具，只允许直接运行本插件的状态、告知确认、停止和用户授权恢复等管理命令。智能体仍须主动说明全部候选并停止工作。它不取消已经运行的命令；托管工具及不经此 hook 的专用路径也不属于完整拦截范围。只有用户明确要求恢复后，智能体才能执行 `resume --halt <当前停止ID>`。停止监测、确认提醒或换模型均不会自动解除锁定。
+任务锁定后 `PreToolUse` 拒绝后续受支持的工作工具，只允许直接运行本插件的状态、告知确认、停止和用户授权恢复等管理命令。智能体仍须主动说明全部候选并停止工作。它不取消已经运行的命令；托管工具及不经此 hook 的专用路径也不属于完整拦截范围。未配置自动切换策略，或备用验证失败时，只有用户明确要求恢复后，智能体才能执行 `resume --halt <当前停止ID>`。停止监测、确认提醒或换模型均不会自动解除锁定。
 
 网页通过带鉴权的实时事件流接收提醒，不等待智能体确认；点击“开启桌面提醒”并授权后可发浏览器系统通知。需要保持网页连接，浏览器/系统可能限制通知；未授权时保留网页提醒与智能体告知渠道。完整本地网址携带访问凭证，请勿公开。
 
@@ -111,7 +113,7 @@ API Key 登录、自定义服务地址、代理和自定义 CA 配置继续使�
 
 监测设置保存在稳定数据目录。重新打开原任务时，启动/恢复 hook 会触发自检，并在观察到工作工具调用后验证运行状态。网页服务和监测相互独立：使用 `dashboard` 命令打开网页，关闭网页不会停止任务监测。
 
-数据默认在 `~/.codex/modeltrace-guard`，可用 `MODELTRACE_GUARD_DATA` 覆盖。状态文件保留近期记录，完整样本、事件及已确认提醒保存在 `_history` 中，可从网页“完整历史”翻页查看。数据格式升级时保留已有历史。状态锁仅在确认所属进程已退出后自动回收；无法确认的锁会报告错误，需检查相关进程状态。
+数据默认在 `${CODEX_HOME:-~/.codex}/modeltrace-guard-autoswitch`，可用 `MODELTRACE_AUTOSWITCH_DATA` 覆盖。状态文件保留近期记录，完整样本、事件及已确认提醒保存在 `_history` 中，可从网页“完整历史”翻页查看。数据格式升级时保留已有历史。状态锁仅在确认所属进程已退出后自动回收；无法确认的锁会报告错误，需检查相关进程状态。
 
 `_fork_cleanup/<临时基准ID>.json` 保存清理状态：`active` 等待本组结束、`pending` 待删除、`deleted` 已删除、`blocked` 需检查。启动/恢复任务会扫描遗留清理记录；也可运行 `node scripts/fork-cleanup.mjs <数据目录>`。默认跳过已阻塞项；检查原因后可追加 `--retry-blocked` 重新核验。清理仅针对所属任务、轮次及后代检查均通过的临时基准；失败时保留错误与目标信息，供排查使用。
 

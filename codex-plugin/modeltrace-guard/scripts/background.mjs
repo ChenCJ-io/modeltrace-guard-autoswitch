@@ -4,6 +4,7 @@ import { controlContext, handleHook, notificationContext, submitForkResult } fro
 import { runForkProbe } from './fork-runner.mjs';
 import { BACKGROUND_STATE_LOCK, expirePending, processAlive, readState, withState } from './state.mjs';
 import { summarize } from './status.mjs';
+import { beginVerification, failAutoSwitch, haltBlocksProbe, isRecoveryActive, isVerification } from './switch-policy.mjs';
 
 export const BACKGROUND_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse'];
 // One configurable checkpoint may live for at most 1,000,000 seconds. The
@@ -21,8 +22,12 @@ async function backgroundNotice(event, directory, session, confirmationId) {
   // Most hooks have nothing to deliver. Avoid an additional lock/fsync for an
   // empty notification; a writer that commits a new alert delivers it itself.
   if (!observed || (!pendingAlerts(observed).some((alert) => alert.lastDeliveryTurn !== (observed.turn || 'no-turn'))
-    && !observed.taskHalt && !(confirmationId && observed.confirmation?.id === confirmationId))) return {};
+    && !observed.taskHalt && !observed.autoSwitch?.noticePending && !(confirmationId && observed.confirmation?.id === confirmationId))) return {};
   return withState(directory, session, (state) => {
+    if (state.autoSwitch?.noticePending) {
+      state.autoSwitch.noticePending = false;
+      return injected(event, 'ModelTrace AutoSwitch: fallback verification completed successfully and this same thread now uses the authorized official route. Tell the user briefly and continue the original task. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.');
+    }
     const alerts = pendingAlerts(state).filter((alert) => alert.lastDeliveryTurn !== (state.turn || 'no-turn')).slice(0, 5);
     if (alerts.length) {
       for (const alert of alerts) {
@@ -50,13 +55,18 @@ export async function handleBackgroundHook(event, directory, env = process.env, 
     || (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID)
     || !BACKGROUND_EVENTS.includes(event.hook_event_name)) return {};
   const output = await handleHook(event, directory, undefined, undefined, { background: true });
+  const observed = await readState(directory, event.session_id);
+  if (observed?.autoSwitch?.phase === 'switch_pending' && !pendingAlerts(observed).length) {
+    await withState(directory, event.session_id, state => beginVerification(state, Date.now()), BACKGROUND_STATE_LOCK);
+  }
+  const after = await readState(directory, event.session_id);
   // Deliver already-known alerts immediately, without delaying them for a probe.
-  if (Object.keys(output).length) return output;
+  if (Object.keys(output).length && !(isVerification(after) && !pendingAlerts(after).length)) return output;
   const deadline = Date.now() + (dependencies.budgetMs ?? (BACKGROUND_TIMEOUT_SECONDS - 60) * 1000);
   let confirmationId = null;
   for (let count = 0; count < 100; count++) {
     const state = await readState(directory, event.session_id);
-    if (!state?.enabled || state.taskHalt || state.compacting || state.runtimeEndedAt || state.runtimePaused
+    if (!state?.enabled || haltBlocksProbe(state) || state.compacting || state.runtimeEndedAt || state.runtimePaused
       || !state.pending || pendingAlerts(state).length || (state.probeRun && processAlive(state.probeRun.pid))) break;
     // Extremely long configured retries continue in a later background hook;
     // never exceed the host's timeout or change a checkpoint's deadline.
@@ -87,16 +97,20 @@ export async function waitForConfirmation(directory, session, id, { timeoutMs = 
   do {
     state = await readState(directory, session);
     if (state?.confirmation?.id !== id) throw new Error('No matching confirmation batch');
+    if (state.autoSwitch?.phase === 'switch_pending' && Date.now() - state.autoSwitch.queuedAt >= state.config.pendingSeconds * 1000) {
+      await withState(directory, session, current => failAutoSwitch(current, Date.now(), 'verification_not_started'));
+      state = await readState(directory, session);
+    }
     if (state.pending && Date.now() >= state.pending.expiresAt) {
       await withState(directory, session, (current) => { expirePending(current, Date.now()); });
       state = await readState(directory, session);
     }
-    if (!state.enabled || state.taskHalt || pendingAlerts(state).length || state.confirmation.status !== 'active' || Date.now() >= deadline) break;
+    if (!state.enabled || (state.taskHalt && !isRecoveryActive(state)) || pendingAlerts(state).length || (state.confirmation.status !== 'active' && !isRecoveryActive(state)) || Date.now() >= deadline) break;
     await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
   } while (true);
-  return { ...summarize(state, directory), waiting: state.enabled && state.confirmation.status === 'active' && !pendingAlerts(state).length,
+  return { ...summarize(state, directory), waiting: state.enabled && (state.confirmation.status === 'active' || isRecoveryActive(state)) && !pendingAlerts(state).length,
     notificationContext: notificationContext(state, directory), controlContext: controlContext(state, directory),
-    agentAction: state.taskHalt ? 'stop_and_notify_user' : pendingAlerts(state).length ? 'notify_user_now'
+    agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : state.autoSwitch?.phase === 'switched' ? 'autoswitch_verified' : pendingAlerts(state).length ? 'notify_user_now'
       : state.confirmation.status === 'active' ? 'wait_for_background_retries'
         : state.confirmation.status === 'completed' ? 'confirmation_completed' : 'report_coverage_gap' };
 }

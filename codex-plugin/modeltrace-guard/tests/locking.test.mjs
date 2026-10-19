@@ -200,7 +200,7 @@ test('the actual hook command returns deny, not a generic warning, for a busy ha
   await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 }));
   const child = spawn(process.execPath, [path.join(ROOT, 'scripts/guard.mjs'), 'hook'], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, MODELTRACE_GUARD_DATA: directory, CODEX_THREAD_ID: session, MODELTRACE_PROBE_PROCESS: '0' },
+    env: { ...process.env, MODELTRACE_AUTOSWITCH_DATA: directory, CODEX_THREAD_ID: session, MODELTRACE_PROBE_PROCESS: '0' },
   });
   let stdout = '', stderr = '';
   child.stdout.on('data', (bytes) => { stdout += bytes; }); child.stderr.on('data', (bytes) => { stderr += bytes; });

@@ -33,7 +33,7 @@ export function summarize(state, directory, now = Date.now()) {
       running: Boolean(state.probeRun && processAlive(state.probeRun.pid)), challenge: state.probeRun?.challenge || null,
       startedAt: state.probeRun?.startedAt || null },
     forkCleanup: state.forkCleanup || null,
-    confirmation: state.confirmation || null, taskHalt: state.taskHalt || null,
+    confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, autoSwitch: state.autoSwitch || null,
     lastHookAt: state.lastHookAt, probesIssued: state.issued, probesAccepted: historyCount(state, 'samples'),
     missedProbes: state.missed, pendingExpired: Boolean(pendingExpired), pending: state.pending,
     observedWorkTools: state.workTools, nextToolCheckpoint: state.nextTools, nextTimeCheckpoint: null,

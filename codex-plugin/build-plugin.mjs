@@ -33,12 +33,12 @@ await Promise.all([
   }, null, 2) + '\n'),
 ]);
 if (process.argv.includes('--deploy-personal')) {
-  const target = path.join(homedir(), 'plugins', 'modeltrace-guard');
+  const target = path.join(homedir(), 'plugins', 'modeltrace-guard-autoswitch');
   // Refuse to overwrite an unrelated directory. Marketplace creation is handled by Codex's scaffold helper.
   let existing;
   try { existing = JSON.parse(await readFile(path.join(target, '.codex-plugin', 'plugin.json'), 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (!existing || existing.name !== 'modeltrace-guard') throw new Error('First create a personal modeltrace-guard scaffold/marketplace, then deploy');
+  if (!existing || existing.name !== 'modeltrace-guard-autoswitch') throw new Error('First create a personal modeltrace-guard-autoswitch scaffold/marketplace, then deploy');
   await cp(plugin, target, { recursive: true, force: true });
   process.stdout.write(`Deployed personal source: ${target}\n`);
 }

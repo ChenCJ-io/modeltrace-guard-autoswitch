@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { LANGUAGES } from './prompts.mjs';
 import { compactHistory } from './history.mjs';
 import { removeSnapshot } from './fork-snapshot.mjs';
+import { failAutoSwitch, haltBlocksProbe } from './switch-policy.mjs';
 export { validateNumbers } from './probe-output.mjs';
 
 export const DEFAULTS = Object.freeze({
@@ -165,6 +166,7 @@ export function setTurn(state, turn) {
 
 export function abandon(state, now, reason) {
   if (!state.pending) return;
+  if (state.pending.kind === 'fallback_verification') failAutoSwitch(state, now, reason);
   if (state.pending.confirmationId) interruptConfirmation(state, now, reason);
   record(state, 'probe_missed', now, { challenge: state.pending.id, reason });
   state.missed += 1;
@@ -173,6 +175,7 @@ export function abandon(state, now, reason) {
 }
 
 export function segment(state, now, reason, draw = randomInt) {
+  failAutoSwitch(state, now, reason);
   abandon(state, now, reason);
   interruptConfirmation(state, now, reason);
   state.epoch += 1;
@@ -238,7 +241,7 @@ export function recentComparable(state, pending) {
 export function dataDirectory(override, env = process.env) {
   // Stable across plugin reinstalls and the hook / normal-shell environment difference.
   // PLUGIN_DATA is deliberately not used: normal task shell commands may not inherit it.
-  return path.resolve(override || env.MODELTRACE_GUARD_DATA || path.join(homedir(), '.codex', 'modeltrace-guard'));
+  return path.resolve(override || env.MODELTRACE_AUTOSWITCH_DATA || path.join(env.CODEX_HOME || path.join(homedir(), '.codex'), 'modeltrace-guard-autoswitch'));
 }
 
 export function sessionPath(directory, session) { return path.join(directory, `${digest(session)}.json`); }
@@ -333,7 +336,7 @@ export async function withState(directory, session, callback, { lockTimeoutMs = 
     }
     const result = await callback(state);
     if (state.forkSnapshot && (!state.probeRun || !processAlive(state.probeRun.pid))
-      && (!state.enabled || state.taskHalt || (state.confirmation?.status !== 'active' && !state.pending))) {
+      && (!state.enabled || haltBlocksProbe(state) || (state.confirmation?.status !== 'active' && !state.pending))) {
       state.forkCleanup = { id: state.forkSnapshot.id, status: 'pending', at: Date.now() };
       await removeSnapshot(directory, state.forkSnapshot); state.forkSnapshot = null;
     }

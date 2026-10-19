@@ -1,4 +1,4 @@
-name: ModelTrace Guard tests
+name: ModelTrace Guard Autoswitch tests
 on:
   push:
     paths: ['codex-plugin/**', '.agents/plugins/marketplace.json', 'static/fingerprint-core.js', 'static/styles.css', 'data/gpt_reference.jsonl', 'data/claude_reference.jsonl', 'data/unified_bank.json', '.github/workflows/plugin-tests.yml']
@@ -10,13 +10,21 @@ jobs:
   plugin:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install SQLite shell on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Install SQLite shell on Windows
+        if: runner.os == 'Windows'
+        run: choco install sqlite --yes --no-progress
+      - name: Check read-only metadata inspector dependency
+        run: sqlite3 ':memory:' "SELECT hex(sha3('autoswitch-check',256));"
       - run: node codex-plugin/build-plugin.mjs
       - run: node codex-plugin/validate-distribution.mjs
       - run: node codex-plugin/validate-reference-data.mjs

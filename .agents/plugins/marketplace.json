@@ -1,11 +1,11 @@
 {
-  "name": "modeltrace",
+  "name": "modeltrace-autoswitch",
   "interface": {
-    "displayName": "Modeltrace"
+    "displayName": "ModelTrace Guard Autoswitch"
   },
   "plugins": [
     {
-      "name": "modeltrace-guard",
+      "name": "modeltrace-guard-autoswitch",
       "source": {
         "source": "local",
         "path": "./codex-plugin/modeltrace-guard"

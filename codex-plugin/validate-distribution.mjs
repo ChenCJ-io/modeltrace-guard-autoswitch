@@ -6,8 +6,8 @@ import { CODEX_CLIENT_INFO } from './modeltrace-guard/scripts/app-server-client.
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const marketplace = JSON.parse(await readFile(path.join(repository, '.agents/plugins/marketplace.json'), 'utf8'));
-assert.equal(marketplace.name, 'modeltrace');
-const entry = marketplace.plugins.find((plugin) => plugin.name === 'modeltrace-guard');
+assert.equal(marketplace.name, 'modeltrace-autoswitch');
+const entry = marketplace.plugins.find((plugin) => plugin.name === 'modeltrace-guard-autoswitch');
 assert.ok(entry); assert.equal(entry.source.source, 'local');
 assert.equal(entry.source.path, './codex-plugin/modeltrace-guard');
 assert.equal(entry.policy.installation, 'AVAILABLE'); assert.equal(entry.policy.authentication, 'ON_INSTALL');
@@ -18,6 +18,8 @@ const manifest = JSON.parse(await readFile(path.join(root, '.codex-plugin/plugin
 assert.equal(manifest.name, entry.name); assert.equal(manifest.author.name, 'xqy2006');
 const packageInfo = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 assert.equal(packageInfo.name, manifest.name);
+assert.equal(packageInfo.author, 'xqy2006');
+assert.ok(packageInfo.contributors.includes('ChenCJ-io'), 'The independent fork must retain its contributor attribution');
 assert.equal(packageInfo.version, manifest.version, 'Package and plugin manifest versions must match');
 assert.equal(CODEX_CLIENT_INFO.version, manifest.version, 'Codex client and plugin manifest versions must match');
 await access(path.join(root, manifest.skills, 'modeltrace-guard', 'SKILL.md'));

@@ -6,6 +6,7 @@ import { prepareCacheTransport } from './cache-transport.mjs';
 import { freezeSnapshot, publicSnapshot, removeSnapshot, verifySnapshot } from './fork-snapshot.mjs';
 import { forkPrompt } from './prompts.mjs';
 import { ProbeOutputError } from './probe-output.mjs';
+import { failAutoSwitch, haltBlocksProbe, prepareSwitchTransport } from './switch-policy.mjs';
 import { BACKGROUND_STATE_LOCK, abandon, digest, interruptConfirmation, processAlive, readState, record, schedule, setCodexTaskName, withState } from './state.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -36,7 +37,7 @@ export function verifyFork(response, snapshot) {
 export async function prepareProbeFork(client, snapshot, cacheTransport = null) {
   const response = await client.request('thread/fork', forkParameters(snapshot, cacheTransport), 30000);
   const effective = verifyFork(response, snapshot);
-  cacheTransport?.authorize(response.thread.id);
+  await cacheTransport?.authorize(response.thread.id);
   return { response, effective };
 }
 
@@ -44,7 +45,7 @@ export async function requireTrustedGuard(client, cwd) {
   const listing = await client.request('hooks/list', { cwds: [cwd] });
   const hooks = (listing.data || []).flatMap((entry) => entry.hooks || []).filter((hook) =>
     hook.enabled && ['trusted', 'managed'].includes(hook.trustStatus)
-    && /^modeltrace-guard(?:@|$)/.test(hook.pluginId || '') && hook.handlerType === 'command'
+    && /^modeltrace-guard(?:-autoswitch)?(?:@|$)/.test(hook.pluginId || '') && hook.handlerType === 'command'
     && (!hook.matcher || hook.matcher === '.*'));
   const candidates = hooks.filter((hook) => hook.eventName === 'preToolUse' && hook.async === false);
   const expected = digest(await readFile(path.join(ROOT, 'scripts', 'guard.mjs')));
@@ -137,9 +138,9 @@ export async function runForkProbe(directory, session, challenge, env = process.
   const claimed = await updateState((state) => {
     // Parallel background hooks race for one atomic checkpoint lease. A losing
     // contender must not report an error or cancel the winning worker's batch.
-    if (dependencies.background && (!state.enabled || state.taskHalt || !state.pending || state.pending.id !== challenge
+    if (dependencies.background && (!state.enabled || haltBlocksProbe(state) || !state.pending || state.pending.id !== challenge
       || (state.probeRun && processAlive(state.probeRun.pid)))) return false;
-    if (!state.enabled || state.taskHalt || !state.pending || state.pending.id !== challenge) throw new Error('No matching live fork checkpoint');
+    if (!state.enabled || haltBlocksProbe(state) || !state.pending || state.pending.id !== challenge) throw new Error('No matching live fork checkpoint');
     if (state.probeRun && processAlive(state.probeRun.pid)) throw new Error('A fork probe is already running for this task');
     if (Date.now() >= state.pending.expiresAt) throw new Error('Checkpoint has expired');
     if (state.pending.confirmationId && !state.forkSnapshot) throw new Error('Retry snapshot is missing; a fresh snapshot cannot replace it');
@@ -164,7 +165,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
     }
     await verifySnapshot(client, snapshot);
     stage = 'fork_preparation';
-    cacheTransport = await prepareCacheTransport(client, snapshot, env);
+    cacheTransport = await prepareSwitchTransport(directory, snapshot, pending) || await prepareCacheTransport(client, snapshot, env);
     const { response: fork, effective } = await prepareProbeFork(client, snapshot, cacheTransport);
     await enforceTrust(client, snapshot.cwd);
     await updateState((state) => {
@@ -177,14 +178,16 @@ export async function runForkProbe(directory, session, challenge, env = process.
     stage = 'inference';
     const generated = await generate(client, fork.thread.id, pending, async () => {
       const state = await readState(directory, session);
-      return !state?.enabled || state.taskHalt || state.pending?.id !== challenge || state.epoch !== pending.epoch;
+      return !state?.enabled || haltBlocksProbe(state) || state.pending?.id !== challenge || state.epoch !== pending.epoch;
     });
     text = generated.text;
     stage = 'cleanup';
-    await client.close(); await cacheTransport?.close(); cleanupConfirmed = true;
+    await client.close();
+    const routing = await cacheTransport?.receipt?.();
+    await cacheTransport?.close(); cleanupConfirmed = true;
     receipt = { mode: 'ephemeral_fork', snapshot: publicSnapshot(snapshot), effective, cleanedUp: true, usage: generated.usage || null,
       cacheHit: generated.usage ? generated.usage.cachedInputTokens > 0 : null, routingScope: 'fork_continuation',
-      cacheScope: cacheTransport?.mode || 'native_fork' };
+      cacheScope: cacheTransport?.mode || 'native_fork', ...(routing ? { routing } : {}) };
     stage = 'submission';
     const result = await dependencies.submit(directory, session, challenge, text, receipt, stateOptions);
     return result;
@@ -193,6 +196,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
     const cancelled = await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge || state.epoch !== pending.epoch) return true;
       abandon(state, Date.now(), 'fork_probe_failed');
+      failAutoSwitch(state, Date.now(), 'fork_probe_failed');
       interruptConfirmation(state, Date.now(), 'fork_probe_failed'); schedule(state, Date.now());
       state.forkHealth = { ready: false, checkedAt: Date.now(), error: error.message, diagnostic };
       record(state, 'fork_probe_failed', Date.now(), { challenge, reason: error.message, diagnostic });
@@ -206,7 +210,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
       await cacheTransport?.close();
       await updateState(async (state) => {
         if (state.probeRun?.challenge === challenge) state.probeRun = null;
-        if (state.confirmation?.status !== 'active' || !state.enabled || state.taskHalt) {
+        if (state.confirmation?.status !== 'active' || !state.enabled || haltBlocksProbe(state)) {
           if (snapshot) state.forkCleanup = { id: snapshot.id, status: 'pending', at: Date.now() };
           await removeSnapshot(directory, snapshot);
           if (state.forkSnapshot?.id === snapshot?.id) state.forkSnapshot = null;
