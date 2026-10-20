@@ -418,15 +418,18 @@ test('ordinary entry rejects a command-only data directory before native configu
 });
 
 test('the real connect CLI returns its startup trust requirement without a circular-import deadlock', { timeout: 10000 }, async t => {
-  const f = await fixture(t), executable = path.join(f.directory, 'fake-native.mjs');
-  await writeFile(executable, `#!${process.execPath}\nimport readline from 'node:readline';
-for await (const line of readline.createInterface({input:process.stdin})) {
- const request=JSON.parse(line); if(request.id===undefined)continue;
+  const f = await fixture(t);
+  // The launcher invokes <executable> app-server --stdio. Use native Node and
+  // resolve the test-only script from this cwd: Windows cannot spawn shebangs.
+  await writeFile(path.join(f.directory, 'app-server'), `const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const request=JSON.parse(line); if(request.id===undefined)return;
  const result=request.method==='account/read'?{account:{type:'chatgpt'}}:request.method==='hooks/list'?{data:[]}:{};
  process.stdout.write(JSON.stringify({id:request.id,result})+'\\n');
-}\n`, { mode: 0o700 });
+});\n`);
   await assert.rejects(execute(process.execPath, [entry, 'connect'], {
-    env: { ...process.env, ...f.env, MODELTRACE_AUTOSWITCH_DATA: f.directory, MODELTRACE_CODEX_PATH: executable }, timeout: 5000,
+    cwd: f.directory,
+    env: { ...process.env, ...f.env, MODELTRACE_AUTOSWITCH_DATA: f.directory, MODELTRACE_CODEX_PATH: process.execPath }, timeout: 5000,
   }), error => {
     assert.equal(error.killed, false, 'connect must finish rather than wait for a cyclic top-level import');
     assert.match(error.stderr, /Review the updated synchronous ModelTrace startup hook/);
