@@ -1,18 +1,18 @@
 {
   "name": "modeltrace-guard-autoswitch",
-  "version": "0.3.0",
-  "description": "Pause on a fingerprint mismatch and switch a Codex thread only after consent for that specific request and a verified target canary.",
+  "version": "0.4.0",
+  "description": "Use ModelTrace monitoring in ordinary codex conversations after one-time gateway setup. Verify and switch routes only after consent to the specific incident target.",
   "author": {
     "name": "xqy2006"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "ModelTrace Guard Autoswitch",
-    "shortDescription": "指纹异常先询问 · 本次同意后验证切换",
-    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护。默认使用配置的主服务；接入网关并启用监测后，首次有效指纹不一致即暂停并询问。安装、配置主备、开启监测和确认收到提醒均不授权切换。用户针对本次异常明确同意目标后，才运行原生 canary；真实 completed 回执和兼容指纹通过才切换并恢复。官方目标成功后停止探针；第三方目标继续监测，下次异常再次询问。指纹不是后端身份或降智证明。",
+    "shortDescription": "普通 codex 对话启用 · 异常先询问再切换",
+    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护。一次性接入未来新会话后，照常运行 codex，在对话中说使用插件即可逐会话开启监测。安装和接入不会监测全部会话，也不会热改旧会话。默认走主服务；首次指纹不一致暂停询问，本次同意后才验证目标，验证通过才切换并继续。个人路线不持续消耗探针；第三方路线继续监测，每次切换都需新同意。指纹不是后端身份或降智证明。",
     "developerName": "xqy2006 · fork: ChenCJ-io",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "检查 CCSwitch 配置，主用 API2 copy，备用使用我指定的配置；首次指纹异常先询问，只有我对本次目标明确同意后才验证并切换。"
+    "defaultPrompt": "使用 modeltrace-guard-autoswitch。若尚未准备普通 codex 接入，请完成一次性配置并说明它只影响未来新会话；仅监测本会话，首次异常先询问，得到我对本次目标的同意后再验证切换。"
   }
 }

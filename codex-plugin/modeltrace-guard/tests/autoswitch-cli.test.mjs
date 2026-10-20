@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
@@ -48,10 +48,10 @@ async function fixture(t) {
 
 async function nativeFixture(directory, { accountType = 'chatgpt', onAccountRead = async () => {} } = {}) {
   const definition = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
-  const hooks = Object.entries(definition.hooks).map(([name, groups]) => ({
-    eventName: name[0].toLowerCase() + name.slice(1), ...groups[0].hooks[0], async: groups[0].hooks[0].async || false,
+  const hooks = Object.entries(definition.hooks).flatMap(([name, groups]) => groups.flatMap(group => group.hooks.map(handler => ({
+    eventName: name[0].toLowerCase() + name.slice(1), ...handler, async: handler.async || false,
     enabled: true, trustStatus: 'trusted', pluginId: 'modeltrace-guard-autoswitch@fixture', handlerType: 'command', sourcePath: path.join(ROOT, 'hooks/hooks.json'),
-  }));
+  }))));
   const calls = [], children = [], closed = [], clientOptions = [];
   return { calls, children, closed, clientOptions, runtime: {
     executableFor: async () => '/fixture runtime/codex',
@@ -232,4 +232,62 @@ test('disable stops monitoring but retains the chosen route and halt; only exact
 test('new fork storage is isolated per Codex home and ignores the upstream storage override', () => {
   assert.equal(dataDirectory(undefined, { CODEX_HOME: '/profiles/personal', MODELTRACE_GUARD_DATA: '/old' }), path.resolve('/profiles/personal/modeltrace-guard-autoswitch'));
   assert.equal(dataDirectory(undefined, { MODELTRACE_AUTOSWITCH_DATA: '/explicit-new', MODELTRACE_GUARD_DATA: '/old' }), path.resolve('/explicit-new'));
+});
+
+test('natural-language use enables only the already-connected primary thread and is idempotent', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
+  const route = await resolveSessionRoute(f.directory, f.config, session);
+  await saveReceipt(f.directory, f.config, { ...route, threadId: session, requestId: randomUUID(), statusCode: 200,
+    startedAt: Date.now() - 20, finishedAt: Date.now() - 10, success: true, completed: true, responseEvent: 'response.completed' });
+  const invoke = () => runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  const first = await invoke();
+  assert.equal(first.status, 'monitoring_enabled'); assert.equal(first.monitoringEnabled, true); assert.equal(first.switchApproved, false);
+  const before = await readState(f.directory, session), nativeCount = native.calls.length;
+  const second = await invoke();
+  assert.equal(second.alreadyEnabled, true); assert.equal(native.calls.length, nativeCount);
+  assert.deepEqual(await readState(f.directory, session), before);
+  assert.equal(native.children.length, 0, 'ordinary use never starts a replacement CLI');
+});
+
+test('natural-language use leaves personal routes unmonitored without inspecting credentials or moving them', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
+  await resolveSessionRoute(f.directory, f.config, session, 'official');
+  const before = await readState(f.directory, session);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'personal_route_unmonitored'); assert.equal(result.monitoringEnabled, false);
+  assert.deepEqual(await readState(f.directory, session), before); assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
+});
+
+test('ordinary unconnected conversations are not falsely reported as monitored or automatically relaunched', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'connection_setup_required'); assert.equal(result.monitoringEnabled, false);
+  assert.equal(result.connection.phase, 'not_installed'); assert.equal(result.switchApproved, false);
+  assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
+  assert.equal(await readState(f.directory, session), null);
+});
+
+test('ordinary entry rejects a command-only data directory before native configuration or gateway mutation', async t => {
+  const f = await fixture(t), native = await nativeFixture(f.directory);
+  await assert.rejects(runAutoSwitch(['connect', '--data-dir', f.directory], f.env, native.runtime), /same data directory/);
+  assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
+  assert.equal((await f.invoke('gateway-status')).running, false);
+});
+
+test('the real connect CLI returns its startup trust requirement without a circular-import deadlock', { timeout: 10000 }, async t => {
+  const f = await fixture(t), executable = path.join(f.directory, 'fake-native.mjs');
+  await writeFile(executable, `#!${process.execPath}\nimport readline from 'node:readline';
+for await (const line of readline.createInterface({input:process.stdin})) {
+ const request=JSON.parse(line); if(request.id===undefined)continue;
+ const result=request.method==='account/read'?{account:{type:'chatgpt'}}:request.method==='hooks/list'?{data:[]}:{};
+ process.stdout.write(JSON.stringify({id:request.id,result})+'\\n');
+}\n`, { mode: 0o700 });
+  await assert.rejects(execute(process.execPath, [entry, 'connect'], {
+    env: { ...process.env, ...f.env, MODELTRACE_AUTOSWITCH_DATA: f.directory, MODELTRACE_CODEX_PATH: executable }, timeout: 5000,
+  }), error => {
+    assert.equal(error.killed, false, 'connect must finish rather than wait for a cyclic top-level import');
+    assert.match(error.stderr, /Review the updated synchronous ModelTrace startup hook/);
+    return true;
+  });
+  assert.equal((await f.invoke('gateway-status')).running, false);
 });

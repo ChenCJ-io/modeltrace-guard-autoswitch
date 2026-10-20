@@ -67,7 +67,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
+  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
@@ -81,7 +81,7 @@ export function isControlCommand(event) {
   const tokens = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
   if (tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
   if (path.resolve(tokens[1]) === path.join(ROOT, 'scripts', 'autoswitch.mjs')) {
-    if (!['status', 'disable', 'gateway-status', 'gateway-stop'].includes(tokens[2]) || (tokens.length - 3) % 2) return false;
+    if (!['status', 'disable', 'gateway-status', 'gateway-stop', 'connection-status'].includes(tokens[2]) || (tokens.length - 3) % 2) return false;
     const seen = new Set();
     for (let i = 3; i < tokens.length; i += 2) {
       const key = tokens[i];

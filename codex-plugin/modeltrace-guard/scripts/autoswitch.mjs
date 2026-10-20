@@ -13,12 +13,13 @@ import { sourceSettings } from './fork-snapshot.mjs';
 import { requireTrustedGuard } from './fork-runner.mjs';
 import { loadArtifacts } from './guard.mjs';
 import { startSwitchGateway } from './switch-gateway.mjs';
+import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
 import {
   UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
   loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady,
 } from './provider-config.mjs';
 import {
-  enableAutoSwitch, failAutoSwitch, resolveSessionRoute, saveReceipt,
+  enableAutoSwitch, failAutoSwitch, readReceipt, resolveSessionRoute, saveReceipt,
 } from './switch-policy.mjs';
 
 const entrypoint = fileURLToPath(import.meta.url);
@@ -26,7 +27,8 @@ function argumentsFor(args) {
   const command = args.shift() || 'help', options = {};
   const allowed = {
     help: [], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
-    'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
+    connect: [], disconnect: [], 'connection-status': [],
+    'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], use: ['session'], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command');
   while (args.length) {
@@ -111,7 +113,10 @@ export async function runAutoSwitch(args, env = process.env, {
 } = {}) {
   const { command, options } = argumentsFor([...args]);
   const directory = dataDirectory(options['data-dir'], env);
-  if (command === 'help') return { commands: ['inspect', 'configure', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+  if (command === 'help') return { commands: ['inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+    use: 'Natural-language entry: use enables monitoring only for this already-connected thread; it never launches another CLI or approves a switch.',
+    connect: 'One-time setup for ordinary codex: connect this Codex home\'s future new conversations to the gateway. Existing running threads are unchanged; monitoring remains off.',
+    disconnect: 'Restore only the two defaults still owned by this plugin. Existing gateway conversations and monitoring are unchanged; the gateway stays running.',
     configure: 'configure --primary-name NAME --backup-name NAME (or --primary-provider ID --backup-provider ID) [--cc-switch-dir PATH] [--port 15722]',
     launch: 'launch [--resume THREAD_ID] [--provider-name NAME | --provider-id ID] (default: primary; no global config edits)',
     enable: 'enable [--session THREAD_ID] (monitor an already successful primary-route thread; never changes its route)',
@@ -119,6 +124,26 @@ export async function runAutoSwitch(args, env = process.env, {
     incidents: 'Use guard.mjs propose-switch / approve-switch / decline-switch / wait-switch for an incident request',
     scope: 'Pause on the first valid fingerprint mismatch. Each target verification and switch requires consent for that incident. Configuration, enable and acknowledgement never approve a switch.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);
+  if (command === 'connection-status') return nativeIntegrationStatus(directory, env, { connect: openClient });
+  if (command === 'disconnect') return removeNativeIntegration(directory, env, { connect: openClient });
+  if (command === 'connect') {
+    if (directory !== dataDirectory(undefined, env)) {
+      throw new Error('Ordinary codex startup must discover the same data directory. Use this Codex home default or the same MODELTRACE_AUTOSWITCH_DATA environment for both setup and ordinary codex; a command-only --data-dir cannot be connected');
+    }
+    const config = await loadGatewayConfig(directory);
+    const layout = await verifyGatewayReady(directory, config);
+    const client = await openClient(env, { nativeOpenai: true });
+    try {
+      const { account } = await client.request('account/read', { refreshToken: false });
+      if (account?.type !== 'chatgpt') throw new Error('This native Codex process did not read a ChatGPT login. Check the active Codex home/provider; do not infer that the user has never signed in');
+      const { requireTrustedStartupHook } = await import('./startup.mjs');
+      await requireTrustedStartupHook(client, process.cwd());
+    } finally { await client.close(); }
+    await startGateway(directory);
+    const connection = await nativeIntegrationStatus(directory, env, { connect: openClient });
+    const reconnect = layout.defaultProvider === config.primary.id && ['installed', 'conflict', 'repair_pending'].includes(connection.phase);
+    return installNativeIntegration(directory, env, { connect: openClient, reconnect });
+  }
   if (command === 'configure') {
     const current = await gatewayStatus(directory).catch(() => ({ running: false }));
     if (current.running) throw new Error('Stop this gateway before reconfiguring it');
@@ -168,10 +193,18 @@ export async function runAutoSwitch(args, env = process.env, {
   if (!UUID.test(session || '') || (env.CODEX_THREAD_ID && session !== env.CODEX_THREAD_ID)) throw new Error('Use the current native thread ID');
   if (command === 'status') {
     const state = await readState(directory, session);
+    const receipt = await readReceipt(directory, session);
+    const identities = [state?.autoSwitch?.current, state?.autoSwitch?.primary, state?.autoSwitch?.backup, state?.initialRoute?.provider];
+    const observedProvider = receipt && identities.find(provider => provider?.id === receipt.providerId);
     return { session, monitoringEnabled: state?.enabled === true, monitoringStoppedReason: state?.monitoringStoppedReason || null,
       initialRoute: state?.initialRoute || null, autoSwitch: state?.autoSwitch || null,
       switchRequest: state?.switchRequest || null, taskHalt: state?.taskHalt || null,
       configuration: await loadGatewayConfig(directory).then(publicConfig).catch(() => null),
+      connection: await nativeIntegrationStatus(directory, env, { connect: openClient }).catch(() => ({ readyForNewThreads: false, phase: 'unavailable' })),
+      lastRequest: receipt ? { provider: observedProvider?.name || receipt.providerId, transport: receipt.transport,
+        completed: receipt.completed, success: receipt.success, finishedAt: receipt.finishedAt,
+        scope: 'most_recent_gateway_request_only' } : null,
+      routeEvidenceNote: 'A logged-in account and its quota display do not prove the request route. lastRequest is local gateway evidence, not backend model identity.',
       gateway: await gatewayStatus(directory).catch(() => ({ running: false, reason: 'not_configured' })) };
   }
   if (command === 'disable') return withState(directory, session, state => {
@@ -182,6 +215,35 @@ export async function runAutoSwitch(args, env = process.env, {
     return { autoSwitch: state.autoSwitch || null, switchRequest: state.switchRequest || null,
       monitoringEnabled: false, routeUnchanged: true, taskHalt: state.taskHalt || null };
   });
+  if (command === 'use') {
+    const state = await readState(directory, session);
+    if (state?.autoSwitch?.protocol === 3 && state.autoSwitch.enabled && state.enabled) {
+      return { session, monitoringEnabled: true, alreadyEnabled: true, autoSwitch: state.autoSwitch,
+        switchRequest: state.switchRequest || null, taskHalt: state.taskHalt || null, switchApproved: false };
+    }
+    const current = state?.autoSwitch?.current || state?.initialRoute?.provider;
+    if (current?.transport === 'official') return { session, monitoringEnabled: false, status: 'personal_route_unmonitored',
+      provider: current.name, instruction: 'This thread selected the personal Official route. No automatic probes or route changes are needed.' };
+    if (state?.autoSwitch) return { session, monitoringEnabled: state.enabled === true, status: 'existing_policy',
+      autoSwitch: state.autoSwitch, taskHalt: state.taskHalt || null, switchRequest: state.switchRequest || null,
+      instruction: 'Keep the saved route and any halt. Repeated natural-language use never re-arms a disabled policy or grants switch consent.' };
+    const config = await loadGatewayConfig(directory);
+    const deadline = Date.now() + 1000;
+    let receipt;
+    do {
+      receipt = await readReceipt(directory, session);
+      if (receipt?.configId === config.id && receipt.success && receipt.completed) break;
+      await delay(25);
+    } while (Date.now() < deadline);
+    if (!receipt || receipt.configId !== config.id || !receipt.success || !receipt.completed) {
+      const connection = await nativeIntegrationStatus(directory, env, { connect: openClient });
+      return { session, monitoringEnabled: false, status: connection.readyForNewThreads ? 'new_conversation_required' : 'connection_setup_required',
+        connection, switchApproved: false,
+        instruction: connection.readyForNewThreads
+          ? 'The ordinary codex entry is configured, but this thread has no successful gateway request. Existing running threads cannot be hot-attached. Start a fresh ordinary codex conversation after setup, then ask to use this plugin; do not claim this thread is monitored.'
+          : 'Complete the one-time connect setup from the installed skill. It configures future ordinary codex conversations; no special launcher and no automatic monitoring. Check changed user/CCSwitch defaults before replacing anything.' };
+    }
+  }
   const { bank } = await loadArtifacts();
   const legacy = await readState(env.MODELTRACE_GUARD_DATA || path.join(env.CODEX_HOME || path.join(homedir(), '.codex'), 'modeltrace-guard'), session);
   if (legacy?.enabled || legacy?.taskHalt) throw new Error('The upstream ModelTrace Guard still monitors or halts this thread; finish/stop that monitor before opting into this fork');
@@ -192,7 +254,8 @@ export async function runAutoSwitch(args, env = process.env, {
     ]);
     if (!bank.models.some(m => m.id === settings.model)) throw new Error('This exact model label is absent from the fingerprint bank; monitored switching is unavailable');
     await requireTrustedGuard(client, settings.cwd);
-    return enableAutoSwitch(directory, session, { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
+    const policy = await enableAutoSwitch(directory, session, { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
+    return command === 'use' ? { session, monitoringEnabled: true, status: 'monitoring_enabled', autoSwitch: policy, switchApproved: false } : policy;
   } finally { await client.close(); }
 }
 

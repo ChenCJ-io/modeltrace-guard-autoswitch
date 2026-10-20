@@ -1,8 +1,8 @@
-# 安装 ModelTrace Guard Autoswitch 0.3.0
+# 安装 ModelTrace Guard Autoswitch 0.4.0
 
 这是安装前给 Codex 和使用者的入口。用户提供仓库 URL 或本地目录后，先读取本文件，再运行仓库自带安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
 
-**安装和配置主备都不授权切换，也不会开启监测。** v0.3 在每次首次指纹异常时暂停询问，只有用户同意本次目标后才进行验证与切换。
+**安装和配置主备都不授权切换，也不会开启监测或接管原生默认入口。** v0.4 完成一次性接入后，用户照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。每次首次指纹异常仍须暂停询问，获得本次目标的同意后才验证与切换。
 
 ## 取得用户指定的源码
 
@@ -43,7 +43,7 @@ node "/path/to/modeltrace-guard-autoswitch/scripts/install-plugin.mjs" \
 
 执行顺序是：校验本地 marketplace 与插件身份/版本，`codex plugin marketplace add LOCAL_PATH`，`codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch`，再按需调用 `autoswitch.mjs configure --primary-name ... --backup-name ...`。执行使用 `execFile` 参数数组，不拼 shell。步骤失败即停止，不回滚已完成安装；例如配置重名失败时，插件可能已安装成功。
 
-助手不读取认证文件、不改 hook 信任、不启动网关或推理，不调用 `enable`、`approve-switch`。主备名称需成对提供；未提供时不替用户选择。若名称有歧义，安装后用 `inspect` 选择 ID，再明确执行：
+助手不读取认证文件、不改 hook 信任、不启动网关或推理，不调用 `connect`、`use`、`enable`、`approve-switch`。主备名称需成对提供；未提供时不替用户选择。若名称有歧义，安装后用 `inspect` 选择 ID，再明确执行：
 
 ```sh
 node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs inspect
@@ -55,15 +55,23 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs configure \
 
 ## 信任、接入和监测是后续步骤
 
-安装完成后，在兼容 Codex CLI 的 `/hooks` 中由用户审阅并信任插件。不要替用户执行信任修改；更新后如 hook 定义变化，再按原生机制审阅。加载新插件后，已安装技能负责后续自然语言请求。
+安装完成后，在兼容 Codex CLI 的 `/hooks` 中由用户审阅并信任插件。v0.4 增加同步 `SessionStart` 启动 hook，旧版信任不保证覆盖新定义；不要替用户执行信任修改。加载新插件后，由技能处理后续 setup 或“使用 modeltrace-guard-autoswitch”请求，不再让用户手输专用启动器。
 
-主配置和第三方备用须通过 CCSwitch 4.0.15 界面加入 Stack；保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。所有 `launch`/`enable` 均要求当前 CLI 原生 ChatGPT 登录和 `openai` 契约；Official 目标还须没有 managed account，使用当前原生登录。
+主配置和第三方备用须通过 CCSwitch 4.0.15 界面加入 Stack；保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。接入要求当前 Codex home 的原生 ChatGPT 登录与 `openai` 契约；Official 目标还须没有 managed account 或存储的登录快照。
 
-CCSwitch 全局 provider 可能是 `custom`；插件会在认证检查进程中显式选用 `openai`，不会改变全局配置或代为登录。如果此时 `account/read` 仍返回 `account: null`，须先在对应 `CODEX_HOME` 的原生 Codex 中完成 ChatGPT 登录。不要读取、复制其他配置的凭据来绕过检查，也不要把安装成功或公司卡请求成功报告成原生接入已可用。
+CCSwitch 全局 provider 可能是 `custom`；认证检查会为自己的进程显式选用 `openai`，不会代为登录。若返回 `account: null`，先核对实际 Codex home、provider 和原生登录，不推断用户从未登录，不读取或复制其他配置的凭据来绕过检查。
 
-用户要求接入时，用 `autoswitch.mjs gateway-start`、`launch` 启动独立的原生 CLI，新会话默认主配置；明确选择其他有效配置时可用 `launch --provider-name NAME`。这只为新启动的进程设置网关，不会热修改已开的 Desktop 或其他 CLI。`launch --resume UUID` 只能尝试在新 CLI 中继续同一 thread，成功后在该 CLI 内工作；原窗口保持原连接，旧认证和加密历史不保证兼容。已建立路由的 thread 不会被启动参数重新选路。
+用户要求 setup 或使用插件时，技能可完成一次性 `autoswitch.mjs connect` 准备，并如实说明范围：仅将当前 Codex home 的 `model_provider`、`openai_base_url` 默认值接到网关，保存两键原值，影响未来新会话；不改 auth、不动其他 home（例如 `.codex-personal`）、不重启 daemon、不热改旧 thread，也不启用全部会话监测。`connect` 使用原生版本与原值校验，遇到外部修改或配置覆盖不擅自覆盖。
 
-当前 thread 通过网关成功使用主配置后，用户要求监测才运行 `enable --session UUID`。`enable` 不改变路由。只有这条接入并启用的路径才进入本插件监测，安装本身没有探针费用。
+接入与普通 `codex` 启动必须找到同一数据目录；仅命令行使用、普通启动不继承的 `--data-dir` 不可 connect。需要自定义目录时，让两者继承相同的 `MODELTRACE_AUTOSWITCH_DATA`。
+
+首次安装所在的旧会话可能尚未经过网关。技能执行 `use --session UUID` 后若返回 `connection_setup_required`，先完成缺少的 connect；返回 `new_conversation_required` 或准备完成后，明确告知用户新建一个普通 Codex 会话一次，再说“使用 modeltrace-guard-autoswitch”。不得把写盘成功、相同 thread ID 或账号额度 UI 当作旧窗口已改道的证据。`launch` 仅保留为高级诊断兼容入口，不作为正常流程。
+
+正常新会话由同步 `SessionStart` 的 `startup.mjs` 在已拥有且有效的接入配置就绪时保证网关启动；它不启用监测或自动修复 CCSwitch 漂移。单独 `gateway-start` 也不会接入原生默认入口。`connection-status` 检查未来新会话默认值，当前会话实际渠道要由其成功网关回执证明。
+
+CCSwitch 退出、重启或用户切卡可能重写入口，setup 不保证永久占有。用户再次要求使用插件时，允许显式 connect 重连：CCSwitch 须仍选中配置的主卡，当前两个键须逐项等于保存的原值或旧 owned 值；任意其他配置继续拒绝。启动 hook 只报告漂移，不自动重连。
+
+用户在当前会话要求使用插件时，技能执行 `use`：已接网关的主渠道 thread 才启用监测，个人初始路线保持不检测；成功切入个人后也不再排周期探针。重复 use 不重开已停策略、不清 halt、不授权切换。`disconnect` 仅安全恢复仍归插件拥有的两键原值，不改现有会话、监测或网关运行状态。
 
 首次异常时报告候选及其不确定性，等待该次选择。`acknowledge` 是已告知，不是同意。用户说“同意切到 Doro”后，解析该目标，用 `guard.mjs propose-switch --request ID --target-name "Doro"` 准备，再对该目标 ID 执行 `guard.mjs approve-switch`；每次 proposal 都产生新请求 ID，approve/wait/decline 必须使用新返回的 ID，不重复请求同一份明确同意。未获得本次同意、目标身份或配置发生变化时，不发送目标验证请求。完整命令与失败边界见 [README](README.md)。
 

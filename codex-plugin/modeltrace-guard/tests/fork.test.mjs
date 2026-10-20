@@ -478,10 +478,15 @@ const backgroundEvent = (f, extra = {}) => ({ session_id: f.session, hook_event_
 const managementEvent = (f, command) => backgroundEvent(f, { tool_name: 'exec_command', tool_input: { cmd: `node guard.mjs ${command}` } });
 const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
 
-test('only probe-trigger hooks are native async; tool blocking and cancellation remain synchronous', async () => {
+test('probe hooks stay async while transport startup, tool blocking and cancellation are synchronous', async () => {
   const config = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
   for (const [event, groups] of Object.entries(config.hooks)) {
     for (const group of groups) for (const handler of group.hooks) {
+      if (handler.command.includes('startup.mjs')) {
+        assert.equal(event, 'SessionStart'); assert.notEqual(handler.async, true);
+        assert.ok(handler.timeout <= 30); assert.ok(!handler.command.includes('background-hook'));
+        continue;
+      }
       assert.equal(handler.async === true, BACKGROUND_EVENTS.includes(event), event);
       assert.equal(handler.command.includes("main(['background-hook'])"), BACKGROUND_EVENTS.includes(event), event);
       if (handler.async) assert.equal(handler.timeout, BACKGROUND_TIMEOUT_SECONDS);
@@ -690,10 +695,10 @@ test('probe processes, subagents and other tasks cannot start background inferen
 
 test('runtime readiness requires loaded trusted native async hooks and a synchronous work guard from one source', async () => {
   const config = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
-  const hooks = Object.entries(config.hooks).map(([name, groups]) => ({
-    eventName: name[0].toLowerCase() + name.slice(1), ...groups[0].hooks[0], async: groups[0].hooks[0].async || false,
+  const hooks = Object.entries(config.hooks).flatMap(([name, groups]) => groups.flatMap(group => group.hooks.map(handler => ({
+    eventName: name[0].toLowerCase() + name.slice(1), ...handler, async: handler.async || false,
     enabled: true, trustStatus: 'trusted', pluginId: 'modeltrace-guard@fixture', handlerType: 'command', sourcePath: path.join(ROOT, 'hooks/hooks.json'),
-  }));
+  }))));
   const client = (items) => ({ request: async () => ({ data: [{ hooks: items }] }) });
   await requireTrustedGuard(client(hooks), ROOT);
   for (const change of ['sync-probe', 'async-guard', 'untrusted', 'missing']) {
@@ -701,7 +706,7 @@ test('runtime readiness requires loaded trusted native async hooks and a synchro
     if (change === 'sync-probe') broken.find((h) => h.eventName === 'postToolUse').async = false;
     if (change === 'async-guard') broken.find((h) => h.eventName === 'preToolUse').async = true;
     if (change === 'untrusted') broken.find((h) => h.eventName === 'userPromptSubmit').trustStatus = 'modified';
-    if (change === 'missing') broken.splice(broken.findIndex((h) => h.eventName === 'sessionStart'), 1);
+    if (change === 'missing') broken.splice(broken.findIndex((h) => h.eventName === 'sessionStart' && h.async), 1);
     await assert.rejects(() => requireTrustedGuard(client(broken), ROOT), /native async/);
   }
 });

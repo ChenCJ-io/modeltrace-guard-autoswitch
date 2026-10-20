@@ -1,28 +1,38 @@
 # ModelTrace Guard Autoswitch
 
-独立 fork `0.3.0`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+独立 fork `0.4.0`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+
+完成一次性接入后，照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。技能执行 `autoswitch.mjs use`，只为当前已接入的主渠道 thread 开启监测；个人会话默认不检测，无需专用启动器。
 
 ## 主配置、异常询问和本次切换
 
-默认使用用户配置的主服务，例如 API2 copy。安装插件、保存主备和 `enable` 都不授权切换。通过网关成功使用主配置并显式开启监测后，首次有效指纹不一致立即暂停并进入 `awaiting_approval`；此时不隐式复测、不请求备用。
+默认使用用户配置的主服务，例如 API2 copy。安装插件、connect、保存主备和 use/enable 都不授权切换。通过网关成功使用主配置并显式开启监测后，首次有效指纹不一致立即暂停并进入 `awaiting_approval`；此时不隐式复测、不请求备用。
 
 所有命令在本插件目录执行：
 
 ```sh
 node scripts/autoswitch.mjs inspect
 node scripts/autoswitch.mjs configure --primary-name "API2 copy" --backup-name "Doro"
-node scripts/autoswitch.mjs gateway-start
-node scripts/autoswitch.mjs launch
-# 当前会话已成功通过网关使用主配置后：
-node scripts/autoswitch.mjs enable --session SESSION_UUID
+node scripts/autoswitch.mjs connect
+node scripts/autoswitch.mjs connection-status
+# 之后在普通 codex 新会话中，技能执行：
+node scripts/autoswitch.mjs use --session SESSION_UUID
 node scripts/autoswitch.mjs status --session SESSION_UUID
 ```
 
+这是技能执行的准备和管理命令，不要求用户手工启动另一套 CLI。安装助手只安装插件、可选保存明确的主备，不调用 connect。用户随后要求 setup 或使用插件时，技能完成一次性 connect 并说明范围：仅修改当前 Codex home 的 `model_provider`、`openai_base_url` 两项未来新会话默认值，保存原值；不修改 auth、其他 home（例如 `.codex-personal`）、CCSwitch 默认卡或旧 thread，不重启 daemon。写入采用原生版本和原值校验，冲突时不覆盖外部修改。
+
+connect 的数据目录必须与普通启动一致，不能仅用命令行 `--data-dir` 指向普通 `codex` 找不到的位置；自定义目录需共同继承 `MODELTRACE_AUTOSWITCH_DATA`。CCSwitch 退出、重启或切卡可能重写入口；用户再次要求使用插件时，可显式 connect 重连，但只接受 CCSwitch 主卡未变且两键逐项为原值或旧 owned 值的情形。其他配置不覆盖，启动 hook 只报告，不后台抢回入口。
+
+首次安装所在的旧会话没有网关回执时，use 返回 `connection_setup_required` 或 `new_conversation_required`。完成缺少的准备后，新建一个普通 Codex 会话一次，再说“使用 modeltrace-guard-autoswitch”；不能把旧窗口报告为已热接管。
+
 名称先完全匹配，未命中时允许唯一的不区分大小写匹配；重名时从 `inspect` 选 ID，使用 `configure --primary-provider ID --backup-provider ID`，不能混用 name/ID。配置须在网关停止时更新；新配置 ID 不会自动迁移旧路由会话。
 
-所有 `launch`/`enable` 都要求当前 CLI 的原生 ChatGPT 登录和 `openai` 契约。认证检查会为自己的 app-server 进程显式选用 `openai`，避免 CCSwitch 全局 `custom` 配置掩盖原生认证状态；它不会代为登录。若此时仍是 `account: null`，必须先在对应原生 Codex 配置中完成 ChatGPT 登录，不能复制其他配置的凭据或声称已真实接入。
+接入要求当前 Codex home 的原生 ChatGPT 登录和 `openai` 契约。认证检查为自己的 app-server 进程显式选用 `openai`，避免 CCSwitch 全局 `custom` 配置掩盖原生认证状态，不会代为登录。若返回 `account: null`，核对这个进程的 home/provider 与原生登录；不推断用户从未登录，不复制另一配置的凭据。
 
-`launch` 启动独立的原生 CLI，新会话默认主配置；`launch --provider-name NAME` 可明确选择其他有效配置开始，不授权未来切换。它不会热修改已有 Desktop 或其他 CLI 窗口。`launch --resume UUID` 只尝试在新 CLI 继续同一 thread，成功后在该 CLI 内工作；原窗口连接不变，旧认证和加密历史不保证兼容。已有 thread 路由也不会被启动参数覆盖。
+同步 `SessionStart` hook 的 `startup.mjs` 在本插件拥有且有效的接入配置就绪时保证网关启动，不启用监测、不改默认值、不自动修复 CCSwitch 漂移。`gateway-start` 单独启动服务，不等于接入默认入口。`connection-status` 说明未来新会话的配置；当前请求渠道要看对应 thread 的成功回执，账号或额度 UI 不是路由证据。
+
+`launch`、`launch --provider-name NAME`、`launch --resume UUID` 保留为高级诊断兼容命令，不作为普通使用步骤。它们不热改原窗口，不保证旧认证和加密历史兼容，也不覆盖已有 thread 的选路或切换确认。
 
 异常报告包含预期模型、指纹候选、时间及强弱信号；指纹不等于后端身份或降智证据。`acknowledge` 只是确认已告知，不是用户批准。目标操作如下：
 
@@ -40,7 +50,7 @@ node scripts/guard.mjs decline-switch --request REQUEST_ID
 
 批准后才运行目标路由的原生 canary，真实 `completed` 回执与兼容指纹全部通过才切换并解除本次暂停；失败保持 halt。失败收尾后，用户明确改选目标时可从当前失败请求创建新 proposal，使用新 ID 记录对新目标的本次同意；已经说清的同意不重复询问，不能继承旧批准。Official 成功后停止探针，第三方目标成功后继续监测，下一次异常再次询问。拒绝待批准的切换会保留当前路由、恢复任务与普通间隔监测。不会自动回主。
 
-`disable --session UUID` 停止监测，保留路由、已有 halt 和证据。`gateway-stop` 停止代理，依赖它的会话请求随后会失败，直到重新启动；`gateway-status` 用于查看服务状态。
+`disable --session UUID` 停止监测，保留路由、已有 halt 和证据。`disconnect` 仅恢复仍归插件拥有的两键原值，不覆盖用户后续修改，不改变现有会话或监测，也不关闭网关。`gateway-stop` 停止代理，依赖它的会话请求随后会失败，直到重新启动；`gateway-status` 用于查看服务状态。
 
 ## 运行环境和边界
 
@@ -48,9 +58,9 @@ node scripts/guard.mjs decline-switch --request REQUEST_ID
 
 主配置及第三方目标须加入 CCSwitch 4.0.15 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收认证头，不读取凭据存储、不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
 
-安装后在 Codex CLI 的 `/hooks` 中审阅并信任 ModelTrace Guard Autoswitch。hook 定义变更后须按原生机制重新审阅；智能体不能代改信任。可用 `node scripts/guard.mjs doctor` 检查打包文件；`doctor --fork true` 另检查原生 fork、hook 与清理能力，会创建临时分支但不生成探针。存在多个运行时时可用 `MODELTRACE_CODEX_PATH` 选择正确可执行文件，不通过换账户绕过检查。
+安装后在 Codex CLI 的 `/hooks` 中审阅并信任 ModelTrace Guard Autoswitch。v0.4 新增同步启动 hook，定义变更后须按原生机制重新审阅；智能体不能代改信任。可用 `node scripts/guard.mjs doctor` 检查打包文件；`doctor --fork true` 另检查原生 fork、hook 与清理能力，会创建临时分支但不生成探针。存在多个运行时时可用 `MODELTRACE_CODEX_PATH` 选择正确可执行文件，不通过换账户绕过检查。
 
-安装到一个 CLI 配置不会自动监测其所有任务。只有接网关并为当前 thread `enable` 才进入本插件主要流程。不同 `CODEX_HOME` 的配置与数据相互独立；不能让原版监测器同时监测同一 thread。
+安装、connect 和网关自启都不会自动监测全部任务。当前已接入主渠道的 thread 执行 use 才进入主要流程；重复 use 不重开已停策略、不清 halt。个人初始路线与成功切入 Official 的路线不排后续周期探针；普通诊断须用户另行明确请求。不同 `CODEX_HOME` 的配置与数据相互独立，不能让原版监测器同时监测同一 thread。
 
 ## 原生采样与通知
 
