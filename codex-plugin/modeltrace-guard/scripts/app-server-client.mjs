@@ -3,7 +3,7 @@ import { access, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { readProtocolLines } from './protocol-lines.mjs';
 
-export const CODEX_CLIENT_INFO = Object.freeze({ name: 'modeltrace_guard', version: '0.4.1' });
+export const CODEX_CLIENT_INFO = Object.freeze({ name: 'modeltrace_guard', version: '0.4.2' });
 
 // Use Codex's own transport and configured account/provider, never a parallel
 // hand-written Responses/Chat client. Do not print protocol history or stderr.
@@ -104,12 +104,20 @@ export class AppServerClient {
   }
 }
 
-export async function openAppServer(env = process.env, { nativeOpenai = false } = {}) {
+// Session-flag hook state (`hooks.state."<key>".enabled=false`) silences the
+// user's other hooks for this temporary process only. Keys contain dots, so
+// they are passed as one inline TOML table rather than a dotted path.
+export function disabledHooksOverride(keys) {
+  const unique = [...new Set(keys)].filter((key) => typeof key === 'string' && key.trim() && !/[\x00-\x1f]/.test(key));
+  return unique.length ? ['-c', `hooks.state={${unique.map((key) => `${JSON.stringify(key)}={enabled=false}`).join(',')}}`] : [];
+}
+
+export async function openAppServer(env = process.env, { nativeOpenai = false, disabledHooks = [] } = {}) {
   const executable = await codexExecutable(env);
   // CCSwitch may select a custom provider globally. The switch bridge uses the
   // native openai auth contract; its temporary process must inspect that same
   // contract instead of custom-provider account/read (which returns null).
-  const child = spawn(executable, ['app-server', '--stdio', ...(nativeOpenai ? ['-c', 'model_provider="openai"'] : [])], {
+  const child = spawn(executable, ['app-server', '--stdio', ...(nativeOpenai ? ['-c', 'model_provider="openai"'] : []), ...disabledHooksOverride(disabledHooks)], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...env, MODELTRACE_PROBE_PROCESS: '1' },
   });

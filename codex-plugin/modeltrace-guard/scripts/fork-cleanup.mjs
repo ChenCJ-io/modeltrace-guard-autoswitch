@@ -1,4 +1,5 @@
 import { open, readFile, readdir, rename, unlink } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -13,25 +14,37 @@ export const CLEANUP_SOURCE_KINDS = Object.freeze([
   'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown',
 ]);
 
+// A base that may have been used or reparented is kept for the user to review.
+// Any other failure (timeout, lost transport) is retried by a later sweep.
+const preserve = (message) => Object.assign(new Error(message), { code: 'MODELTRACE_CLEANUP_PRESERVE' });
+export const CLEANUP_MAX_ATTEMPTS = 8;
+export const cleanupRetryDelay = (attempts) => Math.min(3600000, 30000 * 2 ** Math.max(0, attempts - 1));
+export function cleanupFailure(job, error, now = Date.now()) {
+  const attempts = (job.attempts || 0) + 1;
+  return error.code === 'MODELTRACE_CLEANUP_PRESERVE' || attempts >= CLEANUP_MAX_ATTEMPTS
+    ? { status: 'blocked', error: error.message, checkedAt: now, attempts }
+    : { status: 'pending', error: error.message, checkedAt: now, attempts, retryAfter: now + cleanupRetryDelay(attempts) };
+}
+
 export async function cleanSnapshot(client, job) {
   const snapshot = job.snapshot;
   if (job.purpose !== 'modeltrace-temporary-base' || !snapshot?.sourceSession || snapshot.id === snapshot.sourceSession) throw new Error('Invalid temporary fork ownership');
   let thread;
   try { ({ thread } = await client.request('thread/read', { threadId: snapshot.id, includeTurns: false })); }
   catch (error) { if (/no rollout found|thread not found|not found for thread/i.test(error.message)) return { status: 'deleted', alreadyAbsent: true }; throw error; }
-  if (thread.id !== snapshot.id || thread.forkedFromId !== snapshot.sourceSession || thread.ephemeral || thread.path !== snapshot.path) throw new Error('Temporary fork ownership changed; nothing deleted');
+  if (thread.id !== snapshot.id || thread.forkedFromId !== snapshot.sourceSession || thread.ephemeral || thread.path !== snapshot.path) throw preserve('Temporary fork ownership changed; nothing deleted');
   const turn = await lastTurn(client, snapshot.id);
-  if (!snapshot.sourceTurn || turn?.id !== snapshot.sourceTurn || turn.status === 'inProgress') throw new Error('Temporary base was used or its boundary is unknown; preserving it for user review');
+  if (!snapshot.sourceTurn || turn?.id !== snapshot.sourceTurn || turn.status === 'inProgress') throw preserve('Temporary base was used or its boundary is unknown; preserving it for user review');
   for (const archived of [false, true]) {
     const descendants = await client.request('thread/list', {
       ancestorThreadId: snapshot.id, limit: 1, archived,
       sourceKinds: [...CLEANUP_SOURCE_KINDS], modelProviders: [], useStateDbOnly: true,
     });
     if (!Array.isArray(descendants?.data)) throw new Error('Cannot verify temporary base descendants; nothing deleted');
-    if (descendants.data.length || descendants.nextCursor) throw new Error('Temporary base has persisted descendants; preserving them for user review');
+    if (descendants.data.length || descendants.nextCursor) throw preserve('Temporary base has persisted descendants; preserving them for user review');
   }
   const latest = await lastTurn(client, snapshot.id);
-  if (latest?.id !== snapshot.sourceTurn || latest.status === 'inProgress') throw new Error('Temporary base changed during cleanup checks; nothing deleted');
+  if (latest?.id !== snapshot.sourceTurn || latest.status === 'inProgress') throw preserve('Temporary base changed during cleanup checks; nothing deleted');
   await client.request('thread/delete', { threadId: snapshot.id }, 45000);
   return { status: 'deleted', deletedAt: Date.now() };
 }
@@ -48,6 +61,7 @@ export async function cleanupPending(directory, env = process.env, { retryBlocke
       try { job = JSON.parse(await readFile(filename, 'utf8')); } catch { continue; }
       if (job.snapshot?.id !== name.slice(0, -5)) continue;
       if (job.status === 'deleted' || (job.status === 'blocked' && !retryBlocked)) continue;
+      if (job.status === 'pending' && job.retryAfter > Date.now()) continue;
       if (job.status === 'active' && processAlive(job.ownerPid)) continue;
       if (job.status === 'active') {
         const state = await readState(directory, job.snapshot.sourceSession);
@@ -66,7 +80,7 @@ export async function cleanupPending(directory, env = process.env, { retryBlocke
         client ||= await openAppServer(env);
         let result;
         try { result = await cleanSnapshot(client, job); }
-        catch (error) { result = { status: 'blocked', error: error.message, checkedAt: Date.now() }; }
+        catch (error) { result = cleanupFailure(job, error); }
         const next = { ...job, ...result }, temporary = `${filename}.${process.pid}.tmp`;
         const file = await open(temporary, 'w', 0o600);
         try { await file.writeFile(JSON.stringify(next)); await file.sync(); } finally { await file.close(); }
@@ -84,6 +98,6 @@ export async function cleanupPending(directory, env = process.env, { retryBlocke
   return results;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await cleanupPending(process.argv[2], process.env, { retryBlocked: process.argv[3] === '--retry-blocked' }).catch(() => { process.exitCode = 1; });
 }

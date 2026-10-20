@@ -12,6 +12,7 @@ export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
+  consumeUserReply, noteUserReply,
   interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK, stopMonitoring,
 } from './state.mjs';
 
@@ -44,7 +45,7 @@ export function challengeContext(state, directory) {
 export function controlContext(state, directory) {
   const switching = switchControlContext(state, directory, ROOT);
   if (switching) return switching;
-  if (state.taskHalt) return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+  if (state.taskHalt) return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision; resume is accepted only after the user's next message. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
   const batch = state.confirmation;
   if (batch?.status === 'active') {
     const command = directory ? `\nnode ${quote(path.join(ROOT, 'scripts', 'guard.mjs'))} wait --session ${quote(state.session)} --data-dir ${quote(directory)} --confirmation ${quote(batch.id)}` : '';
@@ -70,16 +71,49 @@ function ownCommand(event) {
   return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
+// Splits one simple command the way the host shell would, mirroring `quote`
+// (POSIX `'\''`, PowerShell `''`). Returns null for anything that could run
+// more than one plain program invocation: unquoted operators, expansions,
+// globs, comments, line breaks or unbalanced quotes. Quoted text is literal.
+export function commandWords(command, platform = process.platform) {
+  if (/[\r\n\0]/.test(command)) return null;
+  const windows = platform === 'win32', plain = windows ? /[A-Za-z0-9_\-./:+=\\]/ : /[A-Za-z0-9_\-./:+=]/;
+  const words = [];
+  let word = null;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (c === ' ' || c === '\t') { if (word !== null) words.push(word); word = null; continue; }
+    word ??= '';
+    if (c === "'") {
+      for (i++; ; i++) {
+        if (i >= command.length) return null;
+        if (command[i] !== "'") { word += command[i]; continue; }
+        if (windows && command[i + 1] === "'") { word += "'"; i++; continue; }
+        break;
+      }
+    } else if (c === '"') {
+      for (i++; command[i] !== '"'; i++) {
+        if (i >= command.length || ['$', '`', '\\'].includes(command[i])) return null;
+        word += command[i];
+      }
+    } else if (c === '\\' && !windows) {
+      if (++i >= command.length) return null;
+      word += command[i];
+    } else if (plain.test(c)) word += c;
+    else return null;
+  }
+  if (word !== null) words.push(word);
+  return words;
+}
+
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
 // bypass a halt. The only escape is one direct invocation of this exact runner.
 export function isControlCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  if (/[\r\n;|&`$<>]/.test(command)) return false;
-  const words = command.match(/'[^']*'|"[^"]*"|[^\s'"]+/g) || [];
-  const tokens = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
-  if (tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
+  const tokens = commandWords(command);
+  if (!tokens || tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
   if (path.resolve(tokens[1]) === path.join(ROOT, 'scripts', 'autoswitch.mjs')) {
     if (!['status', 'disable', 'gateway-status', 'gateway-stop', 'connection-status'].includes(tokens[2]) || (tokens.length - 3) % 2) return false;
     const seen = new Set();
@@ -99,6 +133,22 @@ function preToolDecision(event, state, directory) {
   const reason = state ? notificationContext(state, directory) || controlContext(state, directory) : null;
   const ask = state?.switchRequest?.status === 'pending' && ['request_user_input', 'request_user_input_async'].includes(event.tool_name);
   if (reason && !ask && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  return {};
+}
+
+// Subagents never contribute samples, but they share the root task's pause.
+// Their hooks carry the root session_id plus their own agent_id (older hosts:
+// their own session_id plus parent_session_id), so check every root candidate.
+async function subagentDecision(event, directory) {
+  if (event.hook_event_name !== 'PreToolUse') return {};
+  for (const root of new Set([event.session_id, event.parent_session_id])) {
+    if (typeof root !== 'string' || !root || root.length > 256) continue;
+    let state;
+    try { state = await readState(directory, root); } catch { continue; }
+    if (!state || !controlContext(state, directory)) continue;
+    const reason = 'ModelTrace Guard: the parent task is paused by a model fingerprint check and is waiting for the user. Subagents must not continue task work. Stop now without further tool calls and tell the parent that work is paused. Do not try to approve, resume or work around the pause.';
+    return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  }
   return {};
 }
 
@@ -128,7 +178,7 @@ async function busyHookFallback(event, directory, error) {
 export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
   // No subagent samples may be submitted as root-task evidence.
-  if (event.agent_id || event.parent_session_id) return {};
+  if (event.agent_id || event.parent_session_id) return subagentDecision(event, directory);
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
   if (!supported.includes(event.hook_event_name)) return {};
   if (['PreToolUse', 'PostToolUse', 'Stop'].includes(event.hook_event_name)) {
@@ -144,6 +194,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     state.lastHookAt = now;
     if (background) state.lastBackgroundHookAt = now;
     state.hooksSeen += 1;
+    if (hook === 'UserPromptSubmit' || (hook === 'PostToolUse' && event.tool_name === 'request_user_input')) noteUserReply(state, now);
     const priorTurn = state.turn;
     const currentTurn = setTurn(state, event.turn_id);
     if (currentTurn && hook === 'UserPromptSubmit' && priorTurn && state.turn !== priorTurn && isRecoveryActive(state)) {
@@ -329,7 +380,8 @@ export async function run(args, env = process.env, receipt = null) {
   if (command === 'hook' || command === 'background-hook') {
     const event = await stdinJson();
     if (env.MODELTRACE_PROBE_PROCESS === '1') return event.hook_event_name === 'PreToolUse' ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'ModelTrace disposable probes are text-only; no tools or original task work are allowed.' } } : {};
-    if (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID) return {};
+    const subagent = command === 'hook' && (event.agent_id || event.parent_session_id);
+    if (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID && !(subagent && event.agent_id === env.CODEX_THREAD_ID)) return {};
     if (command === 'background-hook') {
       const { handleBackgroundHook } = await import('./background.mjs');
       return handleBackgroundHook(event, directory, env);
@@ -447,6 +499,7 @@ export async function run(args, env = process.env, receipt = null) {
   return withState(directory, session, async (state) => {
     if (command === 'resume') {
       if (!state.taskHalt || options.halt !== state.taskHalt.id) throw new Error('Explicit user-approved resume requires the current halt ID');
+      consumeUserReply(state, 'Resuming the task');
       failAutoSwitch(state, now, 'user_resumed_current_route');
       abandon(state, now, 'user_resumed_current_route');
       record(state, 'task_resumed', now, { halt: state.taskHalt.id });

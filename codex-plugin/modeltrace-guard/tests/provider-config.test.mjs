@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -255,4 +257,18 @@ test('schema 1 automatic-switch configuration is rejected without rewriting or s
   const before = await readFile(configPath(f.directory), 'utf8');
   await assert.rejects(loadGatewayConfig(f.directory), /reconfigure.*per-incident approval/);
   assert.equal(await readFile(configPath(f.directory), 'utf8'), before);
+});
+
+test('inspection waits out CCSwitch\'s brief commit lock instead of failing the request', async t => {
+  const f = await fixture(t);
+  const writer = spawn('sqlite3', [f.db], { stdio: ['pipe', 'ignore', 'ignore'] }), exited = once(writer, 'exit');
+  writer.stdin.write("BEGIN EXCLUSIVE; INSERT INTO proxy_config VALUES('other','127.0.0.1',1,0);\n");
+  await delay(200);
+  const started = Date.now(), inspected = f.inspect();
+  await delay(600);
+  writer.stdin.end('COMMIT;\n');
+  const layout = await inspected;
+  assert.ok(Date.now() - started >= 500, 'the read waited for the lock');
+  assert.ok(layout.providers.some(row => row.id === 'company'));
+  await exited;
 });

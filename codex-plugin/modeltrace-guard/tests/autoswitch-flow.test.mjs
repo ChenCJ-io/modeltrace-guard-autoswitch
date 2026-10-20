@@ -157,6 +157,11 @@ async function fixture(t) {
     assert.ok(alert);
     return run(['acknowledge', '--data-dir', directory, '--session', session, '--alert', alert.id], {});
   }
+  // The user's next message reaches the plugin through the native async hook.
+  async function reply() {
+    await delay(2);
+    return handleBackgroundHook({ session_id: session, turn_id: 'fixture-turn', hook_event_name: 'UserPromptSubmit' }, directory, {}, dependencies);
+  }
   async function approve() {
     const current = await state();
     return approveSwitch(directory, session, current.switchRequest.id, current.switchRequest.target.id,
@@ -175,7 +180,7 @@ async function fixture(t) {
     assert.ok(current.samples.every(row => row.fork.routing.route === 'source' && row.fork.routing.success));
     return current;
   }
-  return { directory, session, sibling, state, background, acknowledge, approve, reachHalt, request,
+  return { directory, session, sibling, state, background, acknowledge, reply, approve, reachHalt, request,
     bases, forks, nativeCalls, upstreamRequests, originalHistory, historyBefore, clientsClosed: () => clientsClosed,
     holdFallback() { holdFallback = true; }, fallbackStarted: fallbackStarted.promise,
     releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; } };
@@ -192,6 +197,8 @@ test('first mismatch asks, acknowledgement spends no backup quota, and explicit 
   await assert.rejects(waitForSwitch(f.directory, f.session, halted.switchRequest.id), /Ask the user and yield/);
   const stopped = await handleHook({ session_id: f.session, turn_id: 'fixture-turn', hook_event_name: 'Stop' }, f.directory);
   assert.equal(stopped.decision, undefined, 'the consent question must yield to the user');
+  await assert.rejects(f.approve(), /user's reply/, 'the agent cannot approve within its own turn');
+  await f.reply();
   await f.approve();
   assert.equal((await f.state()).pending.kind, 'fallback_verification');
   f.holdFallback();
@@ -249,6 +256,7 @@ test('a completed fallback request with an incompatible fingerprint retains the 
   const f = await fixture(t), halted = await f.reachHalt();
   f.mismatchFallback();
   await f.acknowledge();
+  await f.reply();
   await f.approve();
   await f.background();
   const result = await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
@@ -267,6 +275,7 @@ test('a completed fallback request with an incompatible fingerprint retains the 
 test('Interrupt during a fallback request prevents a later successful receipt from clearing the halt', async t => {
   const f = await fixture(t), halted = await f.reachHalt();
   await f.acknowledge();
+  await f.reply();
   await f.approve();
   f.holdFallback();
   const worker = f.background();

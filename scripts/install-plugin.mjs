@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
 import { readFile, access } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -86,7 +87,7 @@ export async function installPlugin(options = {}, { run = execute, env = process
 
 const usage = 'node scripts/install-plugin.mjs [--source LOCAL_CHECKOUT] [--codex CODEX_EXECUTABLE] [--primary-name NAME --backup-name NAME]\nInstalls the local plugin; optional names only configure preferences. No monitoring, route switch, credential access or hook trust changes.\n';
 
-if (process.argv[1] && path.resolve(process.argv[1]) === entrypoint) {
+if (process.argv[1] && realpathSync(process.argv[1]) === entrypoint) {
   try {
     const options = parseInstallArgs(process.argv.slice(2));
     if (options.help) process.stdout.write(usage);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { digest, isMismatch, readState, record, schedule, segment, stopMonitoring, withState } from './state.mjs';
+import { consumeUserReply, digest, isMismatch, readState, record, schedule, segment, stopMonitoring, withState } from './state.mjs';
 import { UUID, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
   readJSON, resolveProvider, sameProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
@@ -190,7 +190,8 @@ export async function proposeSwitch(directory, session, id, selection, now = Dat
 }
 
 // This command records the agent/CLI's report of explicit user consent. It is
-// not cryptographic proof of a human response, and acknowledge never calls it.
+// not cryptographic proof of what the user said, and acknowledge never calls
+// it; it does require that the user actually replied after the report.
 export async function approveSwitch(directory, session, id, targetId, readiness, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
   return withState(directory, session, state => {
@@ -203,6 +204,7 @@ export async function approveSwitch(directory, session, id, targetId, readiness,
       throw new Error('Native login/model settings changed; approval cannot start verification');
     }
     assertProviderCurrent(layout, r.source); assertProviderCurrent(layout, r.target);
+    consumeUserReply(state, 'Switch approval');
     r.approval = { id: randomUUID(), requestId: r.id, haltId: r.haltId, providerId: r.target.id, fingerprint: r.target.fingerprint,
       configId: r.configId, policyId: r.policyId, revision: r.revision, approvedAt: now, recordedBy: 'agent_reported_user_consent' };
     r.status = 'approved';
@@ -233,6 +235,7 @@ export async function declineSwitch(directory, session, id, now = Date.now()) {
   return withState(directory, session, state => {
     const r = currentRequest(state, id);
     if (r.status !== 'pending' || state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Decline requires a pending proposal with reported alerts');
+    consumeUserReply(state, 'Declining the switch');
     r.status = 'declined'; r.finishedAt = now;
     state.taskHalt = null; state.autoSwitch.phase = 'armed';
     state.forceProbe = false; schedule(state, now);
@@ -287,7 +290,7 @@ export function switchControlContext(state, directory, root) {
   const command = (verb, suffix = '') => `node ${quote(path.join(root, 'scripts', 'guard.mjs'))} ${verb}`
     + ` --session ${quote(state.session)} --data-dir ${quote(directory || '')} --request ${quote(r.id)}` + suffix;
   if (p.phase === 'awaiting_approval' && r.status === 'pending') {
-    return `ModelTrace AutoSwitch: STOP original task work and ASK THE USER whether to switch from ${JSON.stringify(r.source.name)} to ${r.target ? JSON.stringify(r.target.name) : 'a user-named CCSwitch configuration'}. Explain the fingerprint candidate is uncertain, not proof of reduced capability; target verification consumes one probe before routing changes. Report and acknowledge the alert, then ask and yield for the user's answer. Do not poll, verify, approve, or switch while waiting for consent. Acknowledgement and installation are NOT switch consent.\nAfter explicit consent to the displayed target only: ${r.target ? command('approve-switch', ` --target-provider ${quote(r.target.id)}`) : 'first propose the requested named target'}.\nIf the user names another target: ${command('propose-switch', ' --target-name <exact-name>')}; approval must use the NEW request ID and target ID. If the user already explicitly said to switch to that named target, record that consent without asking redundantly.\nOnly if the user explicitly chooses to keep this provider and continue: ${command('decline-switch')}. Silence or an ambiguous answer never means consent.`;
+    return `ModelTrace AutoSwitch: STOP original task work and ASK THE USER whether to switch from ${JSON.stringify(r.source.name)} to ${r.target ? JSON.stringify(r.target.name) : 'a user-named CCSwitch configuration'}. Explain the fingerprint candidate is uncertain, not proof of reduced capability; target verification consumes one probe before routing changes. Report and acknowledge the alert, then ask and yield for the user's answer. Approve and decline are accepted only after the user's next message (or a request_user_input answer) that follows the acknowledgement. Do not poll, verify, approve, or switch while waiting for consent. Acknowledgement and installation are NOT switch consent.\nAfter explicit consent to the displayed target only: ${r.target ? command('approve-switch', ` --target-provider ${quote(r.target.id)}`) : 'first propose the requested named target'}.\nIf the user names another target: ${command('propose-switch', ' --target-name <exact-name>')}; approval must use the NEW request ID and target ID. If the user already explicitly said to switch to that named target, record that consent without asking redundantly.\nOnly if the user explicitly chooses to keep this provider and continue: ${command('decline-switch')}. Silence or an ambiguous answer never means consent.`;
   }
   if (p.phase === 'verifying' && r.status === 'verifying') return `ModelTrace AutoSwitch: the user approved ${JSON.stringify(r.target.name)} for this incident. Keep original task work paused while the approved target is verified. Do not clear the halt or replay work tools. Use the bounded read-only command: ${command('wait-switch')}. Continue only after autoswitch_verified; failure retains the halt and current route.`;
   return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, use ${command('propose-switch', ' --target-name <exact-name>')} and approve its NEW request ID. If comparison conditions changed, request a new primary check after an explicit resume instead.`;
@@ -335,7 +338,8 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
       return { ...receipt, policyId: p.policyId };
     },
     async close() {
-      if (forkId) for (const filename of [bindingPath(directory, forkId), probeReceiptPath(directory, forkId, pending.id)]) {
+      // A disposable fork never routes again; keep no per-fork files behind.
+      if (forkId) for (const filename of [bindingPath(directory, forkId), receiptPath(directory, forkId), probeReceiptPath(directory, forkId, pending.id)]) {
         await unlink(filename).catch(e => { if (e.code !== 'ENOENT') throw e; });
       }
     },

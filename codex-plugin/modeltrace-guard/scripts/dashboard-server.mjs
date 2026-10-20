@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { abandon, digest, interruptConfirmation, publicSample, record, schedule, setTaskName, validateConfig, withState } from './state.mjs';
 import { summarize } from './status.mjs';
 import { historyCount, historyPage } from './history.mjs';
+import { realpathSync } from 'node:fs';
 
 export const SERVICE = 'modeltrace-guard-dashboard-v1';
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web');
@@ -219,7 +220,7 @@ export async function createDashboard({ directory, token = randomBytes(32).toStr
 }
 
 // Launched only via a local IPC handshake; never accepts tokens in process args.
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (!process.send) throw new Error('Start via guard.mjs dashboard');
   process.once('message', async (message) => {
     try {

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { installPlugin, parseInstallArgs } from '../scripts/install-plugin.mjs';
@@ -96,4 +98,14 @@ test('an installation failure prevents all subsequent install or configure steps
     } }), error => error.stage === ['marketplace-add', 'plugin-add', 'configure'][failingStep]);
     assert.equal(calls.length, failingStep + 1);
   }
+});
+
+test('the installer runs when invoked through a symlinked checkout path', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'install-link-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const link = path.join(directory, 'checkout');
+  await symlink(path.dirname(path.dirname(fileURLToPath(import.meta.url))), link, process.platform === 'win32' ? 'junction' : 'dir');
+  const result = spawnSync(process.execPath, [path.join(link, 'scripts', 'install-plugin.mjs'), '--help'], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /install-plugin\.mjs/);
 });

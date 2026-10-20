@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { abandon, newState, readState, withState } from '../scripts/state.mjs';
+import { abandon, newState, readState, sessionPath, withState } from '../scripts/state.mjs';
 import { controlContext, handleHook, isControlCommand, ROOT, run } from '../scripts/guard.mjs';
 import { atomicJSON, approveSwitch, beginVerification, configureGateway, declineSwitch, eligibleForSwitch,
   enableAutoSwitch, finishVerification, haltBlocksProbe, loadGatewayConfig, prepareSwitchTransport, proposeSwitch,
@@ -74,6 +74,11 @@ function canary(state) {
     proposalId: r.id, approvalId: r.approval.id, challenge: state.pending.id,
     threadId: randomUUID(), requestId: randomUUID(), finishedAt: Date.now(),
   } } };
+}
+// The user's next message after the report; consent commands require one.
+async function userReplies(f) {
+  const state = await readState(f.directory, f.session);
+  await handleHook({ session_id: f.session, hook_event_name: 'UserPromptSubmit' }, f.directory, Math.max(Date.now(), state.lastUserReplyAt || 0) + 1);
 }
 async function pendingIncident(f) {
   await enable(f);
@@ -157,6 +162,8 @@ test('the only approval path requires exact incident and target, reported alert,
     [r.id, r.target.id, { ...readiness, accountType: 'apikey' }], [r.id, r.target.id, { ...readiness, model: 'different' }]]) {
     await assert.rejects(approveSwitch(f.directory, f.session, id, target, settings));
   }
+  await assert.rejects(approveSwitch(f.directory, f.session, r.id, r.target.id, readiness), /user's reply/);
+  await userReplies(f);
   await approveSwitch(f.directory, f.session, r.id, r.target.id, readiness);
   const state = await readState(f.directory, f.session);
   assert.equal(state.pending.kind, 'fallback_verification');
@@ -170,6 +177,7 @@ test('retarget by name creates a new incident ID and rejects the old target/cons
   assert.notEqual(updated.id, old.id); assert.equal(updated.target.id, alternateId); assert.equal(updated.approval, null);
   await assert.rejects(approveSwitch(f.directory, f.session, old.id, fallbackId, readiness));
   await assert.rejects(approveSwitch(f.directory, f.session, updated.id, fallbackId, readiness));
+  await userReplies(f);
   await approveSwitch(f.directory, f.session, updated.id, alternateId, readiness);
   const state = await readState(f.directory, f.session), sample = canary(state), checkpoint = state.pending;
   finishVerification(state, sample, checkpoint, Date.now());
@@ -194,6 +202,8 @@ test('a saved target mutation invalidates consent even when the display ID is un
 
 test('explicit refusal continues the same source without any backup probe or immediate new check', async t => {
   const f = await fixture(t), r = await pendingIncident(f);
+  await assert.rejects(declineSwitch(f.directory, f.session, r.id), /user's reply/);
+  await userReplies(f);
   await declineSwitch(f.directory, f.session, r.id);
   const state = await readState(f.directory, f.session);
   assert.equal(state.taskHalt, null); assert.equal(state.autoSwitch.current.id, sourceId);
@@ -231,11 +241,14 @@ test('failed, stale, wrong-target or revoked receipts cannot clear the halt', ()
 
 test('failed canary can be reproposed with fresh consent, never inherited from the failed request', async t => {
   const f = await fixture(t), r = await pendingIncident(f);
+  await userReplies(f);
   await approveSwitch(f.directory, f.session, r.id, r.target.id, readiness);
   await withState(f.directory, f.session, state => abandon(state, Date.now(), 'test_target_unavailable'));
   const fresh = await proposeSwitch(f.directory, f.session, r.id, { name: 'Alternate' });
   assert.notEqual(fresh.id, r.id); assert.equal(fresh.approval, null);
   await assert.rejects(approveSwitch(f.directory, f.session, r.id, fallbackId, readiness));
+  await assert.rejects(approveSwitch(f.directory, f.session, fresh.id, alternateId, readiness), /user's reply/, 'one reply settles one decision');
+  await userReplies(f);
   await approveSwitch(f.directory, f.session, fresh.id, alternateId, readiness);
 });
 
@@ -262,6 +275,7 @@ test('fork binding pins exact route and successful receipt survives late failed 
 
 test('interruption revokes incident approval and control exemption cannot execute arbitrary shell', async t => {
   const f = await fixture(t), r = await pendingIncident(f);
+  await userReplies(f);
   await approveSwitch(f.directory, f.session, r.id, r.target.id, readiness);
   await handleHook({ session_id: f.session, hook_event_name: 'Interrupt', turn_id: 'turn-a' }, f.directory);
   const stopped = await readState(f.directory, f.session);
@@ -270,4 +284,56 @@ test('interruption revokes incident approval and control exemption cannot execut
   const command = `node '${ROOT}/scripts/guard.mjs' approve-switch --request '${r.id}' --target-provider '${r.target.id}'`;
   assert.equal(isControlCommand({ tool_name: 'Bash', tool_input: { command } }), true);
   assert.equal(isControlCommand({ tool_name: 'Bash', tool_input: { command: command + '; touch bypass' } }), false);
+});
+
+test('the agent cannot consent within its own turn; only a later user reply settles one decision', async t => {
+  const f = await fixture(t), r = await pendingIncident(f);
+  await withState(f.directory, f.session, state => { state.alerts.push({ id: r.haltId, acknowledgedAt: null }); });
+  const prompt = (now, extra = {}) => handleHook({ session_id: f.session, hook_event_name: 'UserPromptSubmit', ...extra }, f.directory, now);
+  const early = Date.now();
+  await delay(5);
+  await run(['acknowledge', '--session', f.session, '--data-dir', f.directory, '--alert', r.haltId], {});
+  // Same turn: report, acknowledge, then try to decide without the user.
+  for (const decide of [() => approveSwitch(f.directory, f.session, r.id, r.target.id, readiness), () => declineSwitch(f.directory, f.session, r.id)]) {
+    await assert.rejects(decide(), /user's reply/);
+  }
+  // A prompt whose hook started before the acknowledgement, processed late, is not a reply to it.
+  await prompt(early);
+  await assert.rejects(approveSwitch(f.directory, f.session, r.id, r.target.id, readiness), /user's reply/);
+  // A parent agent's instruction to a subagent is not a user reply.
+  await prompt(Date.now() + 1, { agent_id: randomUUID(), agent_type: 'worker' });
+  await assert.rejects(approveSwitch(f.directory, f.session, r.id, r.target.id, readiness), /user's reply/);
+  // A blocking request_user_input answer is a user reply.
+  await handleHook({ session_id: f.session, hook_event_name: 'PostToolUse', tool_name: 'request_user_input', tool_use_id: randomUUID() }, f.directory, Date.now() + 2);
+  await approveSwitch(f.directory, f.session, r.id, r.target.id, readiness);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.switchRequest.status, 'verifying'); assert.equal(state.userDecisionAt, state.lastUserReplyAt);
+});
+
+test('subagents share the root pause and cannot keep working while the user is asked', async t => {
+  const f = await fixture(t);
+  const subagent = { session_id: f.session, agent_id: randomUUID(), agent_type: 'worker', hook_event_name: 'PreToolUse', tool_name: 'apply_patch', tool_input: { command: 'edit' } };
+  assert.deepEqual(await handleHook(subagent, f.directory), {}, 'no state: subagents are untouched');
+  await enable(f);
+  assert.deepEqual(await handleHook(subagent, f.directory), {}, 'monitoring without a pause does not block subagents');
+  await withState(f.directory, f.session, state => {
+    const evidence = evidenceState(f.config).samples[0];
+    evidence.fork.routing.policyId = state.autoSwitch.policyId;
+    state.samples.push(evidence);
+    assert.equal(queueAutoSwitch(state, Date.now(), evidence), true);
+  });
+  const r = (await readState(f.directory, f.session)).switchRequest, before = await readFile(sessionPath(f.directory, f.session), 'utf8');
+  for (const event of [subagent, { ...subagent, session_id: randomUUID(), agent_id: undefined, parent_session_id: f.session },
+    { ...subagent, tool_name: 'Bash', tool_input: { command: `node '${ROOT}/scripts/guard.mjs' approve-switch --request '${r.id}' --target-provider '${r.target.id}'` } }]) {
+    const result = await handleHook(event, f.directory);
+    assert.equal(result.hookSpecificOutput?.permissionDecision, 'deny');
+    assert.match(result.hookSpecificOutput.permissionDecisionReason, /parent task is paused/);
+  }
+  // The native hook runner exposes the subagent's own thread as CODEX_THREAD_ID.
+  const hook = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'guard.mjs'), 'hook'], { encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, MODELTRACE_AUTOSWITCH_DATA: f.directory, CODEX_THREAD_ID: subagent.agent_id, MODELTRACE_PROBE_PROCESS: '0' }, input: JSON.stringify(subagent) });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.equal(JSON.parse(hook.stdout).hookSpecificOutput?.permissionDecision, 'deny');
+  assert.deepEqual(await handleHook({ ...subagent, hook_event_name: 'PostToolUse' }, f.directory), {});
+  assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), before, 'subagent hooks never write root state');
 });

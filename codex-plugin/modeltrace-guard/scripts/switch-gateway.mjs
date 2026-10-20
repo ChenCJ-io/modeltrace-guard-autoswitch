@@ -7,7 +7,17 @@ import * as zlib from 'node:zlib';
 import { createOfficialTransport, encryptedReasoningRetryBody } from './official-transport.mjs';
 
 // A healthy old daemon is not evidence that newly installed forwarding code is running.
-export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.1';
+export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.2';
+
+// Codex sends zstd request bodies and the Official route needs native proxyEnv.
+// Without both, every ordinary request would fail after Codex is pointed here,
+// so the gateway refuses to start or connect instead.
+export function gatewayRuntimeProblem(nodeVersion = process.versions.node, compression = zlib) {
+  const [major, minor] = String(nodeVersion).split('.').map(Number);
+  const proxyEnv = major >= 25 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
+  if (proxyEnv && typeof compression.zstdDecompress === 'function') return null;
+  return `The local gateway needs Node.js 22.21+ or 24.5+ (zstd request bodies and native proxyEnv); the node that runs it is ${nodeVersion}`;
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SOURCE_KEY = /^[a-z0-9][a-z0-9._-]{0,127}$/i;

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+export const SNAPSHOT_TITLE = 'ModelTrace 临时探针快照（自动删除，请勿继续此会话）';
 const queuedDirectories = new Set();
 export const requestCleanupSweep = (directory) => queuedDirectories.add(path.resolve(directory));
 export function cleanupPath(directory, id) {
@@ -63,8 +64,8 @@ export async function snapshotBoundaries(client, id, sourceTurn) {
 
 // Paginated histories reject copied rollout paths. Freeze using a native,
 // persisted fork which is NEVER given a model turn; all probes fork from it.
-export async function freezeSnapshot(client, session, directory) {
-  const settings = await sourceSettings(client, session);
+export async function freezeSnapshot(client, session, directory, settings = null) {
+  settings ||= await sourceSettings(client, session);
   const response = await client.request('thread/fork', {
     threadId: session, excludeTurns: true, deferGoalContinuation: true,
     model: settings.model, modelProvider: settings.provider, cwd: settings.cwd,
@@ -74,6 +75,10 @@ export async function freezeSnapshot(client, session, directory) {
   if (!base?.id || base.id === session || base.forkedFromId !== session || base.ephemeral) throw new Error('Codex did not create an owned persistent snapshot fork');
   const snapshot = { id: base.id, sourceSession: session, path: base.path, capturedAt: Date.now(), boundary: 'codex_persisted_fork', ...settings };
   await saveOwnership(directory, snapshot, 'active');
+  // The persisted base shows up in Codex's thread list under the source title
+  // until it is deleted. Label it so it is never mistaken for, or resumed as,
+  // the user's own conversation. Best effort: a name never affects the probe.
+  await client.request('thread/name/set', { threadId: base.id, name: SNAPSHOT_TITLE }).catch(() => {});
   try {
     const turn = await lastTurn(client, base.id);
     if (!turn || typeof turn.id !== 'string' || !turn.id || !['completed', 'interrupted', 'failed'].includes(turn.status)) throw new Error('Codex snapshot has no fixed completed/interrupted turn boundary');

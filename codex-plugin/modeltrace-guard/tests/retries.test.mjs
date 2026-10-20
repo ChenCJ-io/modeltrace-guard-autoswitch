@@ -114,6 +114,7 @@ test('retry-count and language changes apply to the next batch; current comparis
   const halted = await command(dir, 'status');
   assert.equal(halted.taskHalt.retryCount, 3); assert.equal(halted.frequency.retryCount, 7);
   await acknowledge(dir);
+  await handleHook(event('UserPromptSubmit'), dir, Date.now() + 1);
   await command(dir, 'resume', '--halt', halted.taskHalt.id);
   await withState(dir, session, (state) => { state.forceProbe = true; });
   await handleHook(event('UserPromptSubmit', { turn_id: 'turn-2' }), dir);

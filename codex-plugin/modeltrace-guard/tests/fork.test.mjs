@@ -9,8 +9,9 @@ import { ROOT, run, handleHook, loadArtifacts, submitForkResult, summarize } fro
 import { readState, withState, processAlive } from '../scripts/state.mjs';
 import { runForkProbe, forkParameters, verifyFork, generateProbe, requireTrustedGuard } from '../scripts/fork-runner.mjs';
 import { BACKGROUND_EVENTS, BACKGROUND_TIMEOUT_SECONDS, handleBackgroundHook, waitForConfirmation } from '../scripts/background.mjs';
-import { cleanSnapshot, cleanupPending, CLEANUP_SOURCE_KINDS } from '../scripts/fork-cleanup.mjs';
-import { cleanupPath, freezeSnapshot, snapshotBoundaries, sourceSettings } from '../scripts/fork-snapshot.mjs';
+import { cleanSnapshot, cleanupFailure, cleanupPending, CLEANUP_MAX_ATTEMPTS, CLEANUP_SOURCE_KINDS } from '../scripts/fork-cleanup.mjs';
+import { disabledHooksOverride } from '../scripts/app-server-client.mjs';
+import { SNAPSHOT_TITLE, cleanupPath, freezeSnapshot, snapshotBoundaries, sourceSettings } from '../scripts/fork-snapshot.mjs';
 import { FORK_ROLE_MARKER, forkPrompt } from '../scripts/prompts.mjs';
 
 // In-memory protocol double. No Codex process, provider, API or real task is
@@ -44,6 +45,7 @@ async function fixture(t) {
           return { thread, model, modelProvider: 'fixture', reasoningEffort: 'high', cwd: params.cwd, serviceTier: 'default', instructionSources: [] };
         }
         if (method === 'thread/list') return { data: [] };
+        if (method === 'thread/name/set') { threads.get(params.threadId).name = params.name; return {}; }
         if (method === 'thread/delete') { assert.notEqual(params.threadId, session); threads.delete(params.threadId); return {}; }
         throw new Error(`Unexpected fixture request ${method}`);
       },
@@ -753,4 +755,48 @@ test('cleanup never deletes a base owned by a live retry after the first backgro
   // An invalid executable makes an accidental cleanup connection fail the test.
   assert.deepEqual(await cleanupPending(f.directory, { MODELTRACE_CODEX_PATH: path.join(f.directory, 'must-not-execute') }), []);
   assert.equal(JSON.parse(await readFile(filename, 'utf8')).status, 'active');
+});
+
+test('probes check trust before any snapshot fork and run without the user\'s other hooks', async (t) => {
+  const { bank, analyzeGlobalOutputs } = await loadArtifacts();
+  const expected = analyzeGlobalOutputs([{ text: integers, expected_count: 300 }], bank).results[0].model;
+  const probe = async (enforceTrust) => {
+    const f = await fixture(t), opened = [];
+    const pending = (await f.command('start', '--expected', expected)).pending;
+    const connect = (env, options) => { opened.push(options); return f.connect(); };
+    return { f, opened, result: await runForkProbe(f.directory, f.session, pending.id, {}, { ...f.dependencies, connect, enforceTrust }) };
+  };
+  const untrusted = await probe(async () => { throw new Error('guard is not trusted'); });
+  assert.equal(untrusted.result.accepted, false); assert.equal(untrusted.result.diagnostic.stage, 'trust');
+  assert.equal(untrusted.f.counts().createdBase, 0, 'an untrusted guard never creates a snapshot to delete again');
+  const others = ['user:hooks.json:stop:0:0', 'other@market:hooks/hooks.json:user_prompt_submit:0:0'];
+  const { f, opened, result } = await probe(async () => ({ otherHookKeys: others }));
+  assert.equal(result.accepted, true, result.reason);
+  assert.deepEqual(opened.map((options) => options.disabledHooks || []), [[], others], 'the probe transport is reopened with other hooks disabled');
+  const named = f.calls.filter((call) => call.method === 'thread/name/set');
+  assert.deepEqual(named.map((call) => call.params.threadId), [result.sample.fork.snapshot.id], 'only the temporary base is renamed');
+  assert.deepEqual(named.map((call) => call.params.name), [SNAPSHOT_TITLE]);
+  assert.equal(f.threads.get(f.session).name, undefined, 'the user\'s own conversation keeps its title');
+});
+
+test('disabled hook keys are passed as one inline session-flag table', () => {
+  assert.deepEqual(disabledHooksOverride([]), []);
+  const keys = ['plugin@market:hooks/hooks.json:stop:0:0', 'user:"quoted".json:stop:0:0', 'plugin@market:hooks/hooks.json:stop:0:0', 'bad\nkey'];
+  assert.deepEqual(disabledHooksOverride(keys), ['-c', 'hooks.state={"plugin@market:hooks/hooks.json:stop:0:0"={enabled=false},"user:\\"quoted\\".json:stop:0:0"={enabled=false}}']);
+});
+
+test('cleanup retries transient failures with backoff and preserves possibly used bases', async (t) => {
+  const job = { purpose: 'modeltrace-temporary-base' }, now = 1000000;
+  const first = cleanupFailure(job, new Error('Codex thread/delete timed out'), now);
+  assert.equal(first.status, 'pending'); assert.equal(first.attempts, 1); assert.equal(first.retryAfter, now + 30000);
+  const later = cleanupFailure({ ...job, attempts: 3 }, new Error('Codex probe transport closed'), now);
+  assert.equal(later.status, 'pending'); assert.equal(later.attempts, 4); assert.equal(later.retryAfter, now + 240000);
+  assert.equal(cleanupFailure({ ...job, attempts: CLEANUP_MAX_ATTEMPTS - 1 }, new Error('timed out'), now).status, 'blocked');
+  const f = await fixture(t), client = f.connect();
+  const snapshot = await freezeSnapshot(client, f.session, f.directory);
+  // Someone continued from the temporary base: it now has a persisted child.
+  const continued = { ...client, request: (method, params) => method === 'thread/list' ? { data: [{ id: randomUUID() }] } : client.request(method, params) };
+  const used = await cleanSnapshot(continued, JSON.parse(await readFile(cleanupPath(f.directory, snapshot.id), 'utf8'))).catch((error) => error);
+  assert.equal(used.code, 'MODELTRACE_CLEANUP_PRESERVE');
+  assert.equal(cleanupFailure(job, used, now).status, 'blocked');
 });

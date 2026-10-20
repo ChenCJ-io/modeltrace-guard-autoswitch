@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { atomicJSON, configPath, gatewayURL } from '../scripts/provider-config.mjs';
@@ -316,7 +316,8 @@ test('concurrent install and removal cannot replace the first originals with gat
 
 test('a live old lease is never stolen by age and only a proven dead owner is reaped', async t => {
   const f = await fixture(t), lockname = `${f.filename}.lock`;
-  const liveLease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 });
+  // The oldest lease this boot can hold; only pre-boot leases lose a live PID.
+  const liveLease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() - uptime() * 1000 + 1000 });
   await writeFile(lockname, liveLease, { mode: 0o600 });
   const installing = f.install();
   try {

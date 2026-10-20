@@ -12,7 +12,7 @@ import { openAppServer, codexExecutable } from './app-server-client.mjs';
 import { sourceSettings } from './fork-snapshot.mjs';
 import { requireTrustedGuard } from './fork-runner.mjs';
 import { loadArtifacts } from './guard.mjs';
-import { GATEWAY_IMPLEMENTATION_VERSION, startSwitchGateway } from './switch-gateway.mjs';
+import { GATEWAY_IMPLEMENTATION_VERSION, gatewayRuntimeProblem, startSwitchGateway } from './switch-gateway.mjs';
 import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
 import {
   UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
@@ -76,6 +76,8 @@ export async function startGateway(directory) {
   const current = await gatewayStatus(directory);
   if (current.readiness === 'upgrade_required') throw new Error('Gateway upgrade required: stop the owned gateway, then start it from the updated installed plugin');
   if (current.running) return current;
+  const runtime = gatewayRuntimeProblem();
+  if (runtime) throw new Error(`${runtime}. Put a newer node first on the PATH that Codex hooks use, or run disconnect to restore the previous provider`);
   const config = await loadGatewayConfig(directory);
   // Starting the shared transport must not strand an already selected Official
   // thread when only the company default has drifted. Requests verify their route.
@@ -96,6 +98,8 @@ export async function startGateway(directory) {
 }
 
 async function serveGateway(directory) {
+  const runtime = gatewayRuntimeProblem();
+  if (runtime) throw new Error(runtime);
   const config = await loadGatewayConfig(directory), instanceId = randomUUID();
   await verifyGatewayReady(directory, config);
   let resolveDone;
@@ -184,6 +188,8 @@ export async function runAutoSwitch(args, env = process.env, {
     if (directory !== dataDirectory(undefined, env)) {
       throw new Error('Ordinary codex startup must discover the same data directory. Use this Codex home default or the same MODELTRACE_AUTOSWITCH_DATA environment for both setup and ordinary codex; a command-only --data-dir cannot be connected');
     }
+    const runtime = gatewayRuntimeProblem();
+    if (runtime) throw new Error(`${runtime}. Upgrade Node before connecting ordinary Codex; nothing was changed`);
     const config = await loadGatewayConfig(directory);
     const layout = await verifyGatewayRoute(directory, config);
     const client = await openClient(env, { nativeOpenai: true });

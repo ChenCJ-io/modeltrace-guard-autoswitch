@@ -1,6 +1,6 @@
 import { createHash, randomInt, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { homedir, uptime } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { LANGUAGES } from './prompts.mjs';
@@ -41,12 +41,31 @@ export function newState(session, now = Date.now()) {
     seenTools: [], retiredTurns: [], stopTurn: null, forceProbe: false, samples: [], events: [], alerts: [],
     nextTools: null, nextAt: null, lastOutcome: 'not_started', confirmation: null, taskHalt: null,
     samplingMode: 'fork', forkSnapshot: null, probeRun: null, runtimeStartedAt: null, lastWorkHookAt: null, runtimeEndedAt: null,
-    runtimePaused: false, lastBackgroundHookAt: null,
+    runtimePaused: false, lastBackgroundHookAt: null, lastUserReplyAt: null, userDecisionAt: null,
   };
 }
 
 export function record(state, type, now, details = {}) {
   state.events.push({ at: now, epoch: state.epoch, type, ...details });
+}
+
+// Hooks record when a person actually answered: a submitted prompt or a
+// completed blocking request_user_input. `now` is taken when the hook process
+// starts, before any lock wait, so a delayed hook cannot appear newer.
+export function noteUserReply(state, now) {
+  state.lastUserReplyAt = Math.max(state.lastUserReplyAt || 0, now);
+}
+
+// Approving, declining or resuming needs such an answer after the incident was
+// reported and acknowledged, so the model under suspicion cannot decide on the
+// user's behalf within its own turn. Each answer settles at most one decision.
+export function consumeUserReply(state, action) {
+  const reportedAt = (state.alerts || []).reduce((latest, alert) => Math.max(latest, alert.acknowledgedAt || 0),
+    Math.max(state.taskHalt?.at || 0, state.userDecisionAt || 0));
+  if (!(state.lastUserReplyAt > reportedAt)) {
+    throw new Error(`${action} needs the user's reply after the alert was reported and acknowledged. Report it, acknowledge it, end your turn, and act only on the user's next message.`);
+  }
+  state.userDecisionAt = state.lastUserReplyAt;
 }
 
 export function setTaskName(state, name, now = Date.now()) {
@@ -377,18 +396,55 @@ export function processAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
 }
 
+// A lease is created empty by an exclusive open and filled right after. One
+// still empty or torn after this long was abandoned between those steps (hook
+// killed by its timeout, power loss); a live writer fills it in milliseconds.
+export const ABANDONED_LOCK_MS = 10000;
+// Wall-clock slack for comparing a lease timestamp with the boot time.
+const BOOT_SLACK_MS = 60000;
+
+async function inspectLock(filename) {
+  let handle;
+  try { handle = await open(filename, 'r'); } catch { return null; }
+  try {
+    const [bytes, info] = await Promise.all([handle.readFile('utf8'), handle.stat()]);
+    return { bytes, ino: info.ino, mtimeMs: info.mtimeMs };
+  } catch { return null; } finally { await handle.close(); }
+}
+
+function lockAbandoned(lease, now = Date.now()) {
+  let owner = null;
+  try { owner = JSON.parse(lease.bytes); } catch { /* empty or torn lease */ }
+  if (typeof owner?.nonce !== 'string' || !Number.isSafeInteger(owner.pid)) return now - lease.mtimeMs >= ABANDONED_LOCK_MS;
+  // PIDs are reused after a reboot; a lease written before this boot has no
+  // living owner even if its PID now belongs to an unrelated process. Hosts
+  // that report no uptime fall back to the PID check alone.
+  const booted = uptime() > 0 ? now - uptime() * 1000 : -Infinity;
+  if (Number.isFinite(owner.at) && owner.at < booted - BOOT_SLACK_MS) return true;
+  // No age-only stealing of a lease whose owner may still be running.
+  return !processAlive(owner.pid);
+}
+
 export async function reapDeadLock(filename) {
-  let bytes, owner;
-  try { bytes = await readFile(filename, 'utf8'); owner = JSON.parse(bytes); } catch { return false; }
-  // No age-only stealing. Empty/legacy locks and inaccessible PIDs are uncertain.
-  if (typeof owner.nonce !== 'string' || !Number.isSafeInteger(owner.pid) || processAlive(owner.pid)) return false;
-  const claimName = `${filename}.reap-${digest(bytes)}`;
+  const lease = await inspectLock(filename);
+  if (!lease || !lockAbandoned(lease)) return false;
+  const claimName = `${filename}.reap-${digest(lease.bytes)}`;
   let claim;
-  try { claim = await open(claimName, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  try { claim = await open(claimName, 'wx', 0o600); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    // A reaper killed while holding its claim must not block recovery forever.
+    const stale = await stat(claimName).then((info) => Date.now() - info.mtimeMs >= ABANDONED_LOCK_MS, () => false);
+    if (stale) await unlink(claimName).catch(() => {});
+    return false;
+  }
   try {
     // One reaper per old lease. Recheck after claiming, so a new owner's lease
-    // cannot be removed by a contender that observed the previous dead owner.
-    if (await readFile(filename, 'utf8').catch(() => null) !== bytes) return false;
+    // (including a just-created empty one) cannot be removed by a contender
+    // that observed the previous abandoned lease.
+    const current = await inspectLock(filename);
+    if (!current || current.bytes !== lease.bytes || current.ino !== lease.ino || current.mtimeMs !== lease.mtimeMs
+      || !lockAbandoned(current)) return false;
     await unlink(filename); return true;
   } finally { await claim.close(); await unlink(claimName); }
 }

@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ROOT, handleHook } from '../scripts/guard.mjs';
-import { attemptStateLock, readState, replaceStateFile, sessionPath, withState } from '../scripts/state.mjs';
+import { ABANDONED_LOCK_MS, attemptStateLock, digest, readState, replaceStateFile, sessionPath, withState } from '../scripts/state.mjs';
 import { queueAlert } from '../scripts/alerts.mjs';
 
 const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
@@ -43,7 +43,7 @@ test('background writers outwait foreground contention without stealing a live l
 test('lock deadlines are bounded and a timed-out writer never calls its callback', async (t) => {
   const { directory, session } = await fixture(t);
   const file = sessionPath(directory, session) + '.lock';
-  const lease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 });
+  const lease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() });
   await writeFile(file, lease);
   await assert.rejects(() => withState(directory, session, () => { assert.fail('live lease was stolen'); }, { lockTimeoutMs: 60 }),
     (error) => error.code === 'MODELTRACE_STATE_BUSY' && error.lockTimeoutMs === 60);
@@ -159,7 +159,7 @@ for (const condition of ['halt', 'confirmation', 'alert', 'normal']) {
       if (condition === 'alert') queueAlert(state, { challenge: 'alert', at: 1, expected: 'gpt-5.4', prediction: 'gpt-5.5', expectedWeight: .1, closedSetWeight: .9, outcome: 'difference_signal' });
     });
     const file = sessionPath(directory, session), before = await readFile(file, 'utf8');
-    const lease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 });
+    const lease = JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() });
     await writeFile(file + '.lock', lease);
     const event = { session_id: session, hook_event_name: 'PreToolUse', tool_name: 'apply_patch', tool_input: { command: 'original work' } };
     const [result, control] = await Promise.all([
@@ -177,7 +177,7 @@ for (const condition of ['halt', 'confirmation', 'alert', 'normal']) {
 test('a busy Stop preserves a pending confirmation and does not start a continuation loop', { timeout: 10000 }, async (t) => {
   const { directory, session } = await fixture(t);
   await withState(directory, session, (state) => { state.enabled = true; state.confirmation = { id: 'batch', status: 'active', target: 3, results: [] }; });
-  await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 }));
+  await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
   const event = { session_id: session, hook_event_name: 'Stop' };
   const first = await handleHook(event, directory);
   assert.equal(first.decision, 'block'); assert.match(first.reason, /pause original task work/);
@@ -188,7 +188,7 @@ test('a busy Stop preserves a pending confirmation and does not start a continua
 test('a busy guard cannot silently allow work when the committed state is unreadable', { timeout: 10000 }, async (t) => {
   const { directory, session } = await fixture(t), file = sessionPath(directory, session);
   await writeFile(file, 'not json');
-  await writeFile(file + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 }));
+  await writeFile(file + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
   const result = await handleHook({ session_id: session, hook_event_name: 'PreToolUse', tool_name: 'apply_patch' }, directory);
   assert.equal(result.hookSpecificOutput?.permissionDecision, 'deny');
   assert.match(result.hookSpecificOutput.permissionDecisionReason, /state.*unavailable/i);
@@ -197,7 +197,7 @@ test('a busy guard cannot silently allow work when the committed state is unread
 test('the actual hook command returns deny, not a generic warning, for a busy halted task', { timeout: 15000 }, async (t) => {
   const { directory, session } = await fixture(t);
   await withState(directory, session, (state) => { state.taskHalt = { id: 'halt', expected: 'gpt-5.4', retryCount: 3 }; });
-  await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 }));
+  await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
   const child = spawn(process.execPath, [path.join(ROOT, 'scripts/guard.mjs'), 'hook'], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, MODELTRACE_AUTOSWITCH_DATA: directory, CODEX_THREAD_ID: session, MODELTRACE_PROBE_PROCESS: '0' },
@@ -211,4 +211,42 @@ test('the actual hook command returns deny, not a generic warning, for a busy ha
   const result = JSON.parse(stdout);
   assert.equal(result.hookSpecificOutput?.permissionDecision, 'deny');
   assert.match(result.hookSpecificOutput.permissionDecisionReason, /STOP THE ORIGINAL TASK/);
+});
+
+const age = (file, ms) => utimes(file, new Date(Date.now() - ms), new Date(Date.now() - ms));
+
+test('an empty or torn lease is recovered only after it is clearly abandoned', async (t) => {
+  const { directory, session } = await fixture(t), file = sessionPath(directory, session) + '.lock';
+  for (const lease of ['', '{"pid":12']) {
+    await writeFile(file, lease);
+    await assert.rejects(() => withState(directory, session, () => { assert.fail('a lease being written was stolen'); }, { lockTimeoutMs: 60 }),
+      (error) => error.code === 'MODELTRACE_STATE_BUSY');
+    assert.equal(await readFile(file, 'utf8'), lease);
+    await age(file, ABANDONED_LOCK_MS + 1000);
+    await withState(directory, session, (state) => { state.workTools += 1; }, { lockTimeoutMs: 60 });
+    await assert.rejects(stat(file), (error) => error.code === 'ENOENT');
+  }
+  assert.equal((await readState(directory, session)).workTools, 2);
+});
+
+test('a lease written before this boot is recovered even if its PID is alive again', async (t) => {
+  const { directory, session } = await fixture(t), file = sessionPath(directory, session) + '.lock';
+  const booted = Date.now() - uptime() * 1000;
+  await writeFile(file, JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: booted + 1000 }));
+  await assert.rejects(() => withState(directory, session, () => {}, { lockTimeoutMs: 60 }), (error) => error.code === 'MODELTRACE_STATE_BUSY');
+  await writeFile(file, JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: booted - 24 * 3600 * 1000 }));
+  await withState(directory, session, (state) => { state.workTools = 5; }, { lockTimeoutMs: 60 });
+  assert.equal((await readState(directory, session)).workTools, 5);
+});
+
+test('a reaper killed while holding its claim cannot block recovery forever', async (t) => {
+  const { directory, session } = await fixture(t), file = sessionPath(directory, session) + '.lock';
+  const lease = JSON.stringify({ pid: 1073741823, nonce: randomUUID(), at: Date.now() });
+  const claim = `${file}.reap-${digest(lease)}`;
+  await writeFile(file, lease); await writeFile(claim, '');
+  await assert.rejects(() => withState(directory, session, () => {}, { lockTimeoutMs: 60 }), (error) => error.code === 'MODELTRACE_STATE_BUSY');
+  await age(claim, ABANDONED_LOCK_MS + 1000);
+  await withState(directory, session, (state) => { state.workTools = 3; }, { lockTimeoutMs: 200 });
+  assert.equal((await readState(directory, session)).workTools, 3);
+  await assert.rejects(stat(claim), (error) => error.code === 'ENOENT');
 });

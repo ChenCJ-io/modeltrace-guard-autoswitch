@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 
 // Offline evaluation only: no collection, training, threshold fitting or bank
 // mutations. Ground truth must come from the evaluation operator, not predictions.
@@ -34,7 +35,7 @@ export function evaluateCalibration(rows) {
   };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const rows = process.argv[2] ? (await readFile(process.argv[2], 'utf8')).split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line)) : [];
   process.stdout.write(JSON.stringify(evaluateCalibration(rows), null, 2) + '\n');
 }

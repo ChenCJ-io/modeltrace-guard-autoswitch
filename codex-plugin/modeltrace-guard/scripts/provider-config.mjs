@@ -6,6 +6,10 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 const execute = promisify(execFile);
+// CCSwitch commits a log row per proxied request. A read-only query that meets
+// its brief commit lock must wait instead of failing the request (or voiding an
+// approved switch) with `database is locked`.
+export const SQLITE_BUSY_TIMEOUT_MS = 3000;
 export const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const KEY = /^[a-z0-9][a-z0-9-]{0,23}$/;
 export const configPath = directory => path.join(directory, 'gateway-config.json');
@@ -72,7 +76,8 @@ export async function inspectCCSwitch(directory = path.join(homedir(), '.cc-swit
     FROM flags`;
   const [providers, listeners, live] = await Promise.all([
     ...[query, "SELECT listen_address,listen_port,auto_failover_enabled FROM proxy_config WHERE app_type='codex'"].map(async sql =>
-      JSON.parse((await execute('sqlite3', ['-readonly', '-json', path.join(directory, 'cc-switch.db'), sql], { maxBuffer: 1024 * 1024 })).stdout || '[]')),
+      JSON.parse((await execute('sqlite3', ['-readonly', '-json', '-cmd', `.timeout ${SQLITE_BUSY_TIMEOUT_MS}`,
+        path.join(directory, 'cc-switch.db'), sql], { maxBuffer: 1024 * 1024 })).stdout || '[]')),
     readJSON(path.join(directory, 'live-state.json')),
   ]);
   const mode = live?.apps?.codex || {};

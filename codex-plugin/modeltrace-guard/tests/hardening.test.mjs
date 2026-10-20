@@ -54,10 +54,10 @@ test('runtime health requires fresh work and background hooks, not an older inst
 
 test('known-dead PID locks recover, living PID locks are never stolen', async (t) => {
   const dir = await fixture(t), session = 'lock-fixture', file = sessionPath(dir, session) + '.lock';
-  await writeFile(file, JSON.stringify({ pid: 1073741823, nonce: randomUUID(), at: 1 }));
+  await writeFile(file, JSON.stringify({ pid: 1073741823, nonce: randomUUID(), at: Date.now() }));
   await withState(dir, session, (s) => { s.issued = 7; });
   assert.equal((await readState(dir, session)).issued, 7);
-  await writeFile(file, JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: 1 }));
+  await writeFile(file, JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
   await assert.rejects(() => withState(dir, session, () => {}), /State busy/);
 });
 

@@ -9,6 +9,8 @@ import { nativeIntegrationStatus } from './native-integration.mjs';
 // Keep this import lazy: `autoswitch connect` imports the trust check while its
 // CLI top-level await is active. A static import back would deadlock that CLI.
 const startGateway = async directory => (await import('./autoswitch.mjs')).startGateway(directory);
+const AUTOSWITCH = fileURLToPath(new URL('./autoswitch.mjs', import.meta.url));
+const SAFE_STARTUP_REASON = /^(?:The local gateway needs Node\.js|Gateway upgrade required|Gateway did not become ready|Could not start gateway process)[^/]*$/;
 
 export async function requireTrustedStartupHook(client, cwd) {
   const listing = await client.request('hooks/list', { cwds: [cwd] });
@@ -41,8 +43,12 @@ export async function ensureGatewayForStartup(event, directory, env = process.en
     const gateway = await start(directory);
     if (!gateway.running || gateway.readiness !== 'ready') throw new Error('Gateway is not ready');
     return {};
-  } catch {
-    return { systemMessage: 'ModelTrace: the configured local gateway could not be prepared. Check connection-status and gateway-status; do not claim this conversation is monitored or silently switch providers.' };
+  } catch (error) {
+    // Ordinary Codex may already point at this gateway, so the model may be
+    // unreachable. Tell the user directly how to restore their provider. Only
+    // our own fixed reasons are shown: other errors may carry the capability URL.
+    const detail = SAFE_STARTUP_REASON.test(error?.message || '') ? ` (${error.message})` : '';
+    return { systemMessage: `ModelTrace: the configured local gateway could not be prepared${detail}. New requests fail while ordinary Codex points to it. Fix the cause, or restore the previous provider with: node "${AUTOSWITCH}" disconnect. Do not claim this conversation is monitored or silently switch providers.` };
   }
 }
 

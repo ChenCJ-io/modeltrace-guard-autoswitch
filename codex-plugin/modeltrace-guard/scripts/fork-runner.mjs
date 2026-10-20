@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openAppServer } from './app-server-client.mjs';
 import { prepareCacheTransport } from './cache-transport.mjs';
-import { freezeSnapshot, publicSnapshot, removeSnapshot, verifySnapshot } from './fork-snapshot.mjs';
+import { freezeSnapshot, publicSnapshot, removeSnapshot, sourceSettings, verifySnapshot } from './fork-snapshot.mjs';
 import { forkPrompt } from './prompts.mjs';
 import { ProbeOutputError } from './probe-output.mjs';
 import { failAutoSwitch, haltBlocksProbe, prepareSwitchTransport } from './switch-policy.mjs';
@@ -41,9 +41,12 @@ export async function prepareProbeFork(client, snapshot, cacheTransport = null) 
   return { response, effective };
 }
 
+// Returns the keys of every other enabled hook, so a probe process can run
+// only this plugin's guard and never the user's unrelated hooks.
 export async function requireTrustedGuard(client, cwd) {
   const listing = await client.request('hooks/list', { cwds: [cwd] });
-  const hooks = (listing.data || []).flatMap((entry) => entry.hooks || []).filter((hook) =>
+  const all = (listing.data || []).flatMap((entry) => entry.hooks || []);
+  const hooks = all.filter((hook) =>
     hook.enabled && ['trusted', 'managed'].includes(hook.trustStatus)
     && /^modeltrace-guard(?:-autoswitch)?(?:@|$)/.test(hook.pluginId || '') && hook.handlerType === 'command'
     && (!hook.matcher || hook.matcher === '.*'));
@@ -54,7 +57,9 @@ export async function requireTrustedGuard(client, cwd) {
       const installed = path.resolve(path.dirname(hook.sourcePath), '../scripts/guard.mjs');
       const backgroundReady = ['sessionStart', 'userPromptSubmit', 'postToolUse'].every((event) =>
         hooks.some((item) => item.sourcePath === hook.sourcePath && item.eventName === event && item.async === true && item.command.includes('background-hook')));
-      if (backgroundReady && digest(await readFile(installed)) === expected && hook.command.includes('guard.mjs')) return;
+      if (backgroundReady && digest(await readFile(installed)) === expected && hook.command.includes('guard.mjs')) {
+        return { otherHookKeys: all.filter((item) => item.enabled && item.sourcePath !== hook.sourcePath && item.key).map((item) => item.key) };
+      }
     } catch {}
   }
   throw new Error('The synchronous PreToolUse guard and native async background hooks must be loaded and trusted. Reload the updated plugin, use a Codex runtime with async hook support, and review ModelTrace Guard in /hooks before probing.');
@@ -152,9 +157,19 @@ export async function runForkProbe(directory, session, challenge, env = process.
   if (!claimed) return { skipped: true };
   try {
     client = await connect(env, { nativeOpenai });
+    stage = 'trust';
+    // Check trust before creating any snapshot fork, then reopen the transport
+    // with every unrelated hook disabled: a probe must not trigger the user's
+    // notification, commit or context-injecting hooks in their workspace.
+    const settings = snapshot ? null : await sourceSettings(client, session);
+    const trust = await enforceTrust(client, snapshot?.cwd || settings.cwd);
+    if (trust?.otherHookKeys?.length) {
+      await client.close();
+      client = await connect(env, { nativeOpenai, disabledHooks: trust.otherHookKeys });
+    }
     stage = 'snapshot';
     if (!snapshot) {
-      snapshot = await freezeSnapshot(client, session, directory);
+      snapshot = await freezeSnapshot(client, session, directory, settings);
       await updateState((state) => {
         if (!state.enabled || state.pending?.id !== challenge || state.pending.epoch !== pending.epoch) throw new Error('Checkpoint changed before snapshot capture');
         if (state.model && state.model !== snapshot.model) throw new Error('Source task model metadata differs from the active hook model; wait for task metadata to synchronize');
@@ -168,7 +183,6 @@ export async function runForkProbe(directory, session, challenge, env = process.
     stage = 'fork_preparation';
     cacheTransport = await prepareSwitchTransport(directory, snapshot, pending) || await prepareCacheTransport(client, snapshot, env);
     const { response: fork, effective } = await prepareProbeFork(client, snapshot, cacheTransport);
-    await enforceTrust(client, snapshot.cwd);
     await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge) throw new Error('Checkpoint cancelled');
       if (Date.now() >= state.pending.expiresAt) throw new Error('Checkpoint expired during fork preparation');

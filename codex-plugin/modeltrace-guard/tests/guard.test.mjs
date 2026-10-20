@@ -8,7 +8,8 @@ import {
   DEFAULTS, classifySample, dataDirectory, isDue, issue, newState, readState, schedule,
   recentComparable, sessionPath, setTurn, validateConfig, validateNumbers, withState,
 } from '../scripts/state.mjs';
-import { ROOT, challengeContext, handleHook, loadArtifacts, summarize } from '../scripts/guard.mjs';
+import { ROOT, challengeContext, commandWords, handleHook, isControlCommand, loadArtifacts, notificationContext, summarize } from '../scripts/guard.mjs';
+import { queueAlert } from '../scripts/alerts.mjs';
 import { run } from './fixture-runner.mjs';
 import { LANGUAGES, localizedPrompt, forkPrompt } from '../scripts/prompts.mjs';
 
@@ -428,6 +429,20 @@ test('exact bundled hook launcher works in native shell with spaced paths', asyn
   }
 });
 
+test('every bundled hook launcher reports a startup failure instead of exiting silently', async (t) => {
+  const dir = await fixture(t);
+  const config = JSON.parse(await readFile(path.join(ROOT, 'hooks', 'hooks.json')));
+  const commands = new Set(Object.values(config.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command))));
+  const unset = { ...process.env }; delete unset.PLUGIN_ROOT; delete unset.CLAUDE_PLUGIN_ROOT;
+  for (const command of commands) {
+    for (const env of [unset, { ...unset, PLUGIN_ROOT: dir }]) {
+      const result = spawnSync(command, { shell: true, input: JSON.stringify(event('PreToolUse', { tool_name: 'Bash' })), encoding: 'utf8', env, timeout: 10000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(JSON.parse(result.stdout).systemMessage, /failed to start: .+not enforced/);
+    }
+  }
+});
+
 test('modified bundled assets fail integrity checks instead of silently scoring', async (t) => {
   const dir = await fixture(t);
   const copy = path.join(dir, 'modified-plugin');
@@ -443,4 +458,30 @@ test('hook launcher reports malformed input without preventing actual work', asy
   const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'guard.mjs'), 'hook', '--data-dir', dir], { input: 'not json', encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0);
   assert.ok(JSON.parse(result.stdout).systemMessage.includes('coverage is incomplete'));
+});
+
+test('control commands accept quoted paths with quotes, $ and &, but never a second command', () => {
+  for (const platform of ['linux', 'win32']) {
+    const q = (value) => `'${String(value).replace(/'/g, platform === 'win32' ? "''" : "'\\''")}'`;
+    const directory = "/Users/o'brien/data $HOME & more";
+    assert.deepEqual(commandWords(`node ${q('/plugin/scripts/guard.mjs')} status --data-dir ${q(directory)}`, platform),
+      ['node', '/plugin/scripts/guard.mjs', 'status', '--data-dir', directory]);
+    for (const unsafe of ['node x status; touch y', 'node x && y', 'node x $(y)', 'node x `y`', 'node x # comment', 'node "x$HOME"',
+      "node 'unterminated", 'node x\nrm y', 'node x > out', 'node x | y', 'node (x)', 'node x*', 'node ~/x']) {
+      assert.equal(commandWords(unsafe, platform), null, `${platform}: ${unsafe}`);
+    }
+  }
+  assert.deepEqual(commandWords("node 'a'\\''b'", 'linux'), ['node', "a'b"]);
+  assert.deepEqual(commandWords("node 'a''b'", 'win32'), ['node', "a'b"]);
+  assert.deepEqual(commandWords('node C:\\Plugins\\guard.mjs', 'win32'), ['node', 'C:\\Plugins\\guard.mjs']);
+});
+
+test('the acknowledge command the guard prints is accepted from a data directory with shell characters', async (t) => {
+  const directory = path.join(await fixture(t), "o'brien $HOME & co");
+  const state = newState(session);
+  queueAlert(state, { challenge: 'alert-1', at: 1, epoch: 0, expected: 'gpt-5.4', prediction: 'gpt-5.5', expectedWeight: 0.1, closedSetWeight: 0.9, outcome: 'difference_signal' });
+  const command = notificationContext(state, directory).split('\n').find((line) => line.startsWith('node '));
+  assert.match(command, /acknowledge/);
+  assert.equal(isControlCommand({ tool_name: 'exec_command', tool_input: { cmd: command } }), true);
+  assert.equal(isControlCommand({ tool_name: 'exec_command', tool_input: { cmd: `${command}; touch bypass` } }), false);
 });

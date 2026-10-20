@@ -4,6 +4,7 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { ROOT } from '../scripts/guard.mjs';
 import { ensureGatewayForStartup, requireTrustedStartupHook } from '../scripts/startup.mjs';
+import { gatewayRuntimeProblem } from '../scripts/switch-gateway.mjs';
 
 test('ordinary startup starts only an owned and effective gateway, without enabling or changing a thread', async () => {
   const calls = [], event = { hook_event_name: 'SessionStart', session_id: 'native-session' };
@@ -54,4 +55,21 @@ test('ordinary entry requires the actual loaded and trusted synchronous startup 
   for (const change of [{ trustStatus: 'untrusted' }, { async: true }, { enabled: false }, { command: 'node elsewhere.mjs' }, { sourcePath: '/missing/hooks/hooks.json' }]) {
     await assert.rejects(requireTrustedStartupHook(client([{ ...hook, ...change }]), ROOT), /Review.*startup hook/);
   }
+});
+
+test('a gateway that cannot start tells the user why and how to restore the previous provider', async () => {
+  const reason = gatewayRuntimeProblem('20.18.0', {});
+  const result = await ensureGatewayForStartup({ hook_event_name: 'SessionStart' }, '/fixture', {}, {
+    integrationStatus: async () => ({ readyForNewThreads: true, phase: 'installed' }),
+    start: async () => { throw new Error(`${reason}. Put a newer node first on the PATH that Codex hooks use`); },
+  });
+  assert.ok(result.systemMessage.includes('20.18.0'));
+  assert.ok(result.systemMessage.includes(`node "${path.join(ROOT, 'scripts', 'autoswitch.mjs')}" disconnect`));
+});
+
+test('the gateway requires a Node runtime with zstd request bodies and native proxyEnv', () => {
+  const zstd = { zstdDecompress() {} };
+  for (const version of ['25.0.0', '24.5.0', '24.11.1', '22.21.0', '22.30.2']) assert.equal(gatewayRuntimeProblem(version, zstd), null, version);
+  for (const version of ['18.20.4', '20.19.0', '22.20.0', '23.11.0', '24.4.1']) assert.match(gatewayRuntimeProblem(version, zstd), /22\.21\+ or 24\.5\+/, version);
+  assert.match(gatewayRuntimeProblem('24.11.1', {}), /zstd/);
 });
