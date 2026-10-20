@@ -1,18 +1,18 @@
 # ModelTrace Guard Autoswitch
 
-独立 fork `0.4.1`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+独立 fork `0.4.2`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
 
 完成一次性接入后，照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。技能执行 `autoswitch.mjs use`，只为当前已接入的主渠道 thread 开启监测；个人会话默认不检测，无需专用启动器。
 
 ## 主配置、异常询问和本次切换
 
-默认使用用户配置的主服务，例如 API2 copy。安装插件、connect、保存主备和 use/enable 都不授权切换。通过网关成功使用主配置并显式开启监测后，首次有效指纹不一致立即暂停并进入 `awaiting_approval`；此时不隐式复测、不请求备用。
+默认使用用户配置的主服务，例如 我的主渠道。安装插件、connect、保存主备和 use/enable 都不授权切换。通过网关成功使用主配置并显式开启监测后，首次有效指纹不一致立即暂停并进入 `awaiting_approval`；此时不隐式复测、不请求备用。
 
 所有命令在本插件目录执行：
 
 ```sh
 node scripts/autoswitch.mjs inspect
-node scripts/autoswitch.mjs configure --primary-name "API2 copy" --backup-name "Doro"
+node scripts/autoswitch.mjs configure --primary-name "我的主渠道" --backup-name "另一个渠道"
 node scripts/autoswitch.mjs connect
 node scripts/autoswitch.mjs connection-status
 # 之后在普通 codex 新会话中，技能执行：
@@ -40,7 +40,7 @@ connect 的数据目录必须与普通启动一致，不能仅用命令行 `--da
 
 ```sh
 # 仅准备本次目标，不发送请求：
-node scripts/guard.mjs propose-switch --request REQUEST_ID --target-name "Doro"
+node scripts/guard.mjs propose-switch --request REQUEST_ID --target-name "另一个渠道"
 # 只有用户对本次目标明确同意后：
 node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TARGET_ID
 node scripts/guard.mjs wait-switch --request REQUEST_ID
@@ -48,7 +48,7 @@ node scripts/guard.mjs wait-switch --request REQUEST_ID
 node scripts/guard.mjs decline-switch --request REQUEST_ID
 ```
 
-每次 `propose-switch` 都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 Doro”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
+每次 `propose-switch` 都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 另一个渠道”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
 
 批准后才运行目标路由的原生 canary，真实 `completed` 回执与兼容指纹全部通过才切换并解除本次暂停；失败保持 halt。失败收尾后，用户明确改选目标时可从当前失败请求创建新 proposal，使用新 ID 记录对新目标的本次同意；已经说清的同意不重复询问，不能继承旧批准。Official 成功后停止探针，第三方目标成功后继续监测，下一次异常再次询问。拒绝待批准的切换会保留当前路由、恢复任务与普通间隔监测。不会自动回主。
 

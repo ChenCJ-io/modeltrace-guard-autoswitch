@@ -2,7 +2,7 @@
 
 本仓库是 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork。基线为 upstream `main` 的提交 [`6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2`](https://github.com/xqy2006/ModelTrace/commit/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2)。上游作者为 **xqy2006**，fork 由 **ChenCJ-io** 维护；不代表上游发布或官方 Codex、CCSwitch 项目。
 
-根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.1`，发布仓库为 [ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。
+根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.2`，发布仓库为 [ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。
 
 ## 保留内容
 

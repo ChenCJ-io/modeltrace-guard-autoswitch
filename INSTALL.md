@@ -1,4 +1,4 @@
-# 安装 ModelTrace Guard Autoswitch 0.4.1
+# 安装 ModelTrace Guard Autoswitch 0.4.2
 
 这是安装前给 Codex 和使用者的入口。用户提供仓库 URL 或本地目录后，先读取本文件，再运行仓库自带安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
 
@@ -25,10 +25,10 @@ cd modeltrace-guard-autoswitch
 node scripts/install-plugin.mjs
 ```
 
-用户已经明确说“主用 API2 copy，备用 OpenAI Official”时，可安装并保存这对偏好：
+用户已经明确说“主用 我的主渠道，备用 OpenAI Official”时，可安装并保存这对偏好：
 
 ```sh
-node scripts/install-plugin.mjs --primary-name "API2 copy" --backup-name "OpenAI Official"
+node scripts/install-plugin.mjs --primary-name "我的主渠道" --backup-name "OpenAI Official"
 ```
 
 也可从其他目录指定本地源码和实际 Codex 可执行文件：
@@ -75,7 +75,7 @@ CCSwitch 退出、重启或用户切卡可能重写入口，setup 不保证永�
 
 用户在当前会话要求使用插件时，技能执行 `use`：已接网关的主渠道 thread 才启用监测，个人初始路线保持不检测；成功切入个人后也不再排周期探针。重复 use 不重开已停策略、不清 halt、不授权切换。`disconnect` 仅安全恢复仍归插件拥有的两键原值，不改现有会话、监测或网关运行状态。
 
-首次异常时报告候选及其不确定性，等待该次选择。`acknowledge` 是已告知，不是同意。用户说“同意切到 Doro”后，解析该目标，用 `guard.mjs propose-switch --request ID --target-name "Doro"` 准备，再对该目标 ID 执行 `guard.mjs approve-switch`；每次 proposal 都产生新请求 ID，approve/wait/decline 必须使用新返回的 ID，不重复请求同一份明确同意。未获得本次同意、目标身份或配置发生变化时，不发送目标验证请求。完整命令与失败边界见 [README](README.md)。
+首次异常时报告候选及其不确定性，等待该次选择。`acknowledge` 是已告知，不是同意。用户说“同意切到 另一个渠道”后，解析该目标，用 `guard.mjs propose-switch --request ID --target-name "另一个渠道"` 准备，再对该目标 ID 执行 `guard.mjs approve-switch`；每次 proposal 都产生新请求 ID，approve/wait/decline 必须使用新返回的 ID，不重复请求同一份明确同意。未获得本次同意、目标身份或配置发生变化时，不发送目标验证请求。完整命令与失败边界见 [README](README.md)。
 
 ## 本地验证
 
