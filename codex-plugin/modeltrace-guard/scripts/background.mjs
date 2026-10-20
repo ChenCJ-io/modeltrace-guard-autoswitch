@@ -4,7 +4,7 @@ import { controlContext, handleHook, notificationContext, submitForkResult } fro
 import { runForkProbe } from './fork-runner.mjs';
 import { BACKGROUND_STATE_LOCK, expirePending, processAlive, readState, withState } from './state.mjs';
 import { summarize } from './status.mjs';
-import { beginVerification, failAutoSwitch, haltBlocksProbe, isRecoveryActive, isVerification } from './switch-policy.mjs';
+import { haltBlocksProbe, isRecoveryActive, isVerification } from './switch-policy.mjs';
 
 export const BACKGROUND_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse'];
 // One configurable checkpoint may live for at most 1,000,000 seconds. The
@@ -26,10 +26,11 @@ async function backgroundNotice(event, directory, session, confirmationId) {
   return withState(directory, session, (state) => {
     if (state.autoSwitch?.noticePending) {
       state.autoSwitch.noticePending = false;
-      const monitoring = state.enabled
+      const personal = state.autoSwitch.current?.transport === 'official';
+      const monitoring = !personal ? 'Monitoring continues on the selected third-party route; any later switch requires new consent.' : state.enabled
         ? 'Diagnostic monitoring is currently enabled again; its probes use the personal subscription. Automatic switching remains stopped.'
         : 'Automatic monitoring and switching are stopped; no further probes are scheduled on the personal subscription.';
-      return injected(event, `ModelTrace AutoSwitch: fallback verification completed successfully and this same thread now uses the authorized official route. ${monitoring} Tell the user briefly and continue the original task only if it is still requested. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.`);
+      return injected(event, `ModelTrace AutoSwitch: target verification completed successfully and this same thread now uses the user-approved route ${JSON.stringify(state.autoSwitch.current?.name || 'Official')}. ${monitoring} Tell the user briefly and continue the original task only if it is still requested. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.`);
     }
     const alerts = pendingAlerts(state).filter((alert) => alert.lastDeliveryTurn !== (state.turn || 'no-turn')).slice(0, 5);
     if (alerts.length) {
@@ -60,9 +61,6 @@ export async function handleBackgroundHook(event, directory, env = process.env, 
   const output = await handleHook(event, directory, undefined, undefined, { background: true });
   const observed = await readState(directory, event.session_id);
   if (!observed?.enabled && !observed?.taskHalt && !pendingAlerts(observed).length && !observed?.autoSwitch?.noticePending) return output;
-  if (observed?.autoSwitch?.phase === 'switch_pending' && !pendingAlerts(observed).length) {
-    await withState(directory, event.session_id, state => beginVerification(state, Date.now()), BACKGROUND_STATE_LOCK);
-  }
   const after = await readState(directory, event.session_id);
   // Deliver already-known alerts immediately, without delaying them for a probe.
   if (Object.keys(output).length && !(isVerification(after) && !pendingAlerts(after).length)) return output;
@@ -101,10 +99,6 @@ export async function waitForConfirmation(directory, session, id, { timeoutMs = 
   do {
     state = await readState(directory, session);
     if (state?.confirmation?.id !== id) throw new Error('No matching confirmation batch');
-    if (state.autoSwitch?.phase === 'switch_pending' && Date.now() - state.autoSwitch.queuedAt >= state.config.pendingSeconds * 1000) {
-      await withState(directory, session, current => failAutoSwitch(current, Date.now(), 'verification_not_started'));
-      state = await readState(directory, session);
-    }
     if (state.pending && Date.now() >= state.pending.expiresAt) {
       await withState(directory, session, (current) => { expirePending(current, Date.now()); });
       state = await readState(directory, session);
@@ -118,4 +112,26 @@ export async function waitForConfirmation(directory, session, id, { timeoutMs = 
       : state.confirmation.status === 'active' ? 'wait_for_background_retries'
         : state.autoSwitch?.phase === 'switched' && state.autoSwitch.haltId === id ? 'autoswitch_verified'
         : state.confirmation.status === 'completed' ? 'confirmation_completed' : 'report_coverage_gap' };
+}
+
+// Human consent is never polled. Only an already approved canary may use this
+// bounded observer, and expiration cannot transform a missing result to a hit.
+export async function waitForSwitch(directory, session, id, { timeoutMs = 30000, pollMs = 200 } = {}) {
+  if (!id) throw new Error('wait-switch requires --request <current switch request id>');
+  const deadline = Date.now() + Math.min(30000, Math.max(0, timeoutMs));
+  let state;
+  do {
+    state = await readState(directory, session);
+    if (state?.switchRequest?.id !== id) throw new Error('No matching switch request');
+    if (state.switchRequest.status === 'pending') throw new Error('Ask the user and yield; wait-switch cannot wait for human consent');
+    if (state.pending && Date.now() >= state.pending.expiresAt) {
+      await withState(directory, session, current => expirePending(current, Date.now()));
+      state = await readState(directory, session);
+    }
+    if (!isRecoveryActive(state) || pendingAlerts(state).length || Date.now() >= deadline) break;
+    await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  } while (true);
+  return { ...summarize(state, directory), waiting: isRecoveryActive(state), controlContext: controlContext(state, directory),
+    notificationContext: notificationContext(state, directory), agentAction: state.switchRequest.status === 'succeeded'
+      ? 'autoswitch_verified' : isRecoveryActive(state) ? 'wait_for_route_verification' : 'stop_and_notify_user' };
 }

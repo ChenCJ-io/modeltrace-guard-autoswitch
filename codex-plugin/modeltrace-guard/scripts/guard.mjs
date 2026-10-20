@@ -7,7 +7,7 @@ import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
-import { beginVerification, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
+import { approveSwitch, declineSwitch, proposeSwitch, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
 export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
@@ -67,7 +67,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
+  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
@@ -91,13 +91,14 @@ export function isControlCommand(event) {
     return true;
   }
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
-  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
+  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
 function preToolDecision(event, state, directory) {
   const reason = state ? notificationContext(state, directory) || controlContext(state, directory) : null;
-  if (reason && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  const ask = state?.switchRequest?.status === 'pending' && ['request_user_input', 'request_user_input_async'].includes(event.tool_name);
+  if (reason && !ask && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
   return {};
 }
 
@@ -143,7 +144,12 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     state.lastHookAt = now;
     if (background) state.lastBackgroundHookAt = now;
     state.hooksSeen += 1;
+    const priorTurn = state.turn;
     const currentTurn = setTurn(state, event.turn_id);
+    if (currentTurn && hook === 'UserPromptSubmit' && priorTurn && state.turn !== priorTurn && isRecoveryActive(state)) {
+      failAutoSwitch(state, now, 'new_user_turn_during_verification');
+      abandon(state, now, 'new_user_turn_during_verification');
+    }
     if (currentTurn && ['SessionStart', 'UserPromptSubmit'].includes(hook)) { state.runtimePaused = false; state.runtimeEndedAt = null; }
     if (currentTurn && hook === 'SessionStart' && ['startup', 'resume'].includes(event.source)) {
       failAutoSwitch(state, now, 'runtime_resumed');
@@ -238,6 +244,9 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     }
     const expired = expirePending(state, now);
     if (hook === 'Stop') {
+      // Asking for a decision must actually yield. No background loop or
+      // repeated Stop continuation is permitted while waiting for a human.
+      if (state.switchRequest?.status === 'pending' && !waiting.length) return deliver({});
       if (event.stop_hook_active || state.stopTurn === (state.turn || 'no-turn')) {
         return deliver({}, true);
       }
@@ -267,6 +276,8 @@ function parseArguments(args) {
   const perCommand = {
     help: [], doctor: ['fork'], models: [], hook: [], 'background-hook': [], wait: ['confirmation'], status: [], stop: [], resume: ['halt'], dashboard: [], 'dashboard-stop': [], acknowledge: ['alert'], label: ['name'],
     start: ['expected', 'name', ...fields], configure: ['expected', 'name', ...fields], submit: ['challenge', 'numbers'], probe: ['challenge'],
+    'propose-switch': ['request', 'target-name', 'target-provider'], 'approve-switch': ['request', 'target-provider'],
+    'decline-switch': ['request'], 'wait-switch': ['request'],
   };
   if (!Object.hasOwn(perCommand, command)) throw new Error(`Unknown command: ${command}`);
   for (const key of Object.keys(options)) if (!['data-dir', 'session', ...perCommand[command]].includes(key)) throw new Error(`Unknown ${command} option --${key}`);
@@ -292,7 +303,7 @@ export async function run(args, env = process.env, receipt = null) {
   const { command, options, fields } = parseArguments([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return {
-    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'dashboard', 'dashboard-stop', 'label'],
+    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'dashboard', 'dashboard-stop', 'label'],
     execution: 'Native async hooks run probes in the background. Normal results are silent; wait is only for an active mismatch confirmation.',
     name: 'start --name <task title> or label --name <display name>; metadata only, does not rename the Codex task or change sampling',
     session: 'Defaults to CODEX_THREAD_ID; otherwise pass --session from a trusted hook. Never invent a task id.',
@@ -340,6 +351,32 @@ export async function run(args, env = process.env, receipt = null) {
     const { waitForConfirmation } = await import('./background.mjs');
     return waitForConfirmation(directory, session, options.confirmation);
   }
+  if (command === 'wait-switch') {
+    const { waitForSwitch } = await import('./background.mjs');
+    return waitForSwitch(directory, session, options.request);
+  }
+  if (['propose-switch', 'approve-switch', 'decline-switch'].includes(command)) {
+    if (command === 'propose-switch') await proposeSwitch(directory, session, options.request,
+      { name: options['target-name'], id: options['target-provider'] });
+    if (command === 'decline-switch') await declineSwitch(directory, session, options.request);
+    if (command === 'approve-switch') {
+      const { openAppServer } = await import('./app-server-client.mjs');
+      const { sourceSettings } = await import('./fork-snapshot.mjs');
+      const { requireTrustedGuard } = await import('./fork-runner.mjs');
+      const client = await openAppServer(env, { nativeOpenai: true });
+      try {
+        const [{ account }, settings] = await Promise.all([
+          client.request('account/read', { refreshToken: false }), sourceSettings(client, session),
+        ]);
+        await requireTrustedGuard(client, settings.cwd);
+        await approveSwitch(directory, session, options.request, options['target-provider'],
+          { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
+      } finally { await client.close(); }
+    }
+    const state = await readState(directory, session);
+    return { ...summarize(state, directory), controlContext: controlContext(state, directory),
+      agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.switchRequest?.status === 'pending' ? 'ask_user_to_switch' : 'continue_current_provider' };
+  }
   if (command === 'probe') {
     const { runForkProbe } = await import('./fork-runner.mjs');
     return runForkProbe(directory, session, options.challenge, env, { submit: submitForkResult });
@@ -347,9 +384,8 @@ export async function run(args, env = process.env, receipt = null) {
   const now = Date.now();
   if (command === 'acknowledge') return withState(directory, session, (state) => {
     const result = acknowledgeAlerts(state, options.alert?.split(','), now);
-    beginVerification(state, now);
     if (state.confirmation?.status === 'active') issue(state, now);
-    return { ...result, ...summarize(state, directory, now), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null, controlContext: controlContext(state, directory), agentAction: isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : null };
+    return { ...result, ...summarize(state, directory, now), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null, controlContext: controlContext(state, directory), agentAction: state.switchRequest?.status === 'pending' ? 'ask_user_to_switch' : isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : null };
   });
   if (command === 'label') return withState(directory, session, (state) => { setTaskName(state, options.name, now); return summarize(state, directory, now); });
   if (command === 'submit') {
@@ -393,13 +429,16 @@ export async function run(args, env = process.env, receipt = null) {
       schedule(state, now);
       const verification = finishVerification(state, sample, p, now);
       const alert = verification ? null : queueAlert(state, sample);
-      if (!verification) updateConfirmation(state, sample, p, now);
-      queueAutoSwitch(state, now);
-      if (state.taskHalt && alert) { alert.level = 'confirmed_mismatch'; alert.retryCount = state.taskHalt.retryCount; alert.predictions = state.taskHalt.predictions; }
-      if (alert && state.autoSwitch?.phase === 'switch_pending') alert.autoSwitchPending = true;
+      const awaitingConsent = !verification && queueAutoSwitch(state, now, sample);
+      if (!verification && !awaitingConsent) updateConfirmation(state, sample, p, now);
+      if (state.taskHalt && alert && !awaitingConsent) { alert.level = 'confirmed_mismatch'; alert.retryCount = state.taskHalt.retryCount; alert.predictions = state.taskHalt.predictions; }
+      if (alert && awaitingConsent) {
+        alert.switchConsentRequired = true;
+        alert.sourceName = state.switchRequest.source.name; alert.targetName = state.switchRequest.target?.name || null;
+      }
       if (state.confirmation?.status === 'active') issue(state, now);
       const { numbers: omitted, ...publicSample } = sample;
-      return { accepted: true, sample: publicSample, warning: WARNING, userNotice: alert ? userNotice(alert) : null, agentAction: isRecoveryActive(state) ? (alert ? 'notify_user_now' : 'wait_for_route_verification') : state.taskHalt ? 'stop_and_notify_user' : alert ? 'notify_user_now' : state.confirmation?.status === 'active' ? 'complete_retries' : null, notification: alert, notificationContext: alert ? notificationContext(state, directory, [alert]) : null, confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, controlContext: controlContext(state, directory), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null };
+      return { accepted: true, sample: publicSample, warning: WARNING, userNotice: alert ? userNotice(alert) : null, agentAction: awaitingConsent ? 'ask_user_to_switch' : isRecoveryActive(state) ? 'wait_for_route_verification' : state.taskHalt ? 'stop_and_notify_user' : alert ? 'notify_user_now' : state.confirmation?.status === 'active' ? 'complete_retries' : null, notification: alert, notificationContext: alert ? notificationContext(state, directory, [alert]) : null, confirmation: state.confirmation || null, switchRequest: state.switchRequest || null, taskHalt: state.taskHalt || null, controlContext: controlContext(state, directory), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null };
     }, receipt.stateOptions);
   }
   const patch = {};
@@ -408,8 +447,11 @@ export async function run(args, env = process.env, receipt = null) {
   return withState(directory, session, async (state) => {
     if (command === 'resume') {
       if (!state.taskHalt || options.halt !== state.taskHalt.id) throw new Error('Explicit user-approved resume requires the current halt ID');
+      failAutoSwitch(state, now, 'user_resumed_current_route');
+      abandon(state, now, 'user_resumed_current_route');
       record(state, 'task_resumed', now, { halt: state.taskHalt.id });
       state.taskHalt = null;
+      if (state.autoSwitch?.protocol === 3 && state.autoSwitch.enabled) state.autoSwitch.phase = 'armed';
       schedule(state, now);
       return summarize(state, directory, now);
     }
@@ -460,7 +502,7 @@ export async function main(args = process.argv.slice(2)) {
   catch (error) {
     // Hook failures must remain visible as coverage failures, while not blocking the user's work.
     if (['hook', 'background-hook'].includes(args[0])) process.stdout.write(JSON.stringify({ systemMessage: `ModelTrace Guard unavailable: ${error.message}. Sampling coverage is incomplete.` }) + '\n');
-    else { process.stderr.write(JSON.stringify({ error: error.message }) + '\n'); process.exitCode = 1; }
+    else { process.stderr.write(JSON.stringify({ error: error.message, code: error.code, candidates: error.candidates }) + '\n'); process.exitCode = 1; }
   }
   finally { dispatchQueuedCleanups(); }
 }

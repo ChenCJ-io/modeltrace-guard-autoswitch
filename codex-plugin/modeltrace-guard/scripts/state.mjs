@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { LANGUAGES } from './prompts.mjs';
 import { compactHistory } from './history.mjs';
 import { removeSnapshot } from './fork-snapshot.mjs';
-import { failAutoSwitch, haltBlocksProbe, stopMonitoringOnPersonalRoute } from './switch-policy.mjs';
+import { failAutoSwitch, haltBlocksProbe, invalidateLegacyConsent, stopMonitoringOnPersonalRoute } from './switch-policy.mjs';
 export { validateNumbers } from './probe-output.mjs';
 
 export const DEFAULTS = Object.freeze({
@@ -348,6 +348,7 @@ export async function withState(directory, session, callback, { lockTimeoutMs = 
     // v0.2.0 kept probing after a successful fallback. Apply the new default
     // once before any hook can schedule another probe; keep history and halts.
     stopMonitoringOnPersonalRoute(state, Date.now());
+    invalidateLegacyConsent(state, Date.now());
     const result = await callback(state);
     if (state.forkSnapshot && (!state.probeRun || !processAlive(state.probeRun.pid))
       && (!state.enabled || haltBlocksProbe(state) || (state.confirmation?.status !== 'active' && !state.pending))) {

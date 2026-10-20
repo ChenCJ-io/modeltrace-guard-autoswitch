@@ -4,9 +4,11 @@ import { Transform, pipeline } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 import * as zlib from 'node:zlib';
+import { createOfficialTransport, encryptedReasoningRetryBody } from './official-transport.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SOURCE_KEY = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
+const ROUTE_RECEIPT_FIELDS = ['providerFingerprint', 'proposalId', 'approvalId', 'challenge'];
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length']);
 const FAILURE_EVENTS = new Set(['response.failed', 'response.incomplete', 'response.error', 'error']);
 const TERMINAL_EVENTS = new Set(['response.completed', ...FAILURE_EVENTS]);
@@ -175,9 +177,9 @@ function terminalObserver(contentType, encoding) {
   };
 }
 
-function proxy(req, res, target, bytes, agent, timeoutMs, query = '') {
+function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official, endpoint, body } = {}) {
   return new Promise((resolve) => {
-    let upstream, incoming, observer, ended = false, settled = false, statusCode = 502;
+    let upstream, incoming, observer, ended = false, settled = false, blockedRedirect = false, statusCode = 502;
     const finish = (completed) => {
       if (settled) return;
       settled = true;
@@ -191,40 +193,94 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '') {
     };
     res.once('close', disconnected); req.once('aborted', disconnected);
     if (res.destroyed || req.aborted) { disconnected(); return; }
-    const headers = cleanHeaders(req.headers, { request: true });
-    if (bytes) headers['content-length'] = String(bytes.length);
-    // The query is appended only after validating the fixed /models endpoint.
-    // It is never parsed as a destination URL or allowed to change the path.
-    upstream = httpRequest(target, { method: req.method, headers, agent, path: `${target.pathname}${query}` }, (response) => {
-      incoming = response; statusCode = response.statusCode || 502;
-      observer = terminalObserver(response.headers['content-type'], response.headers['content-encoding']);
-      res.writeHead(statusCode, cleanHeaders(response.headers));
-      // pipeline preserves bytes and backpressure; failure destroys both ends.
-      // There is deliberately no retry, including after HTTP or partial SSE errors.
-      const tap = new Transform({ transform(chunk, _encoding, callback) { observer.write(chunk); callback(null, chunk); } });
-      response.once('end', () => { ended = true; observer.end(); });
-      pipeline(response, tap, res, (error) => finish(!error && ended && response.complete && res.writableFinished));
-    });
-    upstream.once('error', () => {
-      if (settled) return;
+    const transportFailed = () => {
+      if (settled || blockedRedirect) return;
       if (res.headersSent) { res.destroy(); finish(false); }
       else {
+        if (statusCode !== 504) statusCode = 502;
         res.once('finish', () => finish(false));
-        jsonError(req, res, statusCode, statusCode === 504 ? 'CCSwitch request timed out' : 'CCSwitch is unavailable');
+        const service = official ? 'Official transport' : 'CCSwitch';
+        jsonError(req, res, statusCode, statusCode === 504 ? `${service} request timed out` : `${service} is unavailable`);
       }
-    });
-    upstream.setTimeout(timeoutMs, () => {
-      if (!res.headersSent) statusCode = 504;
-      upstream.destroy(); incoming?.destroy();
-    });
-    upstream.end(bytes);
+    };
+    const forward = (response, prefix = []) => {
+      observer = terminalObserver(response.headers['content-type'], response.headers['content-encoding']);
+      res.writeHead(statusCode, cleanHeaders(response.headers));
+      const tap = new Transform({ transform(chunk, _encoding, callback) { observer.write(chunk); callback(null, chunk); } });
+      for (const chunk of prefix) tap.write(chunk);
+      if (response.readableEnded) { ended = true; observer.end(); }
+      response.once('end', () => { ended = true; observer.end(); });
+      // pipeline preserves bytes and backpressure; failure destroys both ends.
+      // Once any response is forwarded, replay is permanently unavailable.
+      pipeline(response, tap, res, (error) => finish(!error && ended && response.complete && res.writableFinished));
+    };
+    const attempt = (payload, retried = false) => {
+      if (settled || res.destroyed || req.aborted) { disconnected(); return; }
+      statusCode = 502;
+      const headers = cleanHeaders(req.headers, { request: true });
+      if (payload) headers['content-length'] = String(payload.length);
+      const received = (response) => {
+        incoming = response; statusCode = response.statusCode || 502;
+        if (official && statusCode >= 300 && statusCode < 400) {
+          // Native clients may follow a proxy's Location themselves. Do not let
+          // a remote redirect move native Authorization outside the fixed origin.
+          blockedRedirect = true; statusCode = 502;
+          response.on('error', () => {});
+          res.once('finish', () => finish(false));
+          jsonError(req, res, 502, 'Official redirects are not allowed');
+          response.destroy();
+          return;
+        }
+        const encoding = String(response.headers['content-encoding'] || 'identity').toLowerCase();
+        if (!official || retried || statusCode !== 400 || encoding !== 'identity'
+            || !/^application\/json(?:\s*;|$)/i.test(response.headers['content-type'] || '')) { forward(response); return; }
+        // Only a complete, bounded JSON rejection is inspected before sending
+        // headers. Large, compressed, partial, and ordinary errors are not retried.
+        const prefix = []; let size = 0;
+        const cleanup = () => { response.off('data', data); response.off('end', end); response.off('error', failed); response.off('aborted', failed); };
+        const failed = () => { cleanup(); transportFailed(); };
+        const data = (chunk) => {
+          prefix.push(chunk); size += chunk.length;
+          if (size > OBSERVER_LIMIT) { response.pause(); cleanup(); forward(response, prefix); }
+        };
+        const end = () => {
+          cleanup();
+          if (settled) return;
+          let rejection;
+          try { rejection = JSON.parse(Buffer.concat(prefix, size).toString('utf8')); } catch { /* Forward invalid/ordinary error bodies unchanged. */ }
+          const repaired = response.complete && !res.headersSent ? encryptedReasoningRetryBody(body, rejection) : null;
+          if (repaired) { incoming = null; attempt(repaired, true); }
+          else forward(response, prefix);
+        };
+        response.on('data', data); response.once('end', end); response.once('error', failed); response.once('aborted', failed);
+      };
+      try {
+        // The local query never changes the destination/path. Official requests
+        // ignore that local URL completely and construct their fixed HTTPS target.
+        upstream = official ? official.request(endpoint, { method: req.method, headers }, received)
+          : httpRequest(target, { method: req.method, headers, agent, path: `${target.pathname}${query}` }, received);
+      } catch { transportFailed(); return; }
+      const outgoing = upstream;
+      outgoing.once('error', () => { if (upstream === outgoing) transportFailed(); });
+      outgoing.setTimeout(timeoutMs, () => {
+        if (upstream !== outgoing) return;
+        if (!res.headersSent) statusCode = 504;
+        outgoing.destroy(); incoming?.destroy();
+      });
+      outgoing.end(payload);
+    };
+    attempt(bytes);
   });
 }
 
 /**
  * Session-scoped, capability-protected Responses bridge to CCSwitch Stack.
  * `url` is a provider base URL ending in /<token>/v1. No auth.json or OAuth flow
- * is involved; Authorization is carried only to the fixed numeric loopback URL.
+ * is involved; Authorization goes only to numeric loopback CCSwitch or, for an
+ * explicitly resolved official route, the fixed TLS-verified ChatGPT endpoint.
+ * An optional /<token>/provider/<encodedProviderId>/v1 prefix supplies an initial
+ * provider hint to the resolver; it never determines a remote URL or overrides
+ * an existing route. Model listing always uses the local CCSwitch endpoint.
  *
  * Continuation state is intentionally in-memory and bounded. A request carrying
  * previous_response_id is accepted only after a successful response on this
@@ -232,7 +288,9 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '') {
  * requires a new request with complete input and no previous_response_id. Even
  * input + previous_response_id cannot prove that input contains the full prior
  * context. We reject with 409 instead of silently dropping it or replaying tools.
- * CCSwitch's own rectifier receives the unaltered input and encrypted content.
+ * CCSwitch's rectifier receives unaltered input/encrypted content. Official may
+ * retry once only after an explicit complete invalid_encrypted_content rejection
+ * and only by removing rejected encrypted reasoning, never task/tool history.
  *
  * Receipts contain only the fields constructed below. `completed` means the
  * entire upstream response arrived and the downstream response finished;
@@ -242,6 +300,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '') {
 export async function startSwitchGateway({
   upstream, token, port = 0, resolveRoute, verifyReady, onReceipt = async () => {},
   instanceId = randomUUID(), onShutdown = async () => {},
+  officialRequestImpl,
   maxBodyBytes = 32 * 1024 * 1024, bodyTimeoutMs = 30_000, upstreamTimeoutMs = 600_000, maxTrackedThreads = 4096,
 } = {}) {
   const base = upstreamUrl(upstream);
@@ -253,15 +312,20 @@ export async function startSwitchGateway({
   positiveInteger(upstreamTimeoutMs, 'upstreamTimeoutMs'); positiveInteger(maxTrackedThreads, 'maxTrackedThreads');
   const capability = Buffer.from(token), threads = new Map(), sockets = new Set(), receipts = new Set(), handlers = new Set();
   const agent = new Agent({ keepAlive: true });
-  let closing = false, origin, closed, shutdownRequested = false;
+  let closing = false, origin, closed, shutdownRequested = false, officialTransport;
   const endpoint = (req) => {
     if (Object.hasOwn(req.headers, 'origin') || req.headers['sec-fetch-site'] === 'cross-site') throw failure(403, 'Browser-origin requests are not allowed');
     if (req.headers.host !== new URL(origin).host) throw failure(403, 'Invalid gateway host');
-    const match = /^\/([^/?#]+)\/v1\/(responses(?:\/compact)?|models|health|shutdown)(\?[^#]*)?$/.exec(req.url || '');
+    const match = /^\/([^/?#]+)(?:\/provider\/([^/?#]+))?\/v1\/(responses(?:\/compact)?|models|health|shutdown)(\?[^#]*)?$/.exec(req.url || '');
     const supplied = Buffer.from(match?.[1] || '');
     if (!match || supplied.length !== capability.length || !timingSafeEqual(supplied, capability)) throw failure(404, 'Unknown gateway endpoint');
-    if (match[3] && match[2] !== 'models') throw failure(404, 'Unknown gateway endpoint');
-    return { path: match[2], query: match[3] || '' };
+    if (match[4] && match[3] !== 'models') throw failure(404, 'Unknown gateway endpoint');
+    let initialProviderId;
+    if (match[2]) {
+      try { initialProviderId = decodeURIComponent(match[2]); } catch { throw failure(404, 'Invalid initial provider path'); }
+      if (!initialProviderId || initialProviderId.length > 512 || /[\x00-\x1f\x7f]/.test(initialProviderId)) throw failure(404, 'Invalid initial provider path');
+    }
+    return { path: match[3], query: match[4] || '', initialProviderId };
   };
   const emitReceipt = (receipt) => {
     // Callback failures cannot alter a finished response or cause a replay.
@@ -275,7 +339,7 @@ export async function startSwitchGateway({
     let receipt, context;
     try {
       if (closing) throw failure(503, 'Gateway is closing');
-      const { path, query } = endpoint(req);
+      const { path, query, initialProviderId } = endpoint(req);
       if (req.method !== (['models', 'health'].includes(path) ? 'GET' : 'POST')) throw failure(405, 'Method is not allowed');
       if (path === 'health' || path === 'shutdown') {
         // Owned-instance lifecycle only; never mutate CCSwitch or kill a PID.
@@ -298,23 +362,34 @@ export async function startSwitchGateway({
       const normalizedThread = threadId.toLowerCase();
       const { body, bytes } = await jsonBody(req, maxBodyBytes, bodyTimeoutMs);
       let route;
-      try { route = await resolveRoute(normalizedThread); } catch { throw failure(503, 'Session routing is unavailable'); }
+      try { route = await resolveRoute(normalizedThread, initialProviderId); } catch { throw failure(503, 'Session routing is unavailable'); }
       if (!route || !['source', 'fallback'].includes(route.route) || !Number.isSafeInteger(route.revision) || route.revision < 0
-          || (route.route === 'source' && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))) throw failure(503, 'Session route is invalid');
-      route = { route: route.route, sourceKey: route.sourceKey, revision: route.revision };
-      receipt = { requestId: randomUUID(), threadId: normalizedThread, route: route.route, revision: route.revision, startedAt };
-      try { if (await verifyReady() === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
+          || (route.transport != null && !['ccswitch', 'official'].includes(route.transport))
+          || (route.providerId != null && (typeof route.providerId !== 'string' || !route.providerId || route.providerId.length > 512 || /[\x00-\x1f\x7f]/.test(route.providerId)))
+          || ((route.transport === 'ccswitch' || (route.transport == null && route.route === 'source')) && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
+          || (route.sourceKey != null && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
+          || ROUTE_RECEIPT_FIELDS.some((field) => route[field] != null && !(Number.isSafeInteger(route[field])
+            || (typeof route[field] === 'string' && route[field].length <= 512 && !/[\x00-\x1f\x7f]/.test(route[field]))))) throw failure(503, 'Session route is invalid');
+      // Legacy routes without transport preserve the former unprefixed fallback;
+      // every v0.3 third-party route explicitly requires a Stack sourceKey.
+      route = Object.freeze({ route: route.route, transport: route.transport || 'ccswitch', providerId: route.providerId ?? null,
+        sourceKey: route.transport === 'official' ? null : route.sourceKey ?? null, revision: route.revision,
+        ...Object.fromEntries(ROUTE_RECEIPT_FIELDS.map((field) => [field, route[field] ?? null])) });
+      receipt = { requestId: randomUUID(), threadId: normalizedThread, ...route, startedAt };
+      try { if (await verifyReady(route) === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
       if (res.destroyed || req.aborted || closing) throw failure(503, 'Request was cancelled');
-      const identity = JSON.stringify([route.route, route.sourceKey || null, route.revision]);
+      const identity = JSON.stringify([route.route, route.providerId, route.providerFingerprint, route.transport, route.sourceKey, route.revision]);
       context = threads.get(normalizedThread);
       if (context?.identity !== identity) context = { identity, established: false };
       threads.delete(normalizedThread); threads.set(normalizedThread, context);
       if (threads.size > maxTrackedThreads) threads.delete(threads.keys().next().value);
       if (body.previous_response_id != null && !context.established) throw failure(409, 'Route continuity is unknown or changed; resend complete input without previous_response_id');
-      // The only semantic request change: Stack's explicit source selector.
-      // Fallback bytes stay untouched (apart from bounded decompression).
-      const forwarded = route.route === 'source' ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
-      const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), forwarded, agent, upstreamTimeoutMs);
+      const forwarded = route.transport === 'ccswitch' && route.sourceKey ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
+      // Unsupported official environments never prevent the default company
+      // gateway from starting. Selection still belongs entirely to the resolver.
+      if (route.transport === 'official') officialTransport ||= createOfficialTransport({ requestImpl: officialRequestImpl });
+      const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), forwarded, agent, upstreamTimeoutMs, '',
+        route.transport === 'official' ? { official: officialTransport, endpoint: path, body } : undefined);
       const success = outcome.completed && outcome.success && outcome.statusCode >= 200 && outcome.statusCode < 300;
       if (success && threads.get(normalizedThread) === context) context.established = true;
       emitReceipt({ ...receipt, ...outcome, success, finishedAt: Date.now() }); receipt = null;
@@ -351,6 +426,7 @@ export async function startSwitchGateway({
       server.close(resolve);
       for (const socket of sockets) socket.destroy();
       agent.destroy();
+      officialTransport?.close();
     }).then(async () => {
       await Promise.allSettled([...handlers]);
       await Promise.allSettled([...receipts]);

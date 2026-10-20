@@ -1,15 +1,16 @@
 {
   "name": "modeltrace-guard-autoswitch-workspace",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
-  "description": "Independent ModelTrace fork for opt-in, verified Codex route switching.",
+  "description": "Independent ModelTrace fork with per-incident consent and verified Codex route switching.",
   "author": "xqy2006",
   "contributors": ["ChenCJ-io"],
   "license": "MIT",
   "type": "module",
   "engines": { "node": ">=18" },
   "scripts": {
-    "test": "node --test --test-concurrency=1 codex-plugin/modeltrace-guard/tests/*.test.mjs",
+    "install-plugin": "node scripts/install-plugin.mjs",
+    "test": "node --test --test-concurrency=1 codex-plugin/modeltrace-guard/tests/*.test.mjs tests/*.test.mjs",
     "build": "node codex-plugin/build-plugin.mjs",
     "check": "node codex-plugin/validate-distribution.mjs && node codex-plugin/verify-parity.mjs"
   }

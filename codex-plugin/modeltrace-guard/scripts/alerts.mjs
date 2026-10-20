@@ -22,7 +22,7 @@ export function queueAlert(state, sample) {
 export const pendingAlerts = (state) => (state?.alerts || []).filter((alert) => !alert.acknowledgedAt);
 
 export function userNotice(alert) {
-  if (alert.autoSwitchPending) return `ModelTrace AutoSwitch：首次异常后的 ${alert.retryCount} 次复测全部出现较强的指纹差异，预期 ${JSON.stringify(alert.expected)}，候选依次为 ${JSON.stringify(alert.predictions)}。已按本会话授权排队验证备用渠道，验证成功后自动继续；这不是后端身份或降智的证明。`;
+  if (alert.switchConsentRequired) return `ModelTrace AutoSwitch：${new Date(alert.at).toISOString()}，${JSON.stringify(alert.sourceName)} 的抽样预期为 ${JSON.stringify(alert.expected)}，指纹候选为 ${JSON.stringify(alert.prediction)}（${alert.level === 'candidate_mismatch' ? '排序不一致，证据不足' : '指纹差异线索'}）。原任务已暂停，等待用户决定是否切换到 ${JSON.stringify(alert.targetName || '用户指定的配置')}。尚未验证或切换备用渠道；本结果不证明模型被替换或降智。`;
   if (alert.level === 'confirmed_mismatch') return `ModelTrace Guard：首次异常后的 ${alert.retryCount} 次复测全部与预期模型 ${JSON.stringify(alert.expected)} 不一致。复测第一候选依次为 ${JSON.stringify(alert.predictions || [alert.prediction])}。已要求智能体立刻停止原任务并告知用户，等待用户决定后续操作。`;
   const strength = { candidate_mismatch: '候选排序不一致，但证据不足', difference_signal: '一次较强的指纹差异线索', repeated_difference: '近期重复的同语言指纹差异线索' }[alert.level];
   return `ModelTrace Guard 提醒：${new Date(alert.at).toISOString()} 的抽样中，预期模型为 ${JSON.stringify(alert.expected)}，指纹第一候选为 ${JSON.stringify(alert.prediction)}（${strength}）。这是未独立校准的实验性结果，不能据此确认模型被替换、降智或厂商作弊；后续匹配也不会抹去本次记录。`;

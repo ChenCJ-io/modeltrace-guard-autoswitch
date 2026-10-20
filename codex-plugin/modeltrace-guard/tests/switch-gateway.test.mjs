@@ -40,6 +40,21 @@ async function fixture(t, handle = (_req, res) => { res.writeHead(200, { 'conten
   return { gateway, received, receipts, upstreamUrl, readyCalls: () => readyCalls };
 }
 
+async function officialFixture(t, handle, options = {}) {
+  let f;
+  const officialCalls = [];
+  f = await fixture(t, handle, {
+    resolveRoute: async () => ({ route: 'fallback', transport: 'official', providerId: 'official-test', revision: 3 }),
+    // Test-only injection: inspect the genuine fixed HTTPS target, but perform
+    // the I/O against the synthetic local server; no account/network is involved.
+    officialRequestImpl: (target, settings, callback) => {
+      officialCalls.push({ url: target.href, headers: settings.headers, rejectUnauthorized: settings.rejectUnauthorized });
+      return httpRequest(f.upstreamUrl, { method: settings.method, headers: settings.headers, path: target.pathname, agent: false }, callback);
+    }, ...options,
+  });
+  return { ...f, officialCalls };
+}
+
 function send(gateway, { path = '/responses', rawPath, method = 'POST', thread = A, body = defaultBody, bytes, headers = {}, tolerateAbort = false } = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(gateway.url + path);
@@ -82,11 +97,13 @@ test('source forwarding changes only model, carries native authorization, and pr
   assert.equal(f.readyCalls(), 1);
   await until(() => f.receipts.length === 1);
   const receipt = f.receipts[0];
-  assert.deepEqual(Object.keys(receipt).sort(), ['requestId', 'threadId', 'route', 'revision', 'startedAt', 'statusCode', 'completed', 'success', 'responseEvent', 'finishedAt'].sort());
+  assert.deepEqual(Object.keys(receipt).sort(), ['requestId', 'threadId', 'route', 'revision', 'providerId', 'transport', 'sourceKey', 'providerFingerprint', 'proposalId', 'approvalId', 'challenge', 'startedAt', 'statusCode', 'completed', 'success', 'responseEvent', 'finishedAt'].sort());
   assert.equal(receipt.route, 'source'); assert.equal(receipt.revision, 0); assert.equal(receipt.threadId, A);
   assert.equal(receipt.statusCode, 200); assert.equal(receipt.completed, true); assert.equal(receipt.success, true); assert.equal(receipt.responseEvent, 'response.completed');
   assert.match(receipt.requestId, /^[0-9a-f-]{36}$/); assert.equal(typeof receipt.startedAt, 'number'); assert.ok(receipt.finishedAt >= receipt.startedAt);
-  assert.doesNotMatch(JSON.stringify(receipt), /synthetic|encrypted|Bearer|capability|API2/);
+  assert.equal(receipt.providerId, null); assert.equal(receipt.transport, 'ccswitch'); assert.equal(receipt.sourceKey, 'API2');
+  assert.equal(receipt.providerFingerprint, null); assert.equal(receipt.proposalId, null); assert.equal(receipt.approvalId, null); assert.equal(receipt.challenge, null);
+  assert.doesNotMatch(JSON.stringify(receipt), /synthetic|encrypted|Bearer|capability/);
 });
 
 test('switching one session preserves the other session and fallback body bytes', async (t) => {
@@ -164,7 +181,7 @@ test('large SSE events remain byte-exact and completion can be observed with a b
     assert.equal((await send(f.gateway)).body, frames[i]);
     await until(() => f.receipts.length === i + 1);
     assert.equal(f.receipts[i].success, true);
-    assert.ok(JSON.stringify(f.receipts[i]).length < 512);
+    assert.ok(JSON.stringify(f.receipts[i]).length < 768);
   }
 });
 
@@ -413,4 +430,171 @@ test('incoming body timeout rejects a stalled upload without contacting upstream
     req.once('error', reject); req.write('{');
   });
   assert.equal(result, 408); assert.equal(f.received.length, 0);
+});
+
+test('v0.3 company and approved third-party backup routes both use explicit CCSwitch Stack selectors', async (t) => {
+  let route = { route: 'source', transport: 'ccswitch', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 };
+  const f = await fixture(t, undefined, { resolveRoute: async () => route });
+  await send(f.gateway);
+  route = { route: 'fallback', transport: 'ccswitch', providerId: 'approved-backup', sourceKey: 'BACKUP', revision: 1,
+    providerFingerprint: 'f'.repeat(64), proposalId: 'proposal-test', approvalId: 'approval-test', challenge: 7 };
+  await send(f.gateway);
+  assert.deepEqual(f.received.map(({ body }) => body.model), ['ccs-API2-copy/gpt-example', 'ccs-BACKUP/gpt-example']);
+  await until(() => f.receipts.length === 2);
+  assert.deepEqual(f.receipts.map(({ providerId, transport, sourceKey }) => ({ providerId, transport, sourceKey })), [
+    { providerId: 'company-config', transport: 'ccswitch', sourceKey: 'API2-copy' },
+    { providerId: 'approved-backup', transport: 'ccswitch', sourceKey: 'BACKUP' },
+  ]);
+  assert.equal(f.receipts[1].providerFingerprint, route.providerFingerprint); assert.equal(f.receipts[1].proposalId, route.proposalId);
+  assert.equal(f.receipts[1].approvalId, route.approvalId); assert.equal(f.receipts[1].challenge, 7);
+  route = { route: 'fallback', transport: 'ccswitch', providerId: 'missing-selector', revision: 2 };
+  assert.equal((await send(f.gateway)).status, 503);
+  route = { route: 'fallback', transport: 'unknown', providerId: 'untrusted-transport', revision: 3 };
+  assert.equal((await send(f.gateway)).status, 503);
+  assert.equal(f.received.length, 2);
+});
+
+test('provider launch paths supply a decoded initial hint while the resolver owns the current route and models stay local', async (t) => {
+  const selected = '公司 / API2?copy#selection', hints = [];
+  const f = await fixture(t, undefined, { resolveRoute: async (thread, hint) => {
+    hints.push({ thread, hint }); return { route: 'fallback', transport: 'ccswitch', providerId: 'current-approved', sourceKey: 'CURRENT', revision: 8 };
+  }, officialRequestImpl: () => { assert.fail('models and third-party requests must not open official transport'); } });
+  const selectedGateway = { url: f.gateway.url.replace('/v1', `/provider/${encodeURIComponent(selected)}/v1`) };
+  assert.equal((await send(selectedGateway)).status, 200);
+  assert.deepEqual(hints, [{ thread: A, hint: selected }]);
+  assert.equal(f.received[0].body.model, 'ccs-CURRENT/gpt-example');
+  await until(() => f.receipts.length === 1); assert.equal(f.receipts[0].providerId, 'current-approved');
+  assert.equal((await send(selectedGateway, { path: '/models?client_version=0.163.0', method: 'GET', thread: null, body: null })).status, 200);
+  assert.equal(f.received[1].path, '/v1/models?client_version=0.163.0'); assert.equal(hints.length, 1);
+  for (const rawPath of [`/${TOKEN}/provider/%ZZ/v1/responses`, `/${TOKEN}/provider/%00/v1/responses`, `/${TOKEN}/provider//v1/responses`,
+    `/${TOKEN}/provider/a/b/v1/responses`, `/wrong-capability/provider/${encodeURIComponent(selected)}/v1/responses`]) {
+    assert.equal((await send(f.gateway, { rawPath })).status, 404);
+  }
+  assert.equal(f.received.length, 2);
+});
+
+test('official routing preserves the native request at fixed TLS targets and strips local capability metadata', async (t) => {
+  const f = await officialFixture(t);
+  const body = { ...defaultBody, reasoning: { effort: 'max' }, input: [
+    { role: 'user', content: 'synthetic task' }, { type: 'reasoning', encrypted_content: 'synthetic-native-encrypted' },
+  ] };
+  const result = await send(f.gateway, { body, headers: { 'chatgpt-account-id': 'synthetic-account', referer: f.gateway.url, 'x-original-url': `/${TOKEN}/v1/responses` } });
+  assert.equal(result.status, 200); assert.equal(result.body, DONE);
+  assert.deepEqual(f.received[0].body, body);
+  assert.equal(f.received[0].path, '/backend-api/codex/responses');
+  assert.equal(f.officialCalls[0].url, 'https://chatgpt.com/backend-api/codex/responses');
+  assert.equal(f.officialCalls[0].rejectUnauthorized, true);
+  assert.equal(f.officialCalls[0].headers.authorization, AUTH); assert.equal(f.officialCalls[0].headers['chatgpt-account-id'], 'synthetic-account');
+  assert.doesNotMatch(JSON.stringify(f.officialCalls), new RegExp(TOKEN));
+  await until(() => f.receipts.length === 1);
+  assert.equal(f.receipts[0].providerId, 'official-test'); assert.equal(f.receipts[0].transport, 'official'); assert.equal(f.receipts[0].sourceKey, null); assert.equal(f.receipts[0].success, true);
+  await send(f.gateway, { path: '/responses/compact', body });
+  assert.equal(f.officialCalls[1].url, 'https://chatgpt.com/backend-api/codex/responses/compact');
+});
+
+test('unsupported official environments do not block startup, company traffic or models and never silently go direct', async (t) => {
+  const original = process.env.ALL_PROXY;
+  process.env.ALL_PROXY = 'socks5://synthetic-secret@proxy.invalid:1080';
+  try {
+    let official = false;
+    const f = await officialFixture(t, undefined, { resolveRoute: async () => official
+      ? { route: 'fallback', transport: 'official', providerId: 'approved-official', revision: 1 }
+      : { route: 'source', transport: 'ccswitch', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 } });
+    assert.equal((await send(f.gateway)).status, 200);
+    assert.equal((await send(f.gateway, { path: '/models', method: 'GET', thread: null, body: null })).status, 200);
+    official = true;
+    const result = await send(f.gateway);
+    assert.equal(result.status, 503); assert.match(result.body, /ALL_PROXY/); assert.doesNotMatch(result.body, /synthetic-secret/);
+    assert.equal(f.officialCalls.length, 0); assert.equal(f.received.length, 2);
+    await until(() => f.receipts.length === 2); assert.equal(f.receipts[1].transport, 'official'); assert.equal(f.receipts[1].success, false);
+  } finally { if (original === undefined) delete process.env.ALL_PROXY; else process.env.ALL_PROXY = original; }
+});
+
+test('explicit official invalid_encrypted_content rejection permits exactly one reasoning-only repair before downstream output', async (t) => {
+  const rejection = JSON.stringify({ error: { code: 'invalid_encrypted_content', param: 'input[0].encrypted_content', message: 'synthetic rejection' } });
+  const body = { ...defaultBody, tools: [{ type: 'function', name: 'synthetic_tool' }], input: [
+    { type: 'reasoning', encrypted_content: 'synthetic-other-provider-state', summary: [] },
+    { role: 'user', content: 'synthetic task' }, { type: 'function_call', call_id: 'synthetic-call', name: 'synthetic_tool', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'synthetic-call', output: 'synthetic tool result' },
+  ] };
+  const f = await officialFixture(t, (_req, res, _seen, index) => {
+    res.writeHead(index === 1 ? 400 : 200, { 'content-type': index === 1 ? 'application/json' : 'text/event-stream' });
+    res.end(index === 1 ? rejection : DONE);
+  });
+  const result = await send(f.gateway, { body });
+  assert.equal(result.status, 200); assert.equal(result.body, DONE);
+  assert.equal(f.received.length, 2); assert.deepEqual(f.received[0].body, body); assert.deepEqual(f.received[1].body, { ...body, input: body.input.slice(1) });
+  assert.ok(f.officialCalls.every((call) => call.url === 'https://chatgpt.com/backend-api/codex/responses' && call.headers.authorization === AUTH));
+  assert.equal(Number(f.received[1].headers['content-length']), f.received[1].bytes.length);
+  await until(() => f.receipts.length === 1); assert.equal(f.receipts[0].statusCode, 200); assert.equal(f.receipts[0].success, true);
+});
+
+test('a second encrypted-content rejection is forwarded without a third attempt', async (t) => {
+  const rejection = '{"error":{"code":"invalid_encrypted_content","message":"synthetic"}}';
+  const f = await officialFixture(t, (_req, res) => { res.writeHead(400, { 'content-type': 'application/json' }); res.end(rejection); });
+  const result = await send(f.gateway, { body: { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic' }, ...defaultBody.input] } });
+  assert.equal(result.status, 400); assert.equal(result.body, rejection); assert.equal(f.received.length, 2);
+  await until(() => f.receipts.length === 1); assert.equal(f.receipts[0].completed, true); assert.equal(f.receipts[0].success, false);
+});
+
+test('official ordinary HTTP errors and oversized rejections are returned once unchanged', async (t) => {
+  const ordinary = '{"error":{"code":"invalid_request_error","message":"synthetic"}}';
+  const large = JSON.stringify({ error: { code: 'invalid_encrypted_content', message: 'synthetic'.repeat(20_000) } });
+  const cases = [{ status: 400, body: ordinary }, { status: 403, body: ordinary }, { status: 429, body: ordinary }, { status: 500, body: ordinary },
+    { status: 400, body: large }];
+  const f = await officialFixture(t, (_req, res, _seen, index) => {
+    const result = cases[index - 1]; res.writeHead(result.status, { 'content-type': 'application/json', location: 'https://external.invalid/never-follow' }); res.end(result.body);
+  });
+  for (const [index, expected] of cases.entries()) {
+    const result = await send(f.gateway, { body: { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic' }, ...defaultBody.input] } });
+    assert.equal(result.status, expected.status); assert.equal(result.body, expected.body); assert.equal(f.received.length, index + 1);
+  }
+  assert.ok(f.officialCalls.every(({ url }) => url === 'https://chatgpt.com/backend-api/codex/responses'));
+  await until(() => f.receipts.length === cases.length); assert.ok(f.receipts.every((receipt) => !receipt.success));
+});
+
+test('every official 3xx becomes 502 without Location so native clients cannot follow or leak identity', async (t) => {
+  const statuses = [300, 301, 302, 303, 304, 305, 307, 308, 399];
+  const f = await officialFixture(t, (_req, res, _seen, index) => {
+    res.writeHead(statuses[index - 1], { location: 'https://external.invalid/never-follow', 'content-type': 'application/json' });
+    res.end('{"error":{"code":"invalid_encrypted_content"}}');
+  });
+  for (const index of statuses.keys()) {
+    const result = await send(f.gateway, { body: { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic' }, ...defaultBody.input] } });
+    assert.equal(result.status, 502); assert.equal(result.headers.location, undefined);
+    assert.match(result.body, /Official redirects are not allowed/); assert.doesNotMatch(result.body, /external\.invalid/);
+    assert.equal(f.received.length, index + 1);
+  }
+  assert.ok(f.officialCalls.every(({ url }) => url === 'https://chatgpt.com/backend-api/codex/responses'));
+  await until(() => f.receipts.length === statuses.length);
+  assert.ok(f.receipts.every((receipt) => receipt.statusCode === 502 && !receipt.completed && !receipt.success));
+});
+
+test('official encrypted task messages and compaction remain intact when rejection cannot be repaired safely', async (t) => {
+  const rejection = '{"error":{"code":"invalid_encrypted_content"}}';
+  const f = await officialFixture(t, (_req, res) => { res.writeHead(400, { 'content-type': 'application/json' }); res.end(rejection); });
+  for (const [index, type] of ['agent_message', 'compaction'].entries()) {
+    const body = { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic-reasoning' }, ...defaultBody.input,
+      { type, encrypted_content: 'synthetic-task-history' }] };
+    const result = await send(f.gateway, { body });
+    assert.equal(result.status, 400); assert.equal(result.body, rejection); assert.equal(f.received.length, index + 1);
+    assert.deepEqual(f.received[index].body, body);
+  }
+});
+
+test('an interrupted official error body and an already-streaming SSE error are never retried', async (t) => {
+  const f = await officialFixture(t, (_req, res, _seen, index) => {
+    if (index === 1) {
+      res.writeHead(400, { 'content-type': 'application/json' }); res.write('{"error":{"code":"invalid_encrypted_content"');
+      setTimeout(() => res.destroy(), 10);
+    } else {
+      res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('event: error\ndata: {"error":{"code":"invalid_encrypted_content"}}\n\n');
+    }
+  });
+  const body = { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic' }, ...defaultBody.input] };
+  assert.equal((await send(f.gateway, { body })).status, 502);
+  assert.equal(f.received.length, 1);
+  assert.equal((await send(f.gateway, { body })).status, 200);
+  assert.equal(f.received.length, 2);
+  await until(() => f.receipts.length === 2); assert.ok(f.receipts.every((receipt) => !receipt.success));
 });

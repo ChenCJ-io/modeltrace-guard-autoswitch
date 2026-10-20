@@ -14,23 +14,36 @@ import { requireTrustedGuard } from './fork-runner.mjs';
 import { loadArtifacts } from './guard.mjs';
 import { startSwitchGateway } from './switch-gateway.mjs';
 import {
-  UUID, atomicJSON, configureGateway, enableAutoSwitch, failAutoSwitch, gatewayURL, inspectCCSwitch,
-  loadGatewayConfig, readJSON, resolveSessionRoute, runtimePath, saveReceipt, verifyGatewayReady,
+  UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
+  loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady,
+} from './provider-config.mjs';
+import {
+  enableAutoSwitch, failAutoSwitch, resolveSessionRoute, saveReceipt,
 } from './switch-policy.mjs';
 
 const entrypoint = fileURLToPath(import.meta.url);
 function argumentsFor(args) {
   const command = args.shift() || 'help', options = {};
   const allowed = {
-    help: [], inspect: ['cc-switch-dir'], configure: ['source-provider', 'fallback-provider', 'cc-switch-dir', 'port'],
-    'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume'],
+    help: [], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
+    'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command');
   while (args.length) {
     const flag = args.shift();
     if (!flag.startsWith('--') || !args.length || Object.hasOwn(options, flag.slice(2)) || !['data-dir', ...allowed[command]].includes(flag.slice(2))) throw new Error(`Invalid option ${flag}`);
-    options[flag.slice(2)] = args.shift();
+    const value = args.shift();
+    if (!value.trim() || value.includes('\0') || value.startsWith('--')) throw new Error(`Invalid value for ${flag}`);
+    options[flag.slice(2)] = value;
   }
+  if (command === 'configure') {
+    const names = ['primary-name', 'backup-name'], ids = ['primary-provider', 'backup-provider'];
+    const hasNames = names.some(key => Object.hasOwn(options, key)), hasIds = ids.some(key => Object.hasOwn(options, key));
+    if (hasNames === hasIds || !(hasNames ? names : ids).every(key => Object.hasOwn(options, key))) {
+      throw new Error('Provide both --primary-name/--backup-name or both --primary-provider/--backup-provider; do not mix names and IDs');
+    }
+  }
+  if (command === 'launch' && options['provider-name'] && options['provider-id']) throw new Error('Choose --provider-name or --provider-id, not both');
   return { command, options };
 }
 
@@ -77,7 +90,7 @@ async function serveGateway(directory) {
   const done = new Promise(resolve => { resolveDone = resolve; });
   const gateway = await startSwitchGateway({ upstream: config.upstream, port: config.port, token: config.token, instanceId,
     verifyReady: () => verifyGatewayReady(directory, config),
-    resolveRoute: thread => resolveSessionRoute(directory, config, thread),
+    resolveRoute: (thread, initialProviderId) => resolveSessionRoute(directory, config, thread, initialProviderId),
     onReceipt: receipt => saveReceipt(directory, config, receipt),
     onShutdown: () => resolveDone(),
   });
@@ -93,20 +106,24 @@ async function serveGateway(directory) {
   }
 }
 
-export async function runAutoSwitch(args, env = process.env) {
+export async function runAutoSwitch(args, env = process.env, {
+  openClient = openAppServer, executableFor = codexExecutable, spawnClient = spawn,
+} = {}) {
   const { command, options } = argumentsFor([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return { commands: ['inspect', 'configure', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
-    configure: 'configure --source-provider ID --fallback-provider ID [--cc-switch-dir PATH] [--port 15722]',
-    launch: 'launch [--resume THREAD_ID] (interactive native Codex; no global config edits)',
-    enable: 'enable [--session THREAD_ID] (after one successful request through the gateway, using native ChatGPT login)',
-    disable: 'Stop automatic switching and monitoring; keep the current route and any halt',
-    scope: 'Per thread, one authorized API provider → official fallback. Monitoring stops after verified fallback. No automatic switch-back.', dataDirectory: directory };
+    configure: 'configure --primary-name NAME --backup-name NAME (or --primary-provider ID --backup-provider ID) [--cc-switch-dir PATH] [--port 15722]',
+    launch: 'launch [--resume THREAD_ID] [--provider-name NAME | --provider-id ID] (default: primary; no global config edits)',
+    enable: 'enable [--session THREAD_ID] (monitor an already successful primary-route thread; never changes its route)',
+    disable: 'Stop monitoring and cancel a pending switch request; keep the selected route and any halt',
+    incidents: 'Use guard.mjs propose-switch / approve-switch / decline-switch / wait-switch for an incident request',
+    scope: 'Pause on the first valid fingerprint mismatch. Each target verification and switch requires consent for that incident. Configuration, enable and acknowledgement never approve a switch.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);
   if (command === 'configure') {
     const current = await gatewayStatus(directory).catch(() => ({ running: false }));
     if (current.running) throw new Error('Stop this gateway before reconfiguring it');
-    return configureGateway(directory, { sourceProvider: options['source-provider'], fallbackProvider: options['fallback-provider'],
+    return configureGateway(directory, { primaryName: options['primary-name'], backupName: options['backup-name'],
+      sourceProvider: options['primary-provider'], fallbackProvider: options['backup-provider'],
       ccSwitchDirectory: options['cc-switch-dir'], port: options.port === undefined ? 15722 : Number(options.port) });
   }
   if (command === 'serve') { await serveGateway(directory); return { stopped: true }; }
@@ -125,17 +142,24 @@ export async function runAutoSwitch(args, env = process.env) {
   }
   if (command === 'launch') {
     if (options.resume && !UUID.test(options.resume)) throw new Error('Invalid native thread ID');
-    await startGateway(directory);
     const config = await loadGatewayConfig(directory);
-    const executable = await codexExecutable(env);
-    const client = await openAppServer(env);
+    const layout = await verifyGatewayReady(directory, config);
+    const explicitProvider = Boolean(options['provider-name'] || options['provider-id']);
+    const provider = explicitProvider ? resolveProvider(layout, { name: options['provider-name'], id: options['provider-id'] }) : config.primary;
+    assertProviderCurrent(layout, provider);
+    const executable = await executableFor(env);
+    const client = await openClient(env, { nativeOpenai: true });
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
       if (account?.type !== 'chatgpt') throw new Error('Sign into the native Codex client with ChatGPT before launch');
     } finally { await client.close(); }
+    await startGateway(directory);
+    // Recheck the chosen descriptor after runtime preparation. Neither a
+    // changed card nor an unrelated global default may substitute this choice.
+    assertProviderCurrent(await verifyGatewayReady(directory, config), provider);
     // argv is passed directly; never build a shell command or persist the URL
     // to the user's shared Codex or CCSwitch configuration.
-    const child = spawn(executable, ['-c', 'model_provider="openai"', '-c', `openai_base_url=${JSON.stringify(gatewayURL(config))}`,
+    const child = spawnClient(executable, ['-c', 'model_provider="openai"', '-c', `openai_base_url=${JSON.stringify(gatewayURL(config, explicitProvider ? provider.id : undefined))}`,
       ...(options.resume ? ['resume', options.resume] : [])], { stdio: 'inherit', env: { ...env, MODELTRACE_AUTOSWITCH_DATA: directory } });
     const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
     return { exited: true, code };
@@ -145,7 +169,9 @@ export async function runAutoSwitch(args, env = process.env) {
   if (command === 'status') {
     const state = await readState(directory, session);
     return { session, monitoringEnabled: state?.enabled === true, monitoringStoppedReason: state?.monitoringStoppedReason || null,
-      autoSwitch: state?.autoSwitch || null, taskHalt: state?.taskHalt || null,
+      initialRoute: state?.initialRoute || null, autoSwitch: state?.autoSwitch || null,
+      switchRequest: state?.switchRequest || null, taskHalt: state?.taskHalt || null,
+      configuration: await loadGatewayConfig(directory).then(publicConfig).catch(() => null),
       gateway: await gatewayStatus(directory).catch(() => ({ running: false, reason: 'not_configured' })) };
   }
   if (command === 'disable') return withState(directory, session, state => {
@@ -153,17 +179,18 @@ export async function runAutoSwitch(args, env = process.env) {
     failAutoSwitch(state, now, 'autoswitch_disabled');
     stopMonitoring(state, now, 'autoswitch_disabled');
     if (state.autoSwitch) state.autoSwitch.enabled = false;
-    return { autoSwitch: state.autoSwitch || null, monitoringEnabled: false, routeUnchanged: true, taskHalt: state.taskHalt || null };
+    return { autoSwitch: state.autoSwitch || null, switchRequest: state.switchRequest || null,
+      monitoringEnabled: false, routeUnchanged: true, taskHalt: state.taskHalt || null };
   });
   const { bank } = await loadArtifacts();
   const legacy = await readState(env.MODELTRACE_GUARD_DATA || path.join(env.CODEX_HOME || path.join(homedir(), '.codex'), 'modeltrace-guard'), session);
   if (legacy?.enabled || legacy?.taskHalt) throw new Error('The upstream ModelTrace Guard still monitors or halts this thread; finish/stop that monitor before opting into this fork');
-  const client = await openAppServer(env);
+  const client = await openClient(env, { nativeOpenai: true });
   try {
     const [{ account }, settings] = await Promise.all([
       client.request('account/read', { refreshToken: false }), sourceSettings(client, session),
     ]);
-    if (!bank.models.some(m => m.id === settings.model)) throw new Error('This exact model label is absent from the fingerprint bank; automatic switching is unavailable');
+    if (!bank.models.some(m => m.id === settings.model)) throw new Error('This exact model label is absent from the fingerprint bank; monitored switching is unavailable');
     await requireTrustedGuard(client, settings.cwd);
     return enableAutoSwitch(directory, session, { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
   } finally { await client.close(); }
@@ -171,5 +198,11 @@ export async function runAutoSwitch(args, env = process.env) {
 
 if (process.argv[1] && realpathSync(process.argv[1]) === entrypoint) {
   try { process.stdout.write(JSON.stringify(await runAutoSwitch(process.argv.slice(2))) + '\n'); }
-  catch (error) { process.stderr.write(JSON.stringify({ error: error.message }) + '\n'); process.exitCode = 1; }
+  catch (error) {
+    process.stderr.write(JSON.stringify({ error: error.message,
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      ...(Array.isArray(error.candidates) ? { candidates: error.candidates.map(({ id, name }) => ({ id, name })) } : {}),
+    }) + '\n');
+    process.exitCode = 1;
+  }
 }

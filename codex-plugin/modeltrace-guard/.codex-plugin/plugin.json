@@ -1,18 +1,18 @@
 {
   "name": "modeltrace-guard-autoswitch",
-  "version": "0.2.1",
-  "description": "Independent ModelTrace fork with opt-in per-thread route switching after repeated strong fingerprint differences and a verified fallback canary.",
+  "version": "0.3.0",
+  "description": "Pause on a fingerprint mismatch and switch a Codex thread only after consent for that specific request and a verified target canary.",
   "author": {
     "name": "xqy2006"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "ModelTrace Guard Autoswitch",
-    "shortDescription": "原生指纹监测 · 授权会话切换 · 回执验证",
-    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护自动切换扩展。保留冻结快照、独立无工具采样、异常提醒和停工保护；仅为明确授权的会话，在首检及至少 3 次追加复测全部为强差异且源路由证据有效后，尝试从 CCSwitch 聚合成员切到官方默认路由。弱排序分歧不触发自动切换。备用路由须返回真实 completed 回执并通过兼容指纹检查才解除暂停；失败保持停工。沿用原生认证，探针消耗对应推理额度。指纹不是后端身份或降智证明。",
+    "shortDescription": "指纹异常先询问 · 本次同意后验证切换",
+    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护。默认使用配置的主服务；接入网关并启用监测后，首次有效指纹不一致即暂停并询问。安装、配置主备、开启监测和确认收到提醒均不授权切换。用户针对本次异常明确同意目标后，才运行原生 canary；真实 completed 回执和兼容指纹通过才切换并恢复。官方目标成功后停止探针；第三方目标继续监测，下次异常再次询问。指纹不是后端身份或降智证明。",
     "developerName": "xqy2006 · fork: ChenCJ-io",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "检查 ModelTrace Guard Autoswitch 的本地路由和监测状态，说明如何为当前会话明确启用自动切换。"
+    "defaultPrompt": "检查 CCSwitch 配置，主用 API2 copy，备用使用我指定的配置；首次指纹异常先询问，只有我对本次目标明确同意后才验证并切换。"
   }
 }

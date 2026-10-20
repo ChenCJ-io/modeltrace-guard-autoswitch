@@ -35,6 +35,7 @@ export function summarize(state, directory, now = Date.now()) {
       startedAt: state.probeRun?.startedAt || null },
     forkCleanup: state.forkCleanup || null,
     confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, autoSwitch: state.autoSwitch || null,
+    initialRoute: state.initialRoute || null, switchRequest: state.switchRequest || null,
     lastHookAt: state.lastHookAt, probesIssued: state.issued, probesAccepted: historyCount(state, 'samples'),
     missedProbes: state.missed, pendingExpired: Boolean(pendingExpired), pending: state.pending,
     observedWorkTools: state.workTools, nextToolCheckpoint: state.nextTools, nextTimeCheckpoint: null,
@@ -45,6 +46,8 @@ export function summarize(state, directory, now = Date.now()) {
     notifications: (state.alerts || []).slice(-5),
     latest: state.samples.slice(-3).map(publicSample),
     stateFile: sessionPath(directory, state.session), warning: WARNING,
-    coverageNote: 'Normal checkpoints use work-tool counts only, with no per-turn or task-total probe limit. Mismatch retries are consecutive and bounded by retryCount. Only sampled continuations are observed.',
+    coverageNote: state.autoSwitch?.protocol === 3
+      ? 'Work-tool checkpoints on the opted-in primary; the first candidate mismatch pauses for per-incident consent. No target probe before approval. Official success stops monitoring.'
+      : 'Normal checkpoints use work-tool counts only, with no per-turn or task-total probe limit. Mismatch retries are consecutive and bounded by retryCount. Only sampled continuations are observed.',
   };
 }

@@ -3,7 +3,7 @@ import { access, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { readProtocolLines } from './protocol-lines.mjs';
 
-export const CODEX_CLIENT_INFO = Object.freeze({ name: 'modeltrace_guard', version: '0.2.1' });
+export const CODEX_CLIENT_INFO = Object.freeze({ name: 'modeltrace_guard', version: '0.3.0' });
 
 // Use Codex's own transport and configured account/provider, never a parallel
 // hand-written Responses/Chat client. Do not print protocol history or stderr.
@@ -104,9 +104,12 @@ export class AppServerClient {
   }
 }
 
-export async function openAppServer(env = process.env) {
+export async function openAppServer(env = process.env, { nativeOpenai = false } = {}) {
   const executable = await codexExecutable(env);
-  const child = spawn(executable, ['app-server', '--stdio'], {
+  // CCSwitch may select a custom provider globally. The switch bridge uses the
+  // native openai auth contract; its temporary process must inspect that same
+  // contract instead of custom-provider account/read (which returns null).
+  const child = spawn(executable, ['app-server', '--stdio', ...(nativeOpenai ? ['-c', 'model_provider="openai"'] : [])], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...env, MODELTRACE_PROBE_PROCESS: '1' },
   });

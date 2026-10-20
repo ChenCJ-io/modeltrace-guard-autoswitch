@@ -133,7 +133,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
   const generate = dependencies.generate || generateProbe;
   const stateOptions = dependencies.background ? BACKGROUND_STATE_LOCK : undefined;
   const updateState = (callback) => withState(directory, session, callback, stateOptions);
-  let client, cacheTransport, snapshot, pending, receipt, text, cleanupConfirmed = false;
+  let client, cacheTransport, snapshot, pending, receipt, text, cleanupConfirmed = false, nativeOpenai = false;
   let stage = 'connect';
   const claimed = await updateState((state) => {
     // Parallel background hooks race for one atomic checkpoint lease. A losing
@@ -146,11 +146,12 @@ export async function runForkProbe(directory, session, challenge, env = process.
     if (state.pending.confirmationId && !state.forkSnapshot) throw new Error('Retry snapshot is missing; a fresh snapshot cannot replace it');
     state.probeRun = { pid: process.pid, challenge, startedAt: Date.now() };
     pending = structuredClone(state.pending); snapshot = state.forkSnapshot;
+    nativeOpenai = state.autoSwitch?.protocol === 3;
     return true;
   });
   if (!claimed) return { skipped: true };
   try {
-    client = await connect(env);
+    client = await connect(env, { nativeOpenai });
     stage = 'snapshot';
     if (!snapshot) {
       snapshot = await freezeSnapshot(client, session, directory);

@@ -2,17 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ROOT, handleHook, loadArtifacts, run } from '../scripts/guard.mjs';
-import { handleBackgroundHook, waitForConfirmation } from '../scripts/background.mjs';
+import { handleBackgroundHook, waitForSwitch } from '../scripts/background.mjs';
 import { readState, sessionPath, withState } from '../scripts/state.mjs';
 import {
-  atomicJSON, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig,
+  atomicJSON, approveSwitch, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig,
   readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayReady,
 } from '../scripts/switch-policy.mjs';
 import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
@@ -78,7 +78,7 @@ async function fixture(t) {
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const upstreamPort = upstream.address().port;
   await atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: {
-    mode: 'proxy', attached: true, proxy_route: 'fixture-official',
+    mode: 'proxy', attached: true, proxy_route: 'fixture-api2',
     stack: { enabled: true, members: ['fixture-api2'], keys: { api2: 'fixture-api2' } },
   } } });
   await execute('sqlite3', [path.join(directory, 'cc-switch.db'), `
@@ -94,7 +94,11 @@ async function fixture(t) {
   config = await loadGatewayConfig(directory);
   gateway = await startSwitchGateway({ upstream: config.upstream, token: config.token,
     verifyReady: () => verifyGatewayReady(directory, config),
-    resolveRoute: thread => resolveSessionRoute(directory, config, thread),
+    resolveRoute: (thread, initial) => resolveSessionRoute(directory, config, thread, initial),
+    officialRequestImpl: (target, { method, headers }, callback) => {
+      assert.equal(target.origin, 'https://chatgpt.com');
+      return httpRequest(`http://127.0.0.1:${upstreamPort}${target.pathname}`, { method, headers, agent: false }, callback);
+    },
     onReceipt: async receipt => {
       // Exercise the real race: response completion precedes receipt publication.
       await delay(25);
@@ -152,37 +156,48 @@ async function fixture(t) {
     assert.ok(alert);
     return run(['acknowledge', '--data-dir', directory, '--session', session, '--alert', alert.id], {});
   }
+  async function approve() {
+    const current = await state();
+    return approveSwitch(directory, session, current.switchRequest.id, current.switchRequest.target.id,
+      { accountType: 'chatgpt', modelProvider: 'openai', model: expected.model });
+  }
   async function reachHalt() {
     await background();
-    for (let retry = 0; retry < 3; retry++) { await acknowledge(); await background(); }
     const current = await state();
-    assert.equal(current.confirmation.status, 'completed');
-    assert.equal(current.confirmation.results.length, 3);
-    assert.equal(current.autoSwitch.phase, 'switch_pending');
+    assert.equal(current.confirmation, null, 'incident consent replaces automatic retry batches');
+    assert.equal(current.autoSwitch.phase, 'awaiting_approval');
+    assert.equal(current.switchRequest.status, 'pending');
+    assert.equal(current.switchRequest.approval, null);
     assert.ok(current.taskHalt);
-    assert.equal(current.forkSnapshot, null, 'the initial retry baseline is released before the canary');
-    assert.equal(bases.length, 1, 'all four source probes share the initial frozen baseline');
-    assert.equal(forks.length, 4);
-    assert.ok(current.samples.every(row => ['difference_signal', 'repeated_difference'].includes(row.outcome)
-      && row.fork.routing.route === 'source' && row.fork.routing.success === true));
+    assert.equal(current.forkSnapshot, null, 'the anomaly snapshot is released before user consent');
+    assert.equal(bases.length, 1); assert.equal(forks.length, 1);
+    assert.ok(current.samples.every(row => row.fork.routing.route === 'source' && row.fork.routing.success));
     return current;
   }
-  return { directory, session, sibling, state, background, acknowledge, reachHalt, request,
+  return { directory, session, sibling, state, background, acknowledge, approve, reachHalt, request,
     bases, forks, nativeCalls, upstreamRequests, originalHistory, historyBefore, clientsClosed: () => clientsClosed,
     holdFallback() { holdFallback = true; }, fallbackStarted: fallbackStarted.promise,
     releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; } };
 }
 
-test('four bound source mismatches queue a fresh fallback canary and wait until its receipt and score unlock the same thread', async t => {
+test('first mismatch asks, acknowledgement spends no backup quota, and explicit consent verifies and switches this thread', async t => {
   const f = await fixture(t), halted = await f.reachHalt();
   const acknowledged = await f.acknowledge();
-  assert.equal(acknowledged.agentAction, 'wait_for_route_verification');
+  assert.equal(acknowledged.agentAction, 'ask_user_to_switch');
+  assert.equal((await f.state()).pending, null);
+  await f.background();
+  assert.equal(f.forks.length, 1, 'ack and background hooks must not run a target probe');
+  assert.equal(f.upstreamRequests.filter(row => row.route === 'fallback').length, 0);
+  await assert.rejects(waitForSwitch(f.directory, f.session, halted.switchRequest.id), /Ask the user and yield/);
+  const stopped = await handleHook({ session_id: f.session, turn_id: 'fixture-turn', hook_event_name: 'Stop' }, f.directory);
+  assert.equal(stopped.decision, undefined, 'the consent question must yield to the user');
+  await f.approve();
   assert.equal((await f.state()).pending.kind, 'fallback_verification');
   f.holdFallback();
   const worker = f.background();
   await f.fallbackStarted;
   let waitFinished = false;
-  const waiting = waitForConfirmation(f.directory, f.session, halted.confirmation.id, { timeoutMs: 3000, pollMs: 5 })
+  const waiting = waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 3000, pollMs: 5 })
     .then(result => { waitFinished = true; return result; });
   await delay(30);
   assert.equal(waitFinished, false, 'verification is awaited while the canary is still running');
@@ -203,14 +218,14 @@ test('four bound source mismatches queue a fresh fallback canary and wait until 
   assert.equal(current.samples.at(-1).outcome, 'compatible');
   assert.equal(current.samples.at(-1).fork.routing.threadId, f.forks.at(-1));
   assert.equal(f.bases.length, 2);
-  assert.equal(new Set([...f.bases, ...f.forks, f.session]).size, 8);
-  assert.equal(f.clientsClosed(), 5);
+  assert.equal(new Set([...f.bases, ...f.forks, f.session]).size, 5);
+  assert.equal(f.clientsClosed(), 2);
   assert.match(notice.hookSpecificOutput.additionalContext, /verification completed successfully/);
   assert.deepEqual(f.originalHistory, f.historyBefore);
   await f.request(f.session);
   await f.request(f.sibling);
-  assert.deepEqual(f.upstreamRequests.slice(-2).map(row => [row.threadId, row.route]), [[f.session, 'fallback'], [f.sibling, 'fallback']]);
-  assert.equal(await readState(f.directory, f.sibling), null, 'another thread never acquires this policy');
+  assert.deepEqual(f.upstreamRequests.slice(-2).map(row => [row.threadId, row.route]), [[f.session, 'fallback'], [f.sibling, 'source']]);
+  assert.equal((await readState(f.directory, f.sibling)).autoSwitch, undefined, 'another thread never acquires this policy');
   // Even a new runtime, user turn or many work completions must not spend
   // further personal-subscription inference after the one verification.
   for (const hook of ['SessionStart', 'UserPromptSubmit', 'PreCompact', 'SessionStart']) {
@@ -225,7 +240,7 @@ test('four bound source mismatches queue a fresh fallback canary and wait until 
     assert.deepEqual(await f.background(), {});
   }
   assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), bytes, 'settled disabled hooks are read-only');
-  assert.equal((await f.state()).issued, 5); assert.equal(f.forks.length, 5);
+  assert.equal((await f.state()).issued, 2); assert.equal(f.forks.length, 2);
   assert.equal((await f.state()).autoSwitch.route, 'fallback');
 });
 
@@ -233,8 +248,9 @@ test('a completed fallback request with an incompatible fingerprint retains the 
   const f = await fixture(t), halted = await f.reachHalt();
   f.mismatchFallback();
   await f.acknowledge();
+  await f.approve();
   await f.background();
-  const result = await waitForConfirmation(f.directory, f.session, halted.confirmation.id, { timeoutMs: 0 });
+  const result = await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
   const current = await f.state();
   assert.equal(result.agentAction, 'stop_and_notify_user');
   assert.equal(current.autoSwitch.phase, 'failed');
@@ -250,20 +266,21 @@ test('a completed fallback request with an incompatible fingerprint retains the 
 test('Interrupt during a fallback request prevents a later successful receipt from clearing the halt', async t => {
   const f = await fixture(t), halted = await f.reachHalt();
   await f.acknowledge();
+  await f.approve();
   f.holdFallback();
   const worker = f.background();
   await f.fallbackStarted;
   await handleHook({ session_id: f.session, turn_id: 'fixture-turn', hook_event_name: 'Interrupt' }, f.directory);
   f.releaseFallback();
   await worker;
-  const result = await waitForConfirmation(f.directory, f.session, halted.confirmation.id, { timeoutMs: 0 });
+  const result = await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
   const current = await f.state();
   assert.equal(result.agentAction, 'stop_and_notify_user');
   assert.equal(current.autoSwitch.phase, 'failed');
   assert.equal(current.autoSwitch.route, 'source');
   assert.equal(current.runtimePaused, true);
   assert.equal(current.taskHalt.id, halted.taskHalt.id);
-  assert.equal(current.samples.length, 4, 'an interrupted canary is not scored');
+  assert.equal(current.samples.length, 1, 'an interrupted canary is not scored');
   assert.equal(current.pending, null);
   assert.equal(current.probeRun, null);
   assert.equal(current.forkSnapshot, null);
@@ -277,14 +294,15 @@ test('a busy Stop still blocks once for fallback verification without clearing t
     state.enabled = true;
     state.taskHalt = { id: 'halt', expected: 'fixture-model', retryCount: 3 };
     state.confirmation = { id: 'halt', status: 'completed', target: 3, results: [] };
-    state.autoSwitch = { enabled: true, phase: 'verifying', haltId: 'halt' };
-    state.pending = { id: 'canary', kind: 'fallback_verification', expiresAt: Date.now() + 30000 };
+    state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, phase: 'verifying', haltId: 'halt' };
+    state.switchRequest = { id: 'request', status: 'verifying', haltId: 'halt', target: { name: 'Official' }, approval: { id: 'approval' } };
+    state.pending = { id: 'canary', kind: 'fallback_verification', proposalId: 'request', approvalId: 'approval', expiresAt: Date.now() + 30000 };
   });
   await writeFile(sessionPath(directory, session) + '.lock', JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
   const event = { session_id: session, hook_event_name: 'Stop' };
   const first = await handleHook(event, directory);
   assert.equal(first.decision, 'block');
-  assert.match(first.reason, /fallback is verified/);
+  assert.match(first.reason, /approved target is verified/);
   const repeated = await handleHook({ ...event, stop_hook_active: true }, directory);
   assert.equal(repeated.decision, undefined);
   assert.ok((await readState(directory, session)).taskHalt);
