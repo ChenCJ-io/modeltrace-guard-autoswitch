@@ -71,7 +71,7 @@ export async function inspectCCSwitch(directory = path.join(homedir(), '.cc-swit
       THEN 1 ELSE 0 END AS managedCodexAccount
     FROM flags`;
   const [providers, listeners, live] = await Promise.all([
-    ...[query, "SELECT listen_address,listen_port FROM proxy_config WHERE app_type='codex'"].map(async sql =>
+    ...[query, "SELECT listen_address,listen_port,auto_failover_enabled FROM proxy_config WHERE app_type='codex'"].map(async sql =>
       JSON.parse((await execute('sqlite3', ['-readonly', '-json', path.join(directory, 'cc-switch.db'), sql], { maxBuffer: 1024 * 1024 })).stdout || '[]')),
     readJSON(path.join(directory, 'live-state.json')),
   ]);
@@ -130,10 +130,27 @@ export function assertProviderCurrent(layout, saved) {
 export function verifyLayout(config, layout) {
   if (layout.mode !== 'proxy' || !layout.attached || !layout.stack.enabled || layout.pending) throw new Error('CCSwitch must be attached in Aggregation mode with no pending config operation');
   if (layout.listener?.listen_address !== '127.0.0.1' || config.upstream !== `http://127.0.0.1:${layout.listener.listen_port}/v1`) throw new Error('CCSwitch listener must match the configured IPv4 loopback endpoint');
-  // Explicit Stack routing and native Official passthrough do not depend on
-  // CCSwitch's global default. In particular, keep the user's company default.
   assertProviderCurrent(layout, config.primary);
   assertProviderCurrent(layout, config.backup);
+  return true;
+}
+// Default forwarding preserves Codex's native protocol headers. Stack selectors
+// strip some of those headers inside CCSwitch and can make Codex-only providers
+// reject a genuine client. Never repair a drifting default by silently selecting
+// another card or falling back to Stack; require the saved primary and no failover.
+export function verifyRouteLayout(config, layout, route) {
+  if (route == null) route = { transport: config.primary.transport, providerId: config.primary.id,
+    providerFingerprint: config.primary.fingerprint, sourceKey: config.primary.key,
+    ccswitchMode: config.primary.transport === 'ccswitch' ? 'default' : null, route: 'source' };
+  if (route.transport !== 'ccswitch') return true;
+  const isPrimary = route.providerId === config.primary.id;
+  if (route.ccswitchMode !== (isPrimary ? 'default' : 'stack')) throw new Error('CCSwitch route mode does not match the selected provider');
+  if (!isPrimary) return true;
+  if (route.route !== 'source' || route.providerFingerprint !== config.primary.fingerprint || route.sourceKey !== config.primary.key) {
+    throw new Error('Primary route identity changed; no provider was switched');
+  }
+  if (layout.defaultProvider !== config.primary.id) throw new Error('CCSwitch default provider changed; restore the configured primary before continuing');
+  if (layout.listener?.auto_failover_enabled !== 0) throw new Error('Disable CCSwitch automatic failover before using the primary; switching requires incident consent');
   return true;
 }
 export async function configureGateway(directory, {
@@ -146,7 +163,7 @@ export async function configureGateway(directory, {
   if (primary.id === backup.id) throw new Error('Primary and backup must be different configurations');
   const config = { schema: 2, id: randomUUID(), ccSwitchDirectory: path.resolve(ccSwitchDirectory), primary, backup,
     port, upstream: `http://127.0.0.1:${layout.listener?.listen_port}/v1`, token: randomBytes(32).toString('hex') };
-  validateGatewayConfig(config); verifyLayout(config, layout);
+  validateGatewayConfig(config); verifyLayout(config, layout); verifyRouteLayout(config, layout);
   await atomicJSON(configPath(directory), config);
   return publicConfig(config);
 }
@@ -167,6 +184,11 @@ export async function verifyGatewayReady(directory, config, inspect = inspectCCS
   if (current.id !== config.id) throw new Error('Gateway configuration changed; restart the gateway');
   const layout = await inspect(config.ccSwitchDirectory);
   verifyLayout(config, layout);
+  return layout;
+}
+export async function verifyGatewayRoute(directory, config, route, inspect = inspectCCSwitch) {
+  const layout = await verifyGatewayReady(directory, config, inspect);
+  verifyRouteLayout(config, layout, route);
   return layout;
 }
 export const gatewayURL = (config, initialProvider) => `http://127.0.0.1:${config.port}/${config.token}${initialProvider ? `/provider/${encodeURIComponent(initialProvider)}` : ''}/v1`;

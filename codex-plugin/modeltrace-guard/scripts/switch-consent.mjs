@@ -4,7 +4,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { digest, isMismatch, readState, record, schedule, segment, stopMonitoring, withState } from './state.mjs';
 import { UUID, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
-  readJSON, resolveProvider, sameProvider, verifyGatewayReady } from './provider-config.mjs';
+  readJSON, resolveProvider, sameProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
 const live = state => Boolean(state?.enabled && !state.runtimePaused && !state.compacting && !state.runtimeEndedAt);
 const consentPolicy = state => state?.autoSwitch?.protocol === 3 && state.autoSwitch.approvalMode === 'per_incident';
@@ -43,7 +43,7 @@ export const readReceipt = (directory, thread) => readJSON(receiptPath(directory
 export async function saveReceipt(directory, config, receipt) {
   if (!UUID.test(receipt.threadId)) return;
   const allowed = ['threadId', 'requestId', 'route', 'revision', 'statusCode', 'startedAt', 'finishedAt', 'completed', 'success',
-    'responseEvent', 'providerId', 'providerFingerprint', 'transport', 'sourceKey', 'proposalId', 'approvalId', 'challenge'];
+    'responseEvent', 'providerId', 'providerFingerprint', 'transport', 'sourceKey', 'ccswitchMode', 'proposalId', 'approvalId', 'challenge'];
   const safe = Object.fromEntries(allowed.filter(k => Object.hasOwn(receipt, k)).map(k => [k, receipt[k]]));
   if (receipt.challenge && receipt.success === true && receipt.completed === true) {
     await atomicJSON(probeReceiptPath(directory, receipt.threadId, receipt.challenge), { ...safe, configId: config.id });
@@ -52,9 +52,15 @@ export async function saveReceipt(directory, config, receipt) {
 }
 const routeFor = (config, provider, revision, extra = {}) => ({ route: provider.id === config.primary.id ? 'source' : 'fallback',
   revision, sourceKey: provider.key, providerId: provider.id, providerFingerprint: provider.fingerprint,
-  transport: provider.transport, ...extra });
-const providerMatchesReceipt = (provider, receipt) => receipt?.providerId === provider.id
-  && receipt.providerFingerprint === provider.fingerprint && receipt.transport === provider.transport && receipt.sourceKey === provider.key;
+  transport: provider.transport, ccswitchMode: provider.transport === 'ccswitch' ? (provider.id === config.primary.id ? 'default' : 'stack') : null, ...extra });
+const providerMatchesReceipt = (provider, receipt, primary) => receipt?.providerId === provider.id
+  && receipt.providerFingerprint === provider.fingerprint && receipt.transport === provider.transport && receipt.sourceKey === provider.key
+  && (provider.transport !== 'ccswitch' || receipt.ccswitchMode === (provider.id === primary.id ? 'default' : 'stack'));
+const checkedRoute = (config, layout, provider, revision, extra) => {
+  const route = routeFor(config, provider, revision, extra);
+  verifyRouteLayout(config, layout, route);
+  return route;
+};
 
 function currentRequest(state, id, { allowFailed = false } = {}) {
   const p = state.autoSwitch, r = state.switchRequest;
@@ -85,7 +91,7 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
     }
     const layout = await verifyGatewayReady(directory, config);
     assertProviderCurrent(layout, binding.provider);
-    return routeFor(config, binding.provider, binding.revision, {
+    return checkedRoute(config, layout, binding.provider, binding.revision, {
       proposalId: binding.proposalId, approvalId: binding.approvalId, challenge: binding.challenge,
     });
   }
@@ -96,18 +102,19 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
     const layout = await verifyGatewayReady(directory, config);
     assertProviderCurrent(layout, p.current);
     // Existing routes override launch's bootstrap selection after a switch.
-    return routeFor(config, p.current, p.revision);
+    return checkedRoute(config, layout, p.current, p.revision);
   }
   if (!state?.initialRoute) {
     const layout = await verifyGatewayReady(directory, config);
     const provider = initialProviderId ? describeProvider(layout, initialProviderId) : config.primary;
+    checkedRoute(config, layout, provider, 0);
     await withState(directory, thread, s => { s.initialRoute ||= { configId: config.id, provider }; });
     state = await readState(directory, thread);
   }
   if (state.initialRoute.configId !== config.id) throw new Error('Initial thread route belongs to an earlier configuration; launch a new thread');
   const layout = await verifyGatewayReady(directory, config);
   assertProviderCurrent(layout, state.initialRoute.provider);
-  return routeFor(config, state.initialRoute.provider, 0);
+  return checkedRoute(config, layout, state.initialRoute.provider, 0);
 }
 
 export async function enableAutoSwitch(directory, session, { accountType, modelProvider, model }, now = Date.now()) {
@@ -115,10 +122,10 @@ export async function enableAutoSwitch(directory, session, { accountType, modelP
     throw new Error('Approval-based switching requires a native ChatGPT-authenticated openai thread started through the gateway');
   }
   const config = await loadGatewayConfig(directory);
-  await verifyGatewayReady(directory, config);
+  verifyRouteLayout(config, await verifyGatewayReady(directory, config));
   if (config.primary.transport === 'official') throw new Error('The selected primary is personal Official; monitoring remains off to avoid extra inference');
   const receipt = await readReceipt(directory, session);
-  if (!receipt || receipt.configId !== config.id || !receipt.success || !receipt.completed || !providerMatchesReceipt(config.primary, receipt)
+  if (!receipt || receipt.configId !== config.id || !receipt.success || !receipt.completed || !providerMatchesReceipt(config.primary, receipt, config.primary)
     || now - receipt.finishedAt > 10 * 60 * 1000 || receipt.finishedAt > now) {
     throw new Error('No recent successful primary request through the gateway; launch with the primary first. Personal sessions are not silently rerouted or monitored');
   }
@@ -144,7 +151,7 @@ export function eligibleForSwitch(state, sample = state.samples.at(-1)) {
     && p.current.transport !== 'official' && !state.taskHalt && !unresolved(state.switchRequest)
     && isMismatch(sample) && sample.epoch === state.epoch && sample.expected === state.expected
     && r?.configId === p.configId && r.policyId === p.policyId && r.revision === p.revision
-    && r.success === true && r.completed === true && providerMatchesReceipt(p.current, r));
+    && r.success === true && r.completed === true && providerMatchesReceipt(p.current, r, p.primary));
 }
 
 function proposal(state, target, evidence, now) {
@@ -259,7 +266,7 @@ export function finishVerification(state, sample, checkpoint, now) {
     && receipt?.success === true && receipt.completed === true && receipt.configId === p.configId
     && receipt.policyId === p.policyId && receipt.revision === p.revision + 1
     && receipt.proposalId === r.id && receipt.approvalId === r.approval.id && receipt.challenge === checkpoint.id
-    && providerMatchesReceipt(r.target, receipt) && sample.expected === state.taskHalt.expected
+    && providerMatchesReceipt(r.target, receipt, p.primary) && sample.expected === state.taskHalt.expected
     && sample.prediction === sample.expected && sample.outcome === 'compatible';
   if (!success) { failAutoSwitch(state, now, 'approved_target_verification_failed'); return true; }
   r.status = 'succeeded'; r.finishedAt = now;
@@ -313,7 +320,7 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
       const deadline = Math.min(pending.expiresAt, Date.now() + 2000);
       let receipt;
       const matches = receipt => receipt && receipt.configId === config.id && receipt.threadId === forkId && receipt.revision === revision
-        && providerMatchesReceipt(provider, receipt) && receipt.challenge === pending.id
+        && providerMatchesReceipt(provider, receipt, p.primary) && receipt.challenge === pending.id
         && receipt.proposalId === binding.proposalId && receipt.approvalId === binding.approvalId
         && receipt.startedAt >= pending.at && receipt.success === true && receipt.completed === true;
       do {

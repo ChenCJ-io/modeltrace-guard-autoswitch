@@ -12,11 +12,11 @@ import { openAppServer, codexExecutable } from './app-server-client.mjs';
 import { sourceSettings } from './fork-snapshot.mjs';
 import { requireTrustedGuard } from './fork-runner.mjs';
 import { loadArtifacts } from './guard.mjs';
-import { startSwitchGateway } from './switch-gateway.mjs';
+import { GATEWAY_IMPLEMENTATION_VERSION, startSwitchGateway } from './switch-gateway.mjs';
 import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
 import {
   UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
-  loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady,
+  loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady, verifyGatewayRoute,
 } from './provider-config.mjs';
 import {
   enableAutoSwitch, failAutoSwitch, readReceipt, resolveSessionRoute, saveReceipt,
@@ -59,16 +59,26 @@ export async function gatewayStatus(directory) {
   try {
     const health = await controlRequest(config, 'health');
     if (!runtime || health.instanceId !== runtime.instanceId || runtime.configId !== config.id) return { running: false, reason: 'gateway_instance_mismatch' };
+    if (health.implementationVersion !== GATEWAY_IMPLEMENTATION_VERSION || runtime.implementationVersion !== GATEWAY_IMPLEMENTATION_VERSION) {
+      return { running: true, readiness: 'upgrade_required', pid: runtime.pid, instanceId: runtime.instanceId,
+        port: config.port, configId: config.id, implementationVersion: health.implementationVersion || null,
+        expectedVersion: GATEWAY_IMPLEMENTATION_VERSION,
+        instruction: 'The owned gateway still runs an older implementation. Stop this gateway and start it from the installed updated plugin; preserve its configuration and existing thread routes.' };
+    }
     let readiness = 'ready';
-    try { await verifyGatewayReady(directory, config); } catch (error) { readiness = error.message; }
-    return { running: true, readiness, pid: runtime.pid, instanceId: runtime.instanceId, port: config.port, configId: config.id };
+    try { await verifyGatewayRoute(directory, config); } catch (error) { readiness = error.message; }
+    return { running: true, readiness, pid: runtime.pid, instanceId: runtime.instanceId, port: config.port, configId: config.id,
+      implementationVersion: GATEWAY_IMPLEMENTATION_VERSION };
   } catch { return { running: false, reason: 'gateway_unreachable', port: config.port }; }
 }
 
 export async function startGateway(directory) {
   const current = await gatewayStatus(directory);
+  if (current.readiness === 'upgrade_required') throw new Error('Gateway upgrade required: stop the owned gateway, then start it from the updated installed plugin');
   if (current.running) return current;
   const config = await loadGatewayConfig(directory);
+  // Starting the shared transport must not strand an already selected Official
+  // thread when only the company default has drifted. Requests verify their route.
   await verifyGatewayReady(directory, config);
   const child = spawn(process.execPath, [entrypoint, 'serve', '--data-dir', directory], { detached: true, stdio: 'ignore', windowsHide: true });
   let spawnError;
@@ -91,12 +101,13 @@ async function serveGateway(directory) {
   let resolveDone;
   const done = new Promise(resolve => { resolveDone = resolve; });
   const gateway = await startSwitchGateway({ upstream: config.upstream, port: config.port, token: config.token, instanceId,
-    verifyReady: () => verifyGatewayReady(directory, config),
+    verifyReady: route => verifyGatewayRoute(directory, config, route),
     resolveRoute: (thread, initialProviderId) => resolveSessionRoute(directory, config, thread, initialProviderId),
     onReceipt: receipt => saveReceipt(directory, config, receipt),
     onShutdown: () => resolveDone(),
   });
-  await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port, startedAt: Date.now() });
+  await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port,
+    implementationVersion: GATEWAY_IMPLEMENTATION_VERSION, startedAt: Date.now() });
   const stop = () => resolveDone();
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try { await done; }
@@ -106,6 +117,49 @@ async function serveGateway(directory) {
     if (runtime?.instanceId === instanceId) await unlink(runtimePath(directory)).catch(error => { if (error.code !== 'ENOENT') throw error; });
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
+}
+
+function requestFailure(receipt) {
+  if (receipt.success === true && receipt.completed === true) return null;
+  const status = receipt.statusCode;
+  if (status === 401) return { reason: 'upstream_authentication_failed',
+    hint: 'The selected route returned HTTP 401. Check the current native authentication and CCSwitch card configuration; do not copy credentials between profiles.' };
+  if (status === 403) return { reason: 'upstream_forbidden',
+    hint: 'The selected route returned HTTP 403. Inspect Codex client header/transport compatibility and CCSwitch forwarding before concluding that this account cannot use Codex. Starting another conversation alone does not repair this failure.' };
+  if (status === 429) return { reason: 'upstream_rate_limited',
+    hint: 'The selected route returned HTTP 429. Check its rate limits or capacity; no fallback request or switch has been authorized.' };
+  if (status === 504) return { reason: 'gateway_request_timeout',
+    hint: 'The gateway request timed out. Check the selected upstream and local proxy availability.' };
+  if (Number.isInteger(status) && status >= 400) return { reason: 'gateway_http_failure',
+    hint: 'The gateway request received an HTTP error. Inspect the selected upstream and CCSwitch transport; this is not fingerprint mismatch evidence.' };
+  if (['response.failed', 'response.incomplete', 'response.error', 'error'].includes(receipt.responseEvent)) return { reason: 'upstream_response_failed',
+    hint: 'The upstream response reported failure or incomplete generation. HTTP success alone does not make a usable monitoring receipt.' };
+  if (!receipt.completed) return { reason: 'gateway_response_interrupted',
+    hint: 'The gateway response did not finish. Check cancellation or transport interruption before retrying the current route.' };
+  return { reason: 'response_completion_unconfirmed',
+    hint: 'The gateway response has no verified successful response.completed outcome. Monitoring remains off until a successful primary response is recorded.' };
+}
+
+function publicReceipt(receipt, state, config) {
+  if (!receipt) return null;
+  const identities = [state?.autoSwitch?.current, state?.autoSwitch?.primary, state?.autoSwitch?.backup,
+    state?.initialRoute?.provider, config?.primary, config?.backup];
+  const provider = identities.find(candidate => candidate?.id === receipt.providerId);
+  const failure = requestFailure(receipt);
+  // Only fixed diagnostics and receipt metadata leave this boundary. Never
+  // surface arbitrary upstream error bodies, URLs or authentication headers.
+  return { provider: provider?.name || receipt.providerId, transport: receipt.transport,
+    completed: receipt.completed === true, success: receipt.success === true,
+    statusCode: Number.isInteger(receipt.statusCode) && receipt.statusCode >= 100 && receipt.statusCode <= 599 ? receipt.statusCode : null,
+    responseEvent: ['response.completed', 'response.failed', 'response.incomplete', 'response.error', 'error'].includes(receipt.responseEvent) ? receipt.responseEvent : null,
+    finishedAt: receipt.finishedAt, configurationMatches: config ? receipt.configId === config.id : null,
+    failureReason: failure?.reason || null, failureHint: failure?.hint || null,
+    scope: 'most_recent_gateway_request_only' };
+}
+
+async function connectionDiagnostic(directory, env, openClient) {
+  return nativeIntegrationStatus(directory, env, { connect: openClient })
+    .catch(() => ({ readyForNewThreads: false, phase: 'unavailable' }));
 }
 
 export async function runAutoSwitch(args, env = process.env, {
@@ -131,7 +185,7 @@ export async function runAutoSwitch(args, env = process.env, {
       throw new Error('Ordinary codex startup must discover the same data directory. Use this Codex home default or the same MODELTRACE_AUTOSWITCH_DATA environment for both setup and ordinary codex; a command-only --data-dir cannot be connected');
     }
     const config = await loadGatewayConfig(directory);
-    const layout = await verifyGatewayReady(directory, config);
+    const layout = await verifyGatewayRoute(directory, config);
     const client = await openClient(env, { nativeOpenai: true });
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
@@ -192,20 +246,17 @@ export async function runAutoSwitch(args, env = process.env, {
   const session = options.session || env.CODEX_THREAD_ID;
   if (!UUID.test(session || '') || (env.CODEX_THREAD_ID && session !== env.CODEX_THREAD_ID)) throw new Error('Use the current native thread ID');
   if (command === 'status') {
-    const state = await readState(directory, session);
-    const receipt = await readReceipt(directory, session);
-    const identities = [state?.autoSwitch?.current, state?.autoSwitch?.primary, state?.autoSwitch?.backup, state?.initialRoute?.provider];
-    const observedProvider = receipt && identities.find(provider => provider?.id === receipt.providerId);
+    const [state, receipt, config, connection, gateway] = await Promise.all([
+      readState(directory, session), readReceipt(directory, session), loadGatewayConfig(directory).catch(() => null),
+      connectionDiagnostic(directory, env, openClient), gatewayStatus(directory).catch(() => ({ running: false, reason: 'not_configured' })),
+    ]);
     return { session, monitoringEnabled: state?.enabled === true, monitoringStoppedReason: state?.monitoringStoppedReason || null,
       initialRoute: state?.initialRoute || null, autoSwitch: state?.autoSwitch || null,
       switchRequest: state?.switchRequest || null, taskHalt: state?.taskHalt || null,
-      configuration: await loadGatewayConfig(directory).then(publicConfig).catch(() => null),
-      connection: await nativeIntegrationStatus(directory, env, { connect: openClient }).catch(() => ({ readyForNewThreads: false, phase: 'unavailable' })),
-      lastRequest: receipt ? { provider: observedProvider?.name || receipt.providerId, transport: receipt.transport,
-        completed: receipt.completed, success: receipt.success, finishedAt: receipt.finishedAt,
-        scope: 'most_recent_gateway_request_only' } : null,
-      routeEvidenceNote: 'A logged-in account and its quota display do not prove the request route. lastRequest is local gateway evidence, not backend model identity.',
-      gateway: await gatewayStatus(directory).catch(() => ({ running: false, reason: 'not_configured' })) };
+      configuration: config ? publicConfig(config) : null, connection,
+      lastRequest: publicReceipt(receipt, state, config),
+      routeEvidenceNote: 'A logged-in account and its quota display do not prove the request route. A failed lastRequest still proves gateway traversal, but not successful inference or backend model identity.',
+      gateway };
   }
   if (command === 'disable') return withState(directory, session, state => {
     const now = Date.now();
@@ -236,11 +287,26 @@ export async function runAutoSwitch(args, env = process.env, {
       await delay(25);
     } while (Date.now() < deadline);
     if (!receipt || receipt.configId !== config.id || !receipt.success || !receipt.completed) {
-      const connection = await nativeIntegrationStatus(directory, env, { connect: openClient });
+      const [connection, gateway] = await Promise.all([
+        connectionDiagnostic(directory, env, openClient), gatewayStatus(directory).catch(() => ({ running: false, reason: 'unavailable' })),
+      ]);
+      const lastRequest = publicReceipt(receipt, state, config);
+      if ((receipt && receipt.configId !== config.id) || (state?.initialRoute && state.initialRoute.configId !== config.id)) {
+        return { session, monitoringEnabled: false, status: 'gateway_configuration_changed', connection, gateway, lastRequest, switchApproved: false,
+          instruction: 'This thread has gateway evidence for an earlier configuration. Inspect the changed configuration and preserve its saved route; use does not migrate an existing thread or approve a switch.' };
+      }
+      if (receipt) return { session, monitoringEnabled: false, status: 'gateway_request_failed', connection, gateway, lastRequest, switchApproved: false,
+        instruction: 'This thread already reached the gateway, but its latest request failed or did not complete successfully. Diagnose the reported request failure on the current route, then retry use after a successful primary response. A new conversation is not required merely because this request failed; no target verification or switch is approved.' };
+      if (state?.initialRoute) return { session, monitoringEnabled: false, status: 'gateway_request_unconfirmed', connection, gateway, lastRequest, switchApproved: false,
+        instruction: 'The gateway selected a route for this thread, but no completed request receipt is available yet. Inspect the in-flight request and gateway health; do not treat this as an old unconnected thread or enable monitoring without a successful primary response.' };
+      if (connection.readyForNewThreads && (!gateway.running || gateway.readiness !== 'ready')) {
+        return { session, monitoringEnabled: false, status: 'gateway_not_ready', connection, gateway, lastRequest, switchApproved: false,
+          instruction: 'The ordinary entry is installed, but the gateway or its primary route is not ready. Resolve the reported gateway readiness condition first; a new conversation cannot repair an old daemon, changed default card, automatic failover, or unavailable service.' };
+      }
       return { session, monitoringEnabled: false, status: connection.readyForNewThreads ? 'new_conversation_required' : 'connection_setup_required',
-        connection, switchApproved: false,
+        connection, gateway, lastRequest, switchApproved: false,
         instruction: connection.readyForNewThreads
-          ? 'The ordinary codex entry is configured, but this thread has no successful gateway request. Existing running threads cannot be hot-attached. Start a fresh ordinary codex conversation after setup, then ask to use this plugin; do not claim this thread is monitored.'
+          ? 'The ordinary codex entry is configured, but this thread has no gateway route or request evidence. Existing running threads cannot be hot-attached. Start a fresh ordinary codex conversation after setup, then ask to use this plugin; do not claim this thread is monitored.'
           : 'Complete the one-time connect setup from the installed skill. It configures future ordinary codex conversations; no special launcher and no automatic monitoring. Check changed user/CCSwitch defaults before replacing anything.' };
     }
   }

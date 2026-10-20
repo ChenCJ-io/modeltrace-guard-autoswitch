@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import * as zlib from 'node:zlib';
-import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
+import { GATEWAY_IMPLEMENTATION_VERSION, startSwitchGateway } from '../scripts/switch-gateway.mjs';
 
 const A = '019a0158-0ea5-7323-a123-123456789abc';
 const B = '019a0158-0ea5-7323-a123-abcdef012345';
@@ -97,13 +97,88 @@ test('source forwarding changes only model, carries native authorization, and pr
   assert.equal(f.readyCalls(), 1);
   await until(() => f.receipts.length === 1);
   const receipt = f.receipts[0];
-  assert.deepEqual(Object.keys(receipt).sort(), ['requestId', 'threadId', 'route', 'revision', 'providerId', 'transport', 'sourceKey', 'providerFingerprint', 'proposalId', 'approvalId', 'challenge', 'startedAt', 'statusCode', 'completed', 'success', 'responseEvent', 'finishedAt'].sort());
+  assert.deepEqual(Object.keys(receipt).sort(), ['requestId', 'threadId', 'route', 'revision', 'providerId', 'transport', 'sourceKey', 'ccswitchMode', 'providerFingerprint', 'proposalId', 'approvalId', 'challenge', 'startedAt', 'statusCode', 'completed', 'success', 'responseEvent', 'finishedAt'].sort());
   assert.equal(receipt.route, 'source'); assert.equal(receipt.revision, 0); assert.equal(receipt.threadId, A);
   assert.equal(receipt.statusCode, 200); assert.equal(receipt.completed, true); assert.equal(receipt.success, true); assert.equal(receipt.responseEvent, 'response.completed');
   assert.match(receipt.requestId, /^[0-9a-f-]{36}$/); assert.equal(typeof receipt.startedAt, 'number'); assert.ok(receipt.finishedAt >= receipt.startedAt);
   assert.equal(receipt.providerId, null); assert.equal(receipt.transport, 'ccswitch'); assert.equal(receipt.sourceKey, 'API2');
   assert.equal(receipt.providerFingerprint, null); assert.equal(receipt.proposalId, null); assert.equal(receipt.approvalId, null); assert.equal(receipt.challenge, null);
   assert.doesNotMatch(JSON.stringify(receipt), /synthetic|encrypted|Bearer|capability/);
+});
+
+test('native default forwarding avoids Stack client-header stripping and preserves decoded request bytes', async t => {
+  let route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'stack', providerId: 'company', sourceKey: 'API2', revision: 0 };
+  const nativeHeaders = { originator: 'codex_cli_rs', version: 'test-version', 'user-agent': 'codex_cli_rs/test-version',
+    'x-codex-beta-features': 'synthetic-native-protocol', session_id: A, 'x-client-request-id': 'synthetic-request' };
+  const f = await fixture(t, (_req, res, seen) => {
+    // CCSwitch's Stack path removes native client identification before reaching
+    // a provider; plain default routing preserves it. No forged headers needed.
+    const forwardedHeaders = { ...seen.headers };
+    if (seen.body.model.startsWith('ccs-')) {
+      for (const name of ['originator', 'version', 'session_id', 'thread-id', 'x-client-request-id']) delete forwardedHeaders[name];
+    }
+    if (!forwardedHeaders.originator || !forwardedHeaders.version) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'This account only allows Codex official clients' } }));
+    } else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(DONE); }
+  }, { resolveRoute: () => route });
+  const failed = await send(f.gateway, { headers: nativeHeaders });
+  assert.equal(failed.status, 403); assert.match(failed.body, /only allows Codex official clients/);
+  route = { ...route, ccswitchMode: 'default' };
+  const bytes = Buffer.from('{ "model": "gpt-example", "stream": true, "metadata": {"large":9007199254740993}, "input": "native bytes" }');
+  const encoders = [['identity', value => value], ['gzip', zlib.gzipSync], ['deflate', zlib.deflateSync]];
+  if (zlib.zstdCompressSync) encoders.push(['zstd', zlib.zstdCompressSync]);
+  for (const [encoding, encode] of encoders) {
+    const result = await send(f.gateway, { bytes: encode(bytes), headers: { ...nativeHeaders, 'content-encoding': encoding } });
+    assert.equal(result.status, 200); assert.equal(result.body, DONE);
+    const seen = f.received.at(-1);
+    assert.deepEqual(seen.bytes, bytes); assert.equal(seen.body.model, 'gpt-example');
+    for (const [name, value] of Object.entries(nativeHeaders)) assert.equal(seen.headers[name], value);
+    assert.equal(seen.headers['thread-id'], A); assert.equal(seen.headers['content-encoding'], undefined);
+  }
+  await until(() => f.receipts.length === encoders.length + 1);
+  assert.equal(f.receipts[0].success, false);
+  assert.ok(f.receipts.slice(1).every(row => row.success && row.ccswitchMode === 'default'));
+});
+
+test('default route is rechecked immediately before forwarding and cannot be applied to a backup or Official', async t => {
+  let drift = false, route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 1 };
+  const checked = [];
+  const f = await fixture(t, undefined, {
+    resolveRoute: () => route,
+    verifyReady: selected => { checked.push(selected); return !drift; },
+  });
+  assert.equal((await send(f.gateway)).status, 200);
+  assert.equal(checked[0].ccswitchMode, 'default');
+  drift = true;
+  assert.equal((await send(f.gateway)).status, 503);
+  assert.equal(f.received.length, 1, 'a drifting default is never forwarded or retried with Stack');
+  drift = false;
+  for (const invalid of [
+    { ...route, route: 'fallback' }, { ...route, transport: 'official' }, { ...route, providerId: null },
+    { ...route, ccswitchMode: 'unknown' },
+  ]) {
+    route = invalid;
+    assert.equal((await send(f.gateway)).status, 503);
+  }
+  assert.equal(f.received.length, 1);
+});
+
+test('client Stack selectors cannot redirect primary or backup requests or falsify route receipts', async t => {
+  const routes = [
+    { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0 },
+    { route: 'fallback', transport: 'ccswitch', ccswitchMode: 'stack', providerId: 'backup', sourceKey: 'BACKUP', revision: 1 },
+    { route: 'fallback', transport: 'official', providerId: 'official', revision: 1 },
+  ];
+  for (const route of routes) {
+    const f = route.transport === 'official' ? await officialFixture(t) : await fixture(t, undefined, { resolveRoute: () => route });
+    for (const model of ['ccs-other/gpt-example', 'ccs-API2/gpt-example', 'ccs-/gpt-example', 'ccs-other/nested/model']) {
+      const result = await send(f.gateway, { body: { ...defaultBody, model } });
+      assert.equal(result.status, 400); assert.match(result.body, /plain model ID is required/);
+    }
+    assert.equal(f.received.length, 0); assert.equal(f.receipts.length, 0);
+    assert.equal((await send(f.gateway, { body: { ...defaultBody, model: 'ccs-plain-name-without-selector' } })).status, 200);
+  }
 });
 
 test('switching one session preserves the other session and fallback body bytes', async (t) => {
@@ -383,10 +458,10 @@ test('health and shutdown control only the capability-owned instance and never p
   assert.equal((await send(f.gateway, { path: '/shutdown', body: null, thread: null, headers: { origin: 'null' } })).status, 403);
   assert.equal((await send(f.gateway, { path: '/shutdown', body: null, thread: null, headers: { host: 'external.invalid' } })).status, 403);
   const health = await send(f.gateway, { path: '/health', method: 'GET', body: null, thread: null });
-  assert.deepEqual(JSON.parse(health.body), { ok: true, instanceId });
+  assert.deepEqual(JSON.parse(health.body), { ok: true, instanceId, implementationVersion: GATEWAY_IMPLEMENTATION_VERSION });
   assert.equal(health.status, 200); assert.equal(stopped, 0);
   const shutdown = await send(f.gateway, { path: '/shutdown', body: null, thread: null });
-  assert.deepEqual(JSON.parse(shutdown.body), { ok: true, instanceId });
+  assert.deepEqual(JSON.parse(shutdown.body), { ok: true, instanceId, implementationVersion: GATEWAY_IMPLEMENTATION_VERSION });
   assert.equal(shutdown.status, 200);
   await until(() => stopped === 1);
   await assert.rejects(send(f.gateway, { path: '/health', method: 'GET', body: null, thread: null }), (error) => ['ECONNREFUSED', 'ECONNRESET'].includes(error.code));
@@ -432,14 +507,14 @@ test('incoming body timeout rejects a stalled upload without contacting upstream
   assert.equal(result, 408); assert.equal(f.received.length, 0);
 });
 
-test('v0.3 company and approved third-party backup routes both use explicit CCSwitch Stack selectors', async (t) => {
-  let route = { route: 'source', transport: 'ccswitch', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 };
+test('primary uses the native CCSwitch default while approved third-party backup uses an explicit Stack selector', async (t) => {
+  let route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 };
   const f = await fixture(t, undefined, { resolveRoute: async () => route });
   await send(f.gateway);
   route = { route: 'fallback', transport: 'ccswitch', providerId: 'approved-backup', sourceKey: 'BACKUP', revision: 1,
     providerFingerprint: 'f'.repeat(64), proposalId: 'proposal-test', approvalId: 'approval-test', challenge: 7 };
   await send(f.gateway);
-  assert.deepEqual(f.received.map(({ body }) => body.model), ['ccs-API2-copy/gpt-example', 'ccs-BACKUP/gpt-example']);
+  assert.deepEqual(f.received.map(({ body }) => body.model), ['gpt-example', 'ccs-BACKUP/gpt-example']);
   await until(() => f.receipts.length === 2);
   assert.deepEqual(f.receipts.map(({ providerId, transport, sourceKey }) => ({ providerId, transport, sourceKey })), [
     { providerId: 'company-config', transport: 'ccswitch', sourceKey: 'API2-copy' },
@@ -447,6 +522,7 @@ test('v0.3 company and approved third-party backup routes both use explicit CCSw
   ]);
   assert.equal(f.receipts[1].providerFingerprint, route.providerFingerprint); assert.equal(f.receipts[1].proposalId, route.proposalId);
   assert.equal(f.receipts[1].approvalId, route.approvalId); assert.equal(f.receipts[1].challenge, 7);
+  assert.equal(f.receipts[0].ccswitchMode, 'default'); assert.equal(f.receipts[1].ccswitchMode, 'stack');
   route = { route: 'fallback', transport: 'ccswitch', providerId: 'missing-selector', revision: 2 };
   assert.equal((await send(f.gateway)).status, 503);
   route = { route: 'fallback', transport: 'unknown', providerId: 'untrusted-transport', revision: 3 };

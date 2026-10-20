@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { readFile } from 'node:fs/promises';
 import { AppServerClient, CODEX_CLIENT_INFO } from '../scripts/app-server-client.mjs';
+import { GATEWAY_IMPLEMENTATION_VERSION } from '../scripts/switch-gateway.mjs';
 import { MAX_PROTOCOL_MESSAGE_BYTES, readProtocolLines } from '../scripts/protocol-lines.mjs';
 
 function transport(t, options) {
@@ -148,5 +149,6 @@ test('plugin manifest, package and protocol identify the same release', async ()
   assert.equal(manifest.name, packageInfo.name);
   assert.equal(manifest.version, packageInfo.version);
   assert.equal(CODEX_CLIENT_INFO.version, manifest.version);
+  assert.equal(GATEWAY_IMPLEMENTATION_VERSION, manifest.version);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
 });

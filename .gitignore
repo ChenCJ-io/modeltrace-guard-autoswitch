@@ -13,6 +13,9 @@ dist/
 .local/
 gateway-config.json
 gateway-runtime.json
+native-integration.json
+# Local acceptance evidence contains native thread / incident identifiers.
+/docs/NATIVE-ACCEPTANCE-0.4.1.md
 _bindings/
 _receipts/
 _history/

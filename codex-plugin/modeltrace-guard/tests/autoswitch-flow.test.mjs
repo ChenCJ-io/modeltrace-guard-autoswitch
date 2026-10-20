@@ -13,7 +13,7 @@ import { handleBackgroundHook, waitForSwitch } from '../scripts/background.mjs';
 import { readState, sessionPath, withState } from '../scripts/state.mjs';
 import {
   atomicJSON, approveSwitch, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig,
-  readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayReady,
+  readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayRoute,
 } from '../scripts/switch-policy.mjs';
 import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
 
@@ -52,7 +52,8 @@ async function fixture(t) {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw), threadId = req.headers['thread-id'];
-    const route = body.model.startsWith('ccs-api2/') ? 'source' : 'fallback';
+    const route = req.url.startsWith('/backend-api/codex/') ? 'fallback' : 'source';
+    assert.equal(body.model, expected.model, 'primary and Official retain the native model ID');
     upstreamRequests.push({ threadId, route, model: body.model });
     if (route === 'fallback' && holdFallback) {
       fallbackStarted.resolve();
@@ -86,14 +87,14 @@ async function fixture(t) {
     INSERT INTO providers VALUES
       ('fixture-api2','API2',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-fixture-only"},"config":""}',NULL),
       ('fixture-official','Official','official','codex','{"auth":{},"config":""}',NULL);
-    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER);
-    INSERT INTO proxy_config VALUES('codex','127.0.0.1',${upstreamPort});
+    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
+    INSERT INTO proxy_config VALUES('codex','127.0.0.1',${upstreamPort},0);
   `]);
   await configureGateway(directory, { sourceProvider: 'fixture-api2', fallbackProvider: 'fixture-official',
     ccSwitchDirectory: directory, port: upstreamPort === 15722 ? 15723 : 15722 });
   config = await loadGatewayConfig(directory);
   gateway = await startSwitchGateway({ upstream: config.upstream, token: config.token,
-    verifyReady: () => verifyGatewayReady(directory, config),
+    verifyReady: route => verifyGatewayRoute(directory, config, route),
     resolveRoute: (thread, initial) => resolveSessionRoute(directory, config, thread, initial),
     officialRequestImpl: (target, { method, headers }, callback) => {
       assert.equal(target.origin, 'https://chatgpt.com');

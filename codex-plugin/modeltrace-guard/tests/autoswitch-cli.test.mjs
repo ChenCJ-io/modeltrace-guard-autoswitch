@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -38,15 +39,15 @@ async function fixture(t) {
       ('company','API2 copy',NULL,'codex','{"auth":{},"config":""}','{}'),
       ('other','Doro',NULL,'codex','{"auth":{},"config":""}','{}'),
       ('official','OpenAI Official','official','codex','{"auth":{},"config":""}','{}');
-    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER);
-    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721);`);
+    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER DEFAULT 0);
+    INSERT INTO proxy_config(app_type,listen_address,listen_port) VALUES('codex','127.0.0.1',15721);`);
   await atomicJSON(path.join(directory, 'live-state.json'), { version: 1, apps: { codex: { mode: 'proxy', attached: true,
     proxy_route: 'company', stack: { enabled: true, members: ['company', 'other'], keys: { company: 'company', doro: 'other' } } } } });
   const configured = await invoke('configure', '--cc-switch-dir', directory, '--primary-name', 'API2 copy', '--backup-name', 'OpenAI Official', '--port', String(await freePort()));
   return { directory, env, invoke, sql, configured, config: await loadGatewayConfig(directory) };
 }
 
-async function nativeFixture(directory, { accountType = 'chatgpt', onAccountRead = async () => {} } = {}) {
+async function nativeFixture(directory, { accountType = 'chatgpt', onAccountRead = async () => {}, configuration = null } = {}) {
   const definition = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
   const hooks = Object.entries(definition.hooks).flatMap(([name, groups]) => groups.flatMap(group => group.hooks.map(handler => ({
     eventName: name[0].toLowerCase() + name.slice(1), ...handler, async: handler.async || false,
@@ -64,6 +65,7 @@ async function nativeFixture(directory, { accountType = 'chatgpt', onAccountRead
           if (method === 'thread/read') return { thread: { id: params.threadId, path: path.join(directory, 'fixture-rollout'), ephemeral: false,
             model: 'gpt-6-sol', modelProvider: 'openai', reasoningEffort: 'high', cwd: ROOT } };
           if (method === 'hooks/list') return { data: [{ hooks }] };
+          if (method === 'config/read' && configuration) return configuration;
           throw new Error(`Unexpected native request: ${method}`);
         },
         close: async () => { closed.push(true); },
@@ -76,6 +78,19 @@ async function nativeFixture(directory, { accountType = 'chatgpt', onAccountRead
       return child;
     },
   } };
+}
+
+async function connectedNativeFixture(f) {
+  await f.invoke('gateway-start');
+  const profileFile = path.join(f.env.CODEX_HOME, 'config.toml');
+  const owned = { model_provider: 'openai', openai_base_url: gatewayURL(f.config) };
+  const name = { type: 'user', file: profileFile, profile: null };
+  await atomicJSON(path.join(f.directory, 'native-integration.json'), { schema: 1, phase: 'installed', profileFile,
+    configId: f.config.id, owned, original: { model_provider: { present: false }, openai_base_url: { present: false } },
+    pending: null, lastWriteStatus: 'ok' });
+  return nativeFixture(f.directory, { configuration: { config: owned,
+    origins: Object.fromEntries(Object.keys(owned).map(key => [key, { name }])),
+    layers: [{ name, version: 'fixture-version', config: owned, disabledReason: null }] } });
 }
 
 test('schema 2 gateway starts once, hides its capability, preserves company default and stops only its own instance', async t => {
@@ -100,6 +115,38 @@ test('schema 2 gateway starts once, hides its capability, preserves company defa
   assert.equal(await readFile(path.join(f.directory, 'live-state.json'), 'utf8'), live);
   await atomicJSON(runtimePath(f.directory), { pid: process.pid, instanceId: randomUUID(), configId: config.id });
   assert.equal((await invoke('gateway-stop')).stopped, false);
+});
+
+test('an old running gateway cannot be reported ready after installing a newer implementation', async t => {
+  const f = await fixture(t), instanceId = randomUUID();
+  const server = createHttpServer((req, res) => {
+    if (req.url.endsWith('/shutdown')) res.once('finish', () => { server.close(); server.closeAllConnections(); });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, instanceId })); // v0.4.0 has no implementation marker.
+  });
+  await new Promise(resolve => server.listen(f.config.port, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await atomicJSON(runtimePath(f.directory), { pid: process.pid, instanceId, configId: f.config.id });
+  const status = await f.invoke('gateway-status');
+  assert.equal(status.running, true);
+  assert.equal(status.readiness, 'upgrade_required');
+  assert.equal(status.implementationVersion, null);
+  await assert.rejects(f.invoke('gateway-start'), /upgrade required/);
+  assert.equal((await f.invoke('gateway-stop')).stopped, true);
+  assert.equal((await f.invoke('gateway-start')).readiness, 'ready');
+});
+
+test('a changed primary reports gateway readiness instead of telling connected users to start another conversation', async t => {
+  const f = await fixture(t), native = await connectedNativeFixture(f);
+  await f.sql("UPDATE proxy_config SET auto_failover_enabled=1 WHERE app_type='codex'");
+  const result = await runAutoSwitch(['use', '--session', randomUUID(), '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'gateway_not_ready');
+  assert.match(result.gateway.readiness, /automatic failover/);
+  assert.equal(result.monitoringEnabled, false); assert.equal(result.switchApproved, false);
+  await f.invoke('gateway-stop');
+  const restarted = await f.invoke('gateway-start');
+  assert.equal(restarted.running, true, 'transport can restart for already selected Official threads');
+  assert.match(restarted.readiness, /automatic failover/);
 });
 
 test('configuration accepts complete names or IDs and rejects mixed or incomplete selectors before mutation', async t => {
@@ -265,6 +312,102 @@ test('ordinary unconnected conversations are not falsely reported as monitored o
   assert.equal(result.connection.phase, 'not_installed'); assert.equal(result.switchApproved, false);
   assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
   assert.equal(await readState(f.directory, session), null);
+});
+
+test('use distinguishes a connected HTTP failure from an old conversation and preserves actionable safe diagnostics', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await connectedNativeFixture(f);
+  const route = await resolveSessionRoute(f.directory, f.config, session);
+  await saveReceipt(f.directory, f.config, { ...route, threadId: session, requestId: randomUUID(), statusCode: 403,
+    startedAt: Date.now() - 20, finishedAt: Date.now() - 10, success: false, completed: true, responseEvent: 'response.failed',
+    error: `Bearer private-upstream-token ${gatewayURL(f.config)}` });
+  const before = await readState(f.directory, session);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.connection.readyForNewThreads, true);
+  assert.equal(result.status, 'gateway_request_failed'); assert.equal(result.monitoringEnabled, false);
+  assert.equal(result.switchApproved, false); assert.equal(result.lastRequest.provider, 'API2 copy');
+  assert.equal(result.lastRequest.statusCode, 403); assert.equal(result.lastRequest.responseEvent, 'response.failed');
+  assert.equal(result.lastRequest.failureReason, 'upstream_forbidden');
+  assert.match(result.lastRequest.failureHint, /header\/transport compatibility/);
+  assert.match(result.instruction, /already reached the gateway/);
+  assert.equal(result.lastRequest.configurationMatches, true);
+  const status = await runAutoSwitch(['status', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.deepEqual(status.lastRequest, result.lastRequest);
+  assert.deepEqual(await readState(f.directory, session), before);
+  assert.ok(native.calls.every(call => call.method === 'config/read'), 'failure diagnosis must not inspect accounts, infer or write configuration');
+  assert.equal(native.children.length, 0);
+  assert.ok(!JSON.stringify({ result, status }).includes(f.config.token));
+  assert.ok(!JSON.stringify({ result, status }).includes('private-upstream-token'));
+});
+
+test('use keeps HTTP success with failed or interrupted generation distinct from successful monitoring readiness', async t => {
+  const f = await fixture(t), native = await nativeFixture(f.directory);
+  for (const outcome of [
+    { completed: true, responseEvent: 'response.failed', failureReason: 'upstream_response_failed' },
+    { completed: false, responseEvent: null, failureReason: 'gateway_response_interrupted' },
+    { completed: true, responseEvent: null, failureReason: 'response_completion_unconfirmed' },
+  ]) {
+    const session = randomUUID(), route = await resolveSessionRoute(f.directory, f.config, session);
+    await saveReceipt(f.directory, f.config, { ...route, threadId: session, requestId: randomUUID(), statusCode: 200,
+      startedAt: Date.now() - 20, finishedAt: Date.now() - 10, success: false, ...outcome });
+    const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+    assert.equal(result.status, 'gateway_request_failed'); assert.equal(result.monitoringEnabled, false);
+    assert.equal(result.lastRequest.statusCode, 200); assert.equal(result.lastRequest.responseEvent, outcome.responseEvent);
+    assert.equal(result.lastRequest.failureReason, outcome.failureReason);
+    assert.equal((await readState(f.directory, session)).autoSwitch ?? null, null);
+  }
+  assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
+});
+
+test('status exposes bounded failure diagnostics without echoing an arbitrary upstream event or error body', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
+  const route = await resolveSessionRoute(f.directory, f.config, session);
+  for (const [statusCode, responseEvent, reason] of [
+    [401, 'error', 'upstream_authentication_failed'],
+    [429, 'error', 'upstream_rate_limited'],
+    [504, null, 'gateway_request_timeout'],
+    [502, 'upstream-private-token', 'gateway_http_failure'],
+    [200, 'response.error', 'upstream_response_failed'],
+  ]) {
+    await saveReceipt(f.directory, f.config, { ...route, threadId: session, requestId: randomUUID(), statusCode,
+      startedAt: Date.now() - 20, finishedAt: Date.now() - 10, success: false, completed: true, responseEvent });
+    const result = await runAutoSwitch(['status', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+    assert.equal(result.lastRequest.statusCode, statusCode); assert.equal(result.lastRequest.failureReason, reason);
+    assert.equal(result.lastRequest.responseEvent, responseEvent === 'upstream-private-token' ? null : responseEvent);
+    assert.ok(!JSON.stringify(result).includes('upstream-private-token'));
+    assert.ok(!JSON.stringify(result).includes(f.config.token));
+  }
+  assert.equal(native.calls.length, 0); assert.equal(native.children.length, 0);
+});
+
+test('only a thread without gateway evidence gets the new-conversation handoff after ordinary setup', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await connectedNativeFixture(f);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'new_conversation_required'); assert.equal(result.connection.readyForNewThreads, true);
+  assert.equal(result.lastRequest, null); assert.equal(result.monitoringEnabled, false);
+  assert.equal(await readState(f.directory, session), null);
+  assert.ok(native.calls.every(call => call.method === 'config/read')); assert.equal(native.children.length, 0);
+});
+
+test('an initial gateway route without a finished receipt is unconfirmed rather than unconnected', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await connectedNativeFixture(f);
+  await resolveSessionRoute(f.directory, f.config, session);
+  const before = await readState(f.directory, session);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'gateway_request_unconfirmed'); assert.equal(result.lastRequest, null);
+  assert.equal(result.monitoringEnabled, false); assert.equal(result.switchApproved, false);
+  assert.deepEqual(await readState(f.directory, session), before);
+});
+
+test('use reports stale gateway evidence without implicitly migrating or enabling the thread', async t => {
+  const f = await fixture(t), session = randomUUID(), native = await connectedNativeFixture(f);
+  const route = await resolveSessionRoute(f.directory, f.config, session);
+  await saveReceipt(f.directory, { ...f.config, id: randomUUID() }, { ...route, threadId: session, requestId: randomUUID(), statusCode: 200,
+    startedAt: Date.now() - 20, finishedAt: Date.now() - 10, success: true, completed: true, responseEvent: 'response.completed' });
+  const before = await readState(f.directory, session);
+  const result = await runAutoSwitch(['use', '--session', session, '--data-dir', f.directory], f.env, native.runtime);
+  assert.equal(result.status, 'gateway_configuration_changed'); assert.equal(result.lastRequest.configurationMatches, false);
+  assert.equal(result.monitoringEnabled, false); assert.equal(result.switchApproved, false);
+  assert.deepEqual(await readState(f.directory, session), before);
 });
 
 test('ordinary entry rejects a command-only data directory before native configuration or gateway mutation', async t => {

@@ -2,7 +2,7 @@
 
 本仓库是 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork。基线为 upstream `main` 的提交 [`6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2`](https://github.com/xqy2006/ModelTrace/commit/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2)。上游作者为 **xqy2006**，fork 由 **ChenCJ-io** 维护；不代表上游发布或官方 Codex、CCSwitch 项目。
 
-根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.0`。
+根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.1`，发布仓库为 [ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。
 
 ## 保留内容
 
@@ -28,11 +28,11 @@ v0.3 引入的**每次异常单独确认**保持不变：首次有效不一致�
 
 用户可同意默认备用，也可指定另一个 CCSwitch 配置。`guard.mjs propose-switch` 创建新的待同意请求，不发送目标请求；后续 approve/wait/decline 必须使用新返回的请求 ID。`guard.mjs approve-switch` 要求该次明确同意并绑定目标 ID；目标身份或配置变化需重新选择、同意。验证取得真实 completed 回执和兼容指纹后才切换并恢复任务。Official 成功后停止探针；第三方目标成功后继续监测，下一次异常再次询问。不自动切回主配置。`guard.mjs decline-switch` 保留当前路由并恢复普通监测；`disable` 停监测但保留路由和 halt。
 
-主服务和第三方目标经本机 CCSwitch Stack，需通过界面加入成员。保留公司默认配置；Official 目标仅支持没有 managed account 的当前 CLI 原生 ChatGPT 登录，由网关使用固定官方 HTTPS 端点透传认证头。插件不读取凭据存储、不解析或保存 token；只读 SQL 返回身份标记和库内计算的配置摘要，不导出密钥值、不修改数据库。
+主服务和第三方目标需通过 CCSwitch 界面登记。0.4.1 主服务使用普通默认路由，以保留原生 Codex 协议头；转发前检查默认卡与主服务相同、自动故障切换关闭。第三方备用仍通过显式 Stack selector 选路。Official 目标仅支持没有 managed account 的当前 CLI 原生 ChatGPT 登录，由网关使用固定官方 HTTPS 端点透传认证头。插件不读取凭据存储、不解析或保存 token；只读 SQL 返回身份标记和库内计算的配置摘要，不导出密钥值、不修改数据库。
 
 ## 安装与证据范围
 
-[INSTALL.md](../INSTALL.md) 是安装前入口。安装助手使用 `execFile` 参数数组安装本地 marketplace/plugin，仅在用户已明确给出名称时保存主备；不执行 connect、不启动监测、不读取认证文件、不修改 hook 信任。后续自然语言 setup/use 与安装授权分别处理。仓库未发布时只使用用户给出的 URL 或本地目录，不借用上游发布身份。
+[INSTALL.md](../INSTALL.md) 是安装前入口。安装助手使用 `execFile` 参数数组安装本地 marketplace/plugin，仅在用户已明确给出名称时保存主备；不执行 connect、不启动监测、不读取认证文件、不修改 hook 信任。后续自然语言 setup/use 与安装授权分别处理。本 fork 使用自己的发布地址，不借用上游发布身份。
 
 完整网关流程同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv`，推荐 Node 24.5+；22.x 至少为 22.21，25+ 也支持。普通独立监测仍支持 Node 18+。配置检查依赖带 `sha3()` 的 `sqlite3`。接入要求当前 home 的原生 ChatGPT 登录；`launch` 仅作为高级诊断兼容入口保留。`connection-status` 证明未来默认配置，当前请求路径须由对应 thread 回执证明；账号或额度 UI 不证明渠道。任何入口均不承诺迁移旧认证和加密历史。
 

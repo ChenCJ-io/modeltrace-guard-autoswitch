@@ -1,0 +1,20 @@
+title = "ModelTrace Guard Autoswitch secret scanning"
+
+[extend]
+useDefault = true
+
+# Fixed test-only values used against loopback fixtures, never real credentials.
+[[allowlists]]
+description = "Synthetic gateway capabilities in isolated HTTP tests"
+condition = "AND"
+paths = ['''^codex-plugin/modeltrace-guard/tests/switch-gateway\.test\.mjs$''']
+regexTarget = "secret"
+regexes = ['''^(synthetic-capability-123456789|wrong-capability-12345)$''']
+
+# RFC 6455's public example nonce for a local WebSocket handshake.
+[[allowlists]]
+description = "Public WebSocket sample nonce in a loopback transport test"
+condition = "AND"
+paths = ['''^codex-plugin/modeltrace-guard/tests/cache-transport\.test\.mjs$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==(\\r)?$''']

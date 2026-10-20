@@ -26,8 +26,8 @@ async function fixture(t) {
     ('${sourceId}','Company',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":""}','{}'),
     ('${alternateId}','Alternate',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":""}','{}'),
     ('${fallbackId}','Official','official','codex','{"auth":{},"config":""}','{}');
-    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER);
-    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721);`]);
+    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
+    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721,0);`]);
   await configureGateway(directory, { primaryName: 'Company', backupName: 'Official', ccSwitchDirectory: directory });
   return { directory, config: await loadGatewayConfig(directory), session: randomUUID() };
 }
@@ -50,7 +50,7 @@ function evidenceState(config) {
     attempts: 0, configId: config?.id || randomUUID(), policyId: randomUUID(), primary, backup, current: primary };
   state.samples.push({ challenge: randomUUID(), at: Date.now(), epoch: 1, language: 'en', reportedModel: 'expected', expected: 'expected',
     expectedWeight: 0.01, prediction: 'other', outcome: 'difference_signal', fork: { routing: {
-      route: 'source', providerId: primary.id, providerFingerprint: primary.fingerprint, transport: primary.transport, sourceKey: primary.key,
+      route: 'source', providerId: primary.id, providerFingerprint: primary.fingerprint, transport: primary.transport, sourceKey: primary.key, ccswitchMode: 'default',
       success: true, completed: true, configId: state.autoSwitch.configId, policyId: state.autoSwitch.policyId, revision: 1,
     } } });
   return state;
@@ -70,6 +70,7 @@ function canary(state) {
   return { expected: 'expected', prediction: 'expected', outcome: 'compatible', fork: { routing: {
     route: 'fallback', success: true, completed: true, configId: r.configId, policyId: r.policyId, revision: r.revision + 1,
     providerId: target.id, providerFingerprint: target.fingerprint, transport: target.transport, sourceKey: target.key,
+    ccswitchMode: target.transport === 'ccswitch' ? (target.id === state.autoSwitch.primary.id ? 'default' : 'stack') : null,
     proposalId: r.id, approvalId: r.approval.id, challenge: state.pending.id,
     threadId: randomUUID(), requestId: randomUUID(), finishedAt: Date.now(),
   } } };
@@ -87,7 +88,8 @@ async function pendingIncident(f) {
 
 test('first request uses primary, enable never changes it, and another thread has no monitor', async t => {
   const f = await fixture(t), sibling = randomUUID();
-  assert.equal((await resolveSessionRoute(f.directory, f.config, f.session)).providerId, sourceId);
+  const first = await resolveSessionRoute(f.directory, f.config, f.session);
+  assert.equal(first.providerId, sourceId); assert.equal(first.ccswitchMode, 'default');
   assert.equal((await readState(f.directory, f.session)).enabled, false);
   await assert.rejects(enableAutoSwitch(f.directory, f.session, readiness), /successful primary/);
   await enable(f);
@@ -99,12 +101,32 @@ test('first request uses primary, enable never changes it, and another thread ha
   assert.equal((await resolveSessionRoute(f.directory, f.config, f.session)).providerId, sourceId);
 });
 
+test('primary resolution rejects default drift and CCSwitch failover before any route is changed', async t => {
+  const f = await fixture(t);
+  await enable(f);
+  const before = await readState(f.directory, f.session);
+  await execute('sqlite3', [path.join(f.directory, 'cc-switch.db'), "UPDATE proxy_config SET auto_failover_enabled=1 WHERE app_type='codex'"]);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, f.session), /automatic failover/);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID()), /automatic failover/);
+  await execute('sqlite3', [path.join(f.directory, 'cc-switch.db'), "UPDATE proxy_config SET auto_failover_enabled=0 WHERE app_type='codex'"]);
+  await atomicJSON(path.join(f.directory, 'live-state.json'), { apps: { codex: { mode: 'proxy', attached: true, proxy_route: alternateId,
+    stack: { enabled: true, members: [sourceId, alternateId], keys: { company: sourceId, alternate: alternateId } } } } });
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, f.session), /default provider changed/);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID()), /default provider changed/);
+  assert.deepEqual((await readState(f.directory, f.session)).autoSwitch, before.autoSwitch);
+  const official = await resolveSessionRoute(f.directory, f.config, randomUUID(), fallbackId);
+  assert.equal(official.transport, 'official'); assert.equal(official.ccswitchMode, null);
+  const alternate = await resolveSessionRoute(f.directory, f.config, randomUUID(), alternateId);
+  assert.equal(alternate.ccswitchMode, 'stack'); assert.equal(alternate.providerId, alternateId);
+});
+
 test('only a valid current-route mismatch can request consent, including a clearly labelled weak disagreement', () => {
   assert.equal(eligibleForSwitch(evidenceState()), true);
   const weak = evidenceState(); weak.samples[0].outcome = 'inconclusive'; assert.equal(eligibleForSwitch(weak), true);
   for (const mutate of [s => { s.samples[0].fork.routing.success = false; }, s => { s.samples[0].fork.routing.completed = false; },
     s => { s.samples[0].fork.routing.providerId = 'other'; }, s => { s.samples[0].fork.routing.providerFingerprint = 'old'; },
     s => { s.samples[0].fork.routing.revision = 0; }, s => { s.samples[0].fork.routing.configId = 'old'; },
+    s => { s.samples[0].fork.routing.ccswitchMode = 'stack'; }, s => { delete s.samples[0].fork.routing.ccswitchMode; },
     s => { s.autoSwitch.enabled = false; }, s => { s.samples[0].outcome = 'unknown_expected_model'; },
     s => { s.samples[0].expectedWeight = null; }, s => { s.samples[0].epoch = 0; }]) {
     const state = evidenceState(); mutate(state); assert.equal(eligibleForSwitch(state), false);

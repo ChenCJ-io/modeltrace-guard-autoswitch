@@ -6,6 +6,9 @@ import { promisify } from 'node:util';
 import * as zlib from 'node:zlib';
 import { createOfficialTransport, encryptedReasoningRetryBody } from './official-transport.mjs';
 
+// A healthy old daemon is not evidence that newly installed forwarding code is running.
+export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.1';
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SOURCE_KEY = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
 const ROUTE_RECEIPT_FIELDS = ['providerFingerprint', 'proposalId', 'approvalId', 'challenge'];
@@ -95,6 +98,10 @@ async function jsonBody(req, limit, timeoutMs) {
   catch { throw failure(400, 'Invalid JSON request body'); }
   if (!body || Array.isArray(body) || typeof body !== 'object') throw failure(400, 'A JSON object is required');
   if (typeof body.model !== 'string' || !body.model.trim()) throw failure(400, 'A model is required');
+  // CCSwitch treats these IDs as provider selectors, including malformed ones.
+  // Accepting one from the client would bypass the consent-owned provider and
+  // falsely attribute its response to the primary/default route in receipts.
+  if (body.model.startsWith('ccs-') && body.model.includes('/')) throw failure(400, 'A plain model ID is required; CCSwitch provider selectors are not accepted');
   if (body.previous_response_id != null && (typeof body.previous_response_id !== 'string' || !body.previous_response_id)) {
     throw failure(400, 'Invalid previous_response_id');
   }
@@ -350,7 +357,7 @@ export async function startSwitchGateway({
           res.once('finish', shutdown);
         }
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, instanceId }));
+        res.end(JSON.stringify({ ok: true, instanceId, implementationVersion: GATEWAY_IMPLEMENTATION_VERSION }));
         return;
       }
       if (path === 'models') {
@@ -365,26 +372,30 @@ export async function startSwitchGateway({
       try { route = await resolveRoute(normalizedThread, initialProviderId); } catch { throw failure(503, 'Session routing is unavailable'); }
       if (!route || !['source', 'fallback'].includes(route.route) || !Number.isSafeInteger(route.revision) || route.revision < 0
           || (route.transport != null && !['ccswitch', 'official'].includes(route.transport))
+          || (route.ccswitchMode != null && (!['default', 'stack'].includes(route.ccswitchMode) || route.transport !== 'ccswitch'))
+          || (route.ccswitchMode === 'default' && (route.route !== 'source' || !route.providerId))
           || (route.providerId != null && (typeof route.providerId !== 'string' || !route.providerId || route.providerId.length > 512 || /[\x00-\x1f\x7f]/.test(route.providerId)))
           || ((route.transport === 'ccswitch' || (route.transport == null && route.route === 'source')) && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
           || (route.sourceKey != null && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
           || ROUTE_RECEIPT_FIELDS.some((field) => route[field] != null && !(Number.isSafeInteger(route[field])
             || (typeof route[field] === 'string' && route[field].length <= 512 && !/[\x00-\x1f\x7f]/.test(route[field]))))) throw failure(503, 'Session route is invalid');
-      // Legacy routes without transport preserve the former unprefixed fallback;
-      // every v0.3 third-party route explicitly requires a Stack sourceKey.
+      // Saved selectors remain part of provider identity. Only an explicit,
+      // independently verified primary default route bypasses Stack rewriting.
       route = Object.freeze({ route: route.route, transport: route.transport || 'ccswitch', providerId: route.providerId ?? null,
         sourceKey: route.transport === 'official' ? null : route.sourceKey ?? null, revision: route.revision,
+        ccswitchMode: route.transport === 'official' ? null : route.ccswitchMode ?? (route.sourceKey ? 'stack' : null),
         ...Object.fromEntries(ROUTE_RECEIPT_FIELDS.map((field) => [field, route[field] ?? null])) });
       receipt = { requestId: randomUUID(), threadId: normalizedThread, ...route, startedAt };
       try { if (await verifyReady(route) === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
       if (res.destroyed || req.aborted || closing) throw failure(503, 'Request was cancelled');
-      const identity = JSON.stringify([route.route, route.providerId, route.providerFingerprint, route.transport, route.sourceKey, route.revision]);
+      const identity = JSON.stringify([route.route, route.providerId, route.providerFingerprint, route.transport, route.sourceKey, route.ccswitchMode, route.revision]);
       context = threads.get(normalizedThread);
       if (context?.identity !== identity) context = { identity, established: false };
       threads.delete(normalizedThread); threads.set(normalizedThread, context);
       if (threads.size > maxTrackedThreads) threads.delete(threads.keys().next().value);
       if (body.previous_response_id != null && !context.established) throw failure(409, 'Route continuity is unknown or changed; resend complete input without previous_response_id');
-      const forwarded = route.transport === 'ccswitch' && route.sourceKey ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
+      const forwarded = route.transport === 'ccswitch' && route.sourceKey && route.ccswitchMode !== 'default'
+        ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
       // Unsupported official environments never prevent the default company
       // gateway from starting. Selection still belongs entirely to the resolver.
       if (route.transport === 'official') officialTransport ||= createOfficialTransport({ requestImpl: officialRequestImpl });

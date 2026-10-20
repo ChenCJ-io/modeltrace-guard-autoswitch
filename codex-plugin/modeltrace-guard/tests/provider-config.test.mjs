@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import {
   assertProviderCurrent, atomicJSON, configPath, configureGateway, describeProvider,
-  inspectCCSwitch, loadGatewayConfig, resolveProvider, sameProvider, verifyGatewayReady, verifyLayout,
+  inspectCCSwitch, loadGatewayConfig, resolveProvider, sameProvider, verifyGatewayReady, verifyGatewayRoute, verifyLayout,
 } from '../scripts/provider-config.mjs';
 
 const execute = promisify(execFile);
@@ -28,8 +28,8 @@ async function fixture(t) {
   const db = path.join(directory, 'cc-switch.db');
   const sql = statement => execute('sqlite3', [db, statement]);
   await sql(`CREATE TABLE providers(id TEXT,name TEXT,category TEXT,app_type TEXT,settings_config TEXT,meta TEXT);
-    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER);
-    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721);`);
+    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
+    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721,0);`);
   async function put({ id, name, category = null, config = plainOfficial, meta = null, rawConfig, rawMeta }) {
     await sql(`DELETE FROM providers WHERE id=${sqlValue(id)};
       INSERT INTO providers VALUES(${[id, name, category, 'codex', rawConfig ?? JSON.stringify(config),
@@ -110,13 +110,38 @@ test('schema 2 config preserves the company default and exposes stable primary a
   const saved = await loadGatewayConfig(f.directory), layout = await verifyGatewayReady(f.directory, saved);
   assert.match(saved.token, /^[a-f0-9]{64}$/);
   assert.equal(layout.defaultProvider, 'company');
-  assert.equal(verifyLayout(saved, { ...layout, defaultProvider: 'other' }), true, 'explicit routes never rewrite or require a global Official default');
+  assert.equal(verifyLayout(saved, { ...layout, defaultProvider: 'other' }), true, 'base validation does not reroute an already selected Official session');
+  await verifyGatewayRoute(f.directory, saved);
   assert.equal(await readFile(path.join(f.directory, 'live-state.json'), 'utf8'), before);
   const thirdPartyBackup = await configureGateway(f.directory, {
     primaryName: 'API2copy', backupName: 'Other Relay', ccSwitchDirectory: f.directory,
   });
   assert.equal(thirdPartyBackup.backup.transport, 'ccswitch');
   assert.equal(thirdPartyBackup.backup.key, 'other');
+});
+
+test('primary readiness fails closed on default drift, enabled or unknown failover, without changing configuration', async t => {
+  const f = await fixture(t);
+  await configureGateway(f.directory, { primaryName: 'API2copy', backupName: 'OpenAI Official', ccSwitchDirectory: f.directory });
+  const config = await loadGatewayConfig(f.directory), before = await readFile(configPath(f.directory));
+  const layout = await f.inspect();
+  for (const variant of [
+    { ...layout, defaultProvider: 'other' },
+    { ...layout, listener: { ...layout.listener, auto_failover_enabled: 1 } },
+    { ...layout, listener: { listen_address: '127.0.0.1', listen_port: 15721 } },
+  ]) {
+    await assert.rejects(verifyGatewayRoute(f.directory, config, undefined, async () => variant), /default provider changed|automatic failover/);
+    await assert.rejects(configureGateway(f.directory, { primaryName: 'API2copy', backupName: 'OpenAI Official', ccSwitchDirectory: f.directory }, async () => variant), /default provider changed|automatic failover/);
+    assert.deepEqual(await readFile(configPath(f.directory)), before);
+    await verifyGatewayRoute(f.directory, config, { transport: 'official', providerId: 'official', route: 'fallback' }, async () => variant);
+  }
+  const route = { transport: 'ccswitch', route: 'source', ccswitchMode: 'default', providerId: config.primary.id,
+    providerFingerprint: config.primary.fingerprint, sourceKey: config.primary.key };
+  await verifyGatewayRoute(f.directory, config, route);
+  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, ccswitchMode: 'stack' }), /route mode/);
+  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, providerFingerprint: 'changed' }), /identity changed/);
+  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, providerId: 'other' }), /route mode/);
+  await verifyGatewayRoute(f.directory, config, { transport: 'ccswitch', route: 'fallback', ccswitchMode: 'stack', providerId: 'other' });
 });
 
 test('Official account bindings and every extra auth field are rejected even if a stale Stack membership remains', async t => {

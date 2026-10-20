@@ -1,8 +1,8 @@
 name: Deploy static ModelTrace to GitHub Pages
 
 on:
-  push:
-    branches: [main]
+  # Publishing the plugin does not automatically deploy the optional upstream website.
+  # Enable GitHub Pages in repository settings before running this workflow.
   workflow_dispatch:
 
 permissions:

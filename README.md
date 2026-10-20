@@ -1,6 +1,6 @@
 # ModelTrace Guard Autoswitch
 
-基于 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork，版本 `0.4.0`。上游作者 xqy2006，fork 由 ChenCJ-io 维护，保留 MIT 许可证；来源见 [UPSTREAM.md](docs/UPSTREAM.md)。
+基于 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork，版本 `0.4.1`。上游作者 xqy2006，fork 由 ChenCJ-io 维护，保留 MIT 许可证；来源见 [UPSTREAM.md](docs/UPSTREAM.md)。
 
 **默认使用主配置。首次指纹异常就暂停并询问；只有用户对这一次目标明确同意后，才验证并切换。** 安装、配置主备、开启监测、确认收到提醒，都不预先授权任何切换。
 
@@ -12,26 +12,30 @@
 
 ## 安装和自然语言使用
 
-从用户提供的仓库 URL 或本地目录读取 [INSTALL.md](INSTALL.md)，再执行安装助手。本仓库尚未发布 GitHub 地址；不要把上游地址当成本 fork 的安装源。可以对 Codex 说：
+本项目地址：[ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。新用户可以直接把下面这段话发给 Codex：
 
-> 从「仓库 URL 或本地目录」安装这个插件，先读 INSTALL.md。主用「API2 copy」，备用「Doro」。出现指纹异常先询问我，每次同意后才切换。
+> 请从 https://github.com/ChenCJ-io/modeltrace-guard-autoswitch 安装这个插件。先读取 INSTALL.md，检查运行环境并完成插件安装、主备配置和普通 Codex 入口接入。主用 CCSwitch 的 API2 copy，备用 OpenAI Official；配置不存在或重名时列出实际候选让我选择。需要登录、填写供应商凭据或在 /hooks 中信任插件时引导我完成，然后继续配置。在对话中开启指纹监测，异常立即暂停并询问，只有我明确同意本次目标后才验证并切换。最后根据真实路由回执和监测状态报告结果；首次安装的旧会话无法接入时，说明新对话的启用方法。
+
+首次使用仍需要用户已有可用的 CCSwitch 主通道、当前 Codex home 的原生 ChatGPT 登录，并亲自信任插件 hooks；一段指令可以发起完整流程，不代表零交互或预先批准切换。
 
 在本地仓库根运行的等效命令：
 
 ```sh
-node scripts/install-plugin.mjs --primary-name "API2 copy" --backup-name "Doro"
+git clone https://github.com/ChenCJ-io/modeltrace-guard-autoswitch.git
+cd modeltrace-guard-autoswitch
+node scripts/install-plugin.mjs --primary-name "API2 copy" --backup-name "OpenAI Official"
 ```
 
 安装助手只执行本地 marketplace/plugin 安装和明确给定的主备配置，不修改原生 Codex 的默认入口、不启动网关、监测或推理，也不修改 hook 信任。安装后须按 Codex 原生机制在 `/hooks` 审阅并信任新插件，包括 v0.4 新增的同步启动 hook。
 
 ## 一次性接入普通 codex
 
-需要 CCSwitch 4.0.15 Stack 聚合模式。通过 CCSwitch 界面将主配置和第三方备用加入 Stack，保留公司默认配置；无需把 OpenAI Official 改为 CCSwitch 默认。完整网关流程推荐 Node.js 24.5+；使用 22.x 时至少为 22.21，25+ 也支持，以同时满足 zstd 和官方 HTTPS 的原生 `proxyEnv` 要求。配置检查还需要带 `sha3()` 的 `sqlite3` 命令。普通独立监测最低仍为 Node.js 18+。
+需要 CCSwitch 代理模式和已登记的 Stack 配置。通过 CCSwitch 界面登记主配置和第三方备用，将默认卡保持为选定的主配置（例如 API2 copy），并关闭 CCSwitch 自动故障切换。0.4.1 的主通道使用普通默认路由，保留原始模型名和 Codex 协议头；第三方备用才使用 Stack 前缀，Official 不需要成为全局默认。完整网关流程推荐 Node.js 24.5+；使用 22.x 时至少为 22.21，25+ 也支持，以同时满足 zstd 和官方 HTTPS 的原生 `proxyEnv` 要求。配置检查还需要带 `sha3()` 的 `sqlite3` 命令。普通独立监测最低仍为 Node.js 18+。
 
 ```sh
 AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
 node "$AUTOSWITCH" inspect
-node "$AUTOSWITCH" configure --primary-name "API2 copy" --backup-name "Doro"
+node "$AUTOSWITCH" configure --primary-name "API2 copy" --backup-name "OpenAI Official"
 node "$AUTOSWITCH" connect
 node "$AUTOSWITCH" connection-status
 ```
@@ -44,9 +48,13 @@ node "$AUTOSWITCH" connection-status
 
 首次安装或接入所在的旧对话没有经过网关时，`use` 会返回 `connection_setup_required` 或 `new_conversation_required`。技能先完成缺少的一次性准备；之后用户只需新建一个普通 Codex 会话，再说“使用 modeltrace-guard-autoswitch”。旧对话不能被报告为已经热接管，也不能把写盘成功当作当前请求改道成功。
 
+已经经过网关但返回 403 等错误的线程会返回 `gateway_request_failed`，附带 HTTP/SSE 状态和排查提示，不再错误地建议反复新建对话。尚无完整回执为 `gateway_request_unconfirmed`；旧配置的回执为 `gateway_configuration_changed`。这些状态不启用监测、不授权切换。主通道首请求失败时尚无法执行对话中的技能，须先修复传输；不能把 403 当作指纹不一致，也不能声称已进入审批切换流程。
+
+已配置入口但主卡漂移、自动故障切换未关闭或服务不可用时，`use` 返回 `gateway_not_ready`，先修复具体原因。升级后 `gateway-status` 还会核对运行中的 `implementationVersion`；`upgrade_required` 表示旧进程尚未退出。获授权的升级流程应停止并从新安装包重启本插件网关，保留原配置和各线程路由；启动 hook 不会擅自打断正在进行的请求。
+
 `inspect` 列出候选；名称先完全匹配，未命中时允许唯一的不区分大小写匹配；重名时选择 ID，再用 `configure --primary-provider PRIMARY_ID --backup-provider BACKUP_ID`，不能混用 name 与 ID 参数。`configure` 可附加 `--cc-switch-dir PATH`（默认 `~/.cc-switch`）和 `--port N`（默认 `15722`）。配置须在网关停止时更新；更新会生成新配置 ID，已有路由会话不会自动迁移。设置默认备用只是保存偏好。
 
-接入要求当前 Codex home 的原生 ChatGPT 登录和 `openai` 契约，公司请求由网关送往 CCSwitch Stack。认证检查为自己的进程显式选用 `openai`，不会代为登录或复制凭据。若返回 `account: null`，按实际结果核对当前 home 和原生登录，不能推断用户从未登录或读取另一配置的凭据补齐。
+接入要求当前 Codex home 的原生 ChatGPT 登录和 `openai` 契约，公司请求由网关送往 CCSwitch 普通主路由。每次转发校验默认卡和自动故障切换设置，配置漂移时拒绝请求。认证检查为自己的进程显式选用 `openai`，不会代为登录或复制凭据。若返回 `account: null`，按实际结果核对当前 home 和原生登录，不能推断用户从未登录或读取另一配置的凭据补齐。
 
 新增的同步 `SessionStart` hook（`startup.mjs`）只在本插件拥有且仍有效的接入配置就绪时保证网关启动；它不启用监测、不改默认入口，也不自动修复 CCSwitch 配置漂移。`gateway-start` 单独启动服务，不会让普通 Codex 自动接入。
 
@@ -96,6 +104,6 @@ node codex-plugin/modeltrace-guard/scripts/guard.mjs doctor
 
 `npm run check` 包含分发检查与 Python/JavaScript 评分 parity；所选 Python 须已安装 NumPy。`doctor --fork true` 可另行检查原生分支和 hook 就绪状态，会创建临时分支但不生成探针。安装助手测试使用假执行器，离线通过不等于真实路由已验收。
 
-第三方请求经本机 CCSwitch Stack；Official 仅支持当前 CLI 原生 ChatGPT 登录、无 managed account 的目标，由网关转发到固定官方 HTTPS 地址，保留 CCSwitch 公司默认。插件不读取凭据存储、不解析或保存登录 token；HTTP 网关会接收并向选定链路转发原生认证头。配置检查使用只读 SQL 和库内摘要，不导出密钥值。
+主通道经本机 CCSwitch 普通默认路由；第三方备用经 Stack（其请求头清理行为仍须与上游兼容）。Official 仅支持当前 CLI 原生 ChatGPT 登录、无 managed account 的目标，由网关转发到固定官方 HTTPS 地址，保留 CCSwitch 公司默认。插件不读取凭据存储、不解析或保存登录 token；HTTP 网关会接收并向选定链路转发原生认证头。配置检查使用只读 SQL 和库内摘要，不导出密钥值。
 
 数据默认在 `${CODEX_HOME:-~/.codex}/modeltrace-guard-autoswitch`，与上游数据独立。网关 URL 含访问 capability，不应公开。指纹误报率尚未在同上下文和多语言条件下独立校准；不承诺所有端点兼容、加密历史可移植或立即取消正在运行的工具。详见 [插件说明](codex-plugin/modeltrace-guard/README.md)。

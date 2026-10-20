@@ -40,8 +40,8 @@ async function routingFixture(directory) {
     INSERT INTO providers VALUES
       ('company','API2 copy',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":""}',NULL),
       ('official','OpenAI Official','official','codex','{"auth":{},"config":""}','{"providerType":"codex_oauth"}');
-    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER);
-    INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721);
+    CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER DEFAULT 0);
+    INSERT INTO proxy_config(app_type,listen_address,listen_port) VALUES('codex','127.0.0.1',15721);
   `]);
   await atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: {
     mode: 'proxy', attached: true, proxy_route: 'company',

@@ -1,4 +1,4 @@
-# 安装 ModelTrace Guard Autoswitch 0.4.0
+# 安装 ModelTrace Guard Autoswitch 0.4.1
 
 这是安装前给 Codex 和使用者的入口。用户提供仓库 URL 或本地目录后，先读取本文件，再运行仓库自带安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
 
@@ -6,13 +6,13 @@
 
 ## 取得用户指定的源码
 
-本 fork 尚未发布 GitHub 地址。未来地址格式为 `https://github.com/<owner>/<repository>`，它只是占位模板；使用用户提供的真实 URL，不能猜测仓库名或把上游 ModelTrace 当作本 fork。
+本 fork 的安装源为 **https://github.com/ChenCJ-io/modeltrace-guard-autoswitch**。上游 `xqy2006/ModelTrace` 是另一项目，不要将其作为本 fork 的安装地址。
 
 若用户给的是 URL，先将其克隆到明确的本地目录，再读该 checkout 的 `INSTALL.md`：
 
 ```sh
-git clone "<用户提供的仓库URL>" "/path/to/modeltrace-guard-autoswitch"
-cd "/path/to/modeltrace-guard-autoswitch"
+git clone https://github.com/ChenCJ-io/modeltrace-guard-autoswitch.git
+cd modeltrace-guard-autoswitch
 ```
 
 若已经有本地源码，直接进入该目录。安装助手只接受本地 checkout，不代为下载远端代码。
@@ -25,10 +25,10 @@ cd "/path/to/modeltrace-guard-autoswitch"
 node scripts/install-plugin.mjs
 ```
 
-用户已经明确说“主用 API2 copy，备用 Doro”时，可安装并保存这对偏好：
+用户已经明确说“主用 API2 copy，备用 OpenAI Official”时，可安装并保存这对偏好：
 
 ```sh
-node scripts/install-plugin.mjs --primary-name "API2 copy" --backup-name "Doro"
+node scripts/install-plugin.mjs --primary-name "API2 copy" --backup-name "OpenAI Official"
 ```
 
 也可从其他目录指定本地源码和实际 Codex 可执行文件：
@@ -59,13 +59,15 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs configure \
 
 主配置和第三方备用须通过 CCSwitch 4.0.15 界面加入 Stack；保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。接入要求当前 Codex home 的原生 ChatGPT 登录与 `openai` 契约；Official 目标还须没有 managed account 或存储的登录快照。
 
+0.4.1 的主通道实际使用普通 CCSwitch 默认路由，保留 Codex 协议头和模型名，避免 Stack 清理客户端标记引发 “only allows Codex official clients” 403。默认卡必须仍为配置的主通道，且 CCSwitch 自动故障切换必须关闭；插件只检查，不替用户改卡。第三方备用仍走 Stack，需要单独验证兼容性；Official 备用不受该分支影响。
+
 CCSwitch 全局 provider 可能是 `custom`；认证检查会为自己的进程显式选用 `openai`，不会代为登录。若返回 `account: null`，先核对实际 Codex home、provider 和原生登录，不推断用户从未登录，不读取或复制其他配置的凭据来绕过检查。
 
 用户要求 setup 或使用插件时，技能可完成一次性 `autoswitch.mjs connect` 准备，并如实说明范围：仅将当前 Codex home 的 `model_provider`、`openai_base_url` 默认值接到网关，保存两键原值，影响未来新会话；不改 auth、不动其他 home（例如 `.codex-personal`）、不重启 daemon、不热改旧 thread，也不启用全部会话监测。`connect` 使用原生版本与原值校验，遇到外部修改或配置覆盖不擅自覆盖。
 
 接入与普通 `codex` 启动必须找到同一数据目录；仅命令行使用、普通启动不继承的 `--data-dir` 不可 connect。需要自定义目录时，让两者继承相同的 `MODELTRACE_AUTOSWITCH_DATA`。
 
-首次安装所在的旧会话可能尚未经过网关。技能执行 `use --session UUID` 后若返回 `connection_setup_required`，先完成缺少的 connect；返回 `new_conversation_required` 或准备完成后，明确告知用户新建一个普通 Codex 会话一次，再说“使用 modeltrace-guard-autoswitch”。不得把写盘成功、相同 thread ID 或账号额度 UI 当作旧窗口已改道的证据。`launch` 仅保留为高级诊断兼容入口，不作为正常流程。
+首次安装所在的旧会话可能尚未经过网关。技能执行 `use --session UUID` 后若返回 `connection_setup_required`，先完成缺少的 connect；仅返回 `new_conversation_required` 时，明确告知用户新建一个普通 Codex 会话一次，再说“使用 modeltrace-guard-autoswitch”。若已有失败回执，处理 `gateway_request_failed` 中的具体错误；若选路尚未收到回执，处理 `gateway_request_unconfirmed`；配置不一致为 `gateway_configuration_changed`。不得把写盘成功、相同 thread ID 或账号额度 UI 当作旧窗口已改道的证据。`launch` 仅保留为高级诊断兼容入口，不作为正常流程。
 
 正常新会话由同步 `SessionStart` 的 `startup.mjs` 在已拥有且有效的接入配置就绪时保证网关启动；它不启用监测或自动修复 CCSwitch 漂移。单独 `gateway-start` 也不会接入原生默认入口。`connection-status` 检查未来新会话默认值，当前会话实际渠道要由其成功网关回执证明。
 

@@ -1,6 +1,6 @@
 # ModelTrace Guard Autoswitch
 
-独立 fork `0.4.0`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+独立 fork `0.4.1`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
 
 完成一次性接入后，照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。技能执行 `autoswitch.mjs use`，只为当前已接入的主渠道 thread 开启监测；个人会话默认不检测，无需专用启动器。
 
@@ -25,6 +25,8 @@ node scripts/autoswitch.mjs status --session SESSION_UUID
 connect 的数据目录必须与普通启动一致，不能仅用命令行 `--data-dir` 指向普通 `codex` 找不到的位置；自定义目录需共同继承 `MODELTRACE_AUTOSWITCH_DATA`。CCSwitch 退出、重启或切卡可能重写入口；用户再次要求使用插件时，可显式 connect 重连，但只接受 CCSwitch 主卡未变且两键逐项为原值或旧 owned 值的情形。其他配置不覆盖，启动 hook 只报告，不后台抢回入口。
 
 首次安装所在的旧会话没有网关回执时，use 返回 `connection_setup_required` 或 `new_conversation_required`。完成缺少的准备后，新建一个普通 Codex 会话一次，再说“使用 modeltrace-guard-autoswitch”；不能把旧窗口报告为已热接管。
+
+已有失败回执返回 `gateway_request_failed`，附带 HTTP/SSE 状态，须排查传输而不是反复新开对话；未确认回执为 `gateway_request_unconfirmed`，配置已变为 `gateway_configuration_changed`。这些状态均不授权切换。
 
 名称先完全匹配，未命中时允许唯一的不区分大小写匹配；重名时从 `inspect` 选 ID，使用 `configure --primary-provider ID --backup-provider ID`，不能混用 name/ID。配置须在网关停止时更新；新配置 ID 不会自动迁移旧路由会话。
 
@@ -57,6 +59,8 @@ node scripts/guard.mjs decline-switch --request REQUEST_ID
 需要支持原生快照 fork、临时任务删除、同步工具拦截和异步 hooks 的 Codex App Server。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，以满足 zstd 与官方 HTTPS 的原生 `proxyEnv` 要求。普通独立监测仍可使用 Node.js 18+。配置检查依赖提供 `sha3()` 的 `sqlite3` CLI，通过只读 SQL 获取身份和配置摘要，不导出密钥。
 
 主配置及第三方目标须加入 CCSwitch 4.0.15 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收认证头，不读取凭据存储、不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
+
+0.4.1 主通道使用普通默认路由，模型名和原生 Codex 请求头保持不变；转发前校验默认卡仍为主通道、CCSwitch 自动故障切换关闭。第三方备用才使用 Stack 前缀，其协议头清理行为须与上游兼容。主通道检测到漂移会拒绝请求，不自动改卡或降级到 Stack。
 
 安装后在 Codex CLI 的 `/hooks` 中审阅并信任 ModelTrace Guard Autoswitch。v0.4 新增同步启动 hook，定义变更后须按原生机制重新审阅；智能体不能代改信任。可用 `node scripts/guard.mjs doctor` 检查打包文件；`doctor --fork true` 另检查原生 fork、hook 与清理能力，会创建临时分支但不生成探针。存在多个运行时时可用 `MODELTRACE_CODEX_PATH` 选择正确可执行文件，不通过换账户绕过检查。
 
