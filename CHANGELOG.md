@@ -1,24 +1,27 @@
 # 更新日志
 
-## 0.5.0（开发中）
+## 0.5.0
 
-- 新增环境检查 `autoswitch.mjs check`（对 Codex 说“检查 ModelTrace 环境”即可）：只读地按顺序检查 Node、sqlite3、Codex 登录、hooks 信任、CCSwitch 代理模式、主渠道（是否仍是那张卡、是否为默认卡、故障转移是否关闭）、网关版本与运行状态、普通入口接入和可切换渠道，每项给出“通过 / 待完成 / 未通过”和修法，`next` 指向第一件要做的事。新用户安装后先跑一次，就知道还差哪几步。
-- 安装简化：Codex CLI 0.163+ 可以直接从 GitHub 添加插件市场，安装只需 `codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch` 和 `codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch` 两条命令，升级用 `codex plugin marketplace upgrade modeltrace-autoswitch`（已在隔离的 CODEX_HOME 里实测安装与升级）。源码安装保留给开发，文档注明本地插件市场会在 Codex 重启时同步目录当时的文件。
-- 新增开场渠道提示：会话打开或恢复时，同步启动 hook 直接向用户显示一行，说明本会话走哪个渠道、指纹监测是否开启，以及开启方法（对 Codex 说“开启指纹监测”）。没经过插件网关的会话（例如 CCSwitch 改写了 Codex 配置、或在接入前创建的旧会话）会说明实际去向，如 CCSwitch 当前卡或 OpenAI 官方个人订阅，避免在不知情时消耗个人额度。提示只描述路由类型和渠道名，不输出 URL、网关凭证或登录信息；上下文压缩不重复提示；语言跟随 `MODELTRACE_LANG`、POSIX locale 或 macOS 首选语言。
-- 技能可由“开启指纹监测”“enable fingerprint monitoring”等说法触发，原有“使用 modeltrace-guard-autoswitch”继续有效。
-- 异常时列出全部渠道：新增 `guard.mjs candidates`，实时读取 CCSwitch 中所有 Codex 配置，可选的按“推荐备用、主渠道、官方、其他”编号，写明切换后停止还是继续监测，以及这张卡最近一次的抽查结果（读本地记录）；未加入 CCSwitch 聚合、绑定其他 ChatGPT 账号、官方卡带登录快照、主渠道不再是默认卡或开着故障转移等不可选的卡也会列出并说明原因。列出时把编号绑定到卡的身份（ID + 配置指纹）。
+- **默认渠道跟随 CCSwitch，不再配置主渠道**：新会话第一次请求时取 CCSwitch 当时选中的默认卡，此后这个会话固定用这张卡，直到用户在对话里切换；在 CCSwitch 里换默认卡只影响之后的新会话，已经开始的会话不会被中途换掉。`configure` 的 `--primary-name` / `--primary-provider` 和安装助手的 `--primary-name` 已移除，`configure` 只保存可选的推荐备用（不能是只能经 CCSwitch 默认路由使用的默认卡）。需要 CCSwitch 处于代理模式（路由或聚合）：直连模式会在换卡时改写 Codex 配置、绕开网关。
+- **配置升级到 schema 3**：0.5 之前的配置（固定主渠道）读取时报告 `config_outdated`；再次 `connect`（对 Codex 说“重新接入 ModelTrace”）会先确认 CCSwitch 有默认卡，再停止旧网关、按原 CCSwitch 目录和端口生成新配置，保留网关访问凭证（Codex 的入口地址不变）和仍可用的推荐备用。升级前打开的会话属于旧配置，需要新开会话。没有配置时 `connect` 会自动创建，新用户只需说“接入 ModelTrace”。
+- **第三方渠道由网关直连，不再需要 CCSwitch 聚合**：会话走 CCSwitch 里按 key 计费、使用 Responses API 的卡时，网关每次请求都从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，按 Codex 自己的方式直接发往该地址。原生 ChatGPT 登录、账号和其他凭据类请求头不会发给中转；key 只在内存中使用，不写日志、回执或状态；中转的重定向一律拦下；卡的身份摘要（含配置）变了就拒绝转发，新开会话即可用上改过的卡。直连保留 Codex 原生请求头，只认官方客户端的中转不会再因 Stack 清理请求头而 403（10-20 实测 API2 经 Stack 36 次全部 403）。Codex 的模型列表请求跟随 CCSwitch 默认卡。
+- 不能直连的卡（如需要 CCSwitch 转换格式）和 GitHub Copilot、xAI OAuth 这类由 CCSwitch 管登录的卡：是 CCSwitch 默认卡时经 CCSwitch 的普通默认路由，转发前校验它仍是默认卡、自动故障转移已关闭，漂移即拒绝，不悄悄改走别的卡；CCSwitch 默认卡换掉后，这类会话停止转发，需换回或新开会话。由 CCSwitch 管登录的卡不是默认卡时经聚合（Stack），需要加入聚合；只支持 Chat Completions、从环境变量取 key 或读环境变量请求头的卡在清单里标为不可选并说明原因。
+- **对话里切换不再要求先开启监测**：说「切到 渠道 B」时，没有路由策略的会话会获得一个只用于切换的策略，监测保持关闭；切换照旧先向目标发一次探针，回执完整、指纹相符才切。开着监测的会话切到第三方后继续监测，切到 Official 后停止，之后切回第三方时恢复；用户没开或关掉的监测，切到哪里都不会自己打开。“开启指纹监测”在切换过或停过监测的会话上会在当前渠道重新开启（Official 除外）。
+- 新增开场渠道提示：会话打开或恢复时，同步启动 hook 直接向用户显示一行。新会话说明 CCSwitch 当前默认卡，恢复的会话说明它自己的卡（切换过的注明从哪张切来）以及新会话现在走哪张；同时说明指纹监测是否开启和开启方法。卡用不了时说明本会话会失败及原因：CCSwitch 没开代理模式、没选默认卡、只能经 CCSwitch 的卡遇到自动故障转移或默认卡变更、卡被改过或删掉、官方卡但 Codex 不是 ChatGPT 登录。没经过插件网关的会话（例如 CCSwitch 改写了 Codex 配置、或在接入前创建的旧会话）会说明实际去向，如 CCSwitch 当前卡或 OpenAI 官方个人订阅，避免在不知情时消耗个人额度。提示只描述路由类型和渠道名，不输出 URL、网关凭证、key 或登录信息；上下文压缩不重复提示；语言跟随 `MODELTRACE_LANG`、POSIX locale 或 macOS 首选语言。
+- 新增环境检查 `autoswitch.mjs check`（对 Codex 说“检查 ModelTrace 环境”即可）：只读地按顺序检查 Node、sqlite3、Codex 登录、hooks 信任、CCSwitch 数据与代理模式、CCSwitch 默认卡（新会话能否用上它，只能经 CCSwitch 的默认卡还检查自动故障转移）、插件配置、网关版本与运行状态、普通入口接入和可用渠道，每项给出“通过 / 待完成 / 未通过”和修法，`next` 指向第一件要做的事。`gateway-status` 新增 `newConversations`，说明新会话能否开始；`use` 在它不可用时返回 `gateway_not_ready`，而不是让用户新开会话。
+- 异常时列出全部渠道：新增 `guard.mjs candidates`，实时读取 CCSwitch 中所有 Codex 配置，可选的按“推荐备用、本会话开始时的卡、CCSwitch 当前默认卡、官方、其他”编号，写明切换后停止还是继续监测，以及这张卡最近一次的抽查结果（读本地记录）；不可选的卡也会列出并说明原因。列出时把编号绑定到卡的身份（ID + 配置指纹）。
 - 新增 `guard.mjs choose --request ID --pick N`（或 `--target-name`）：用户回复编号或渠道名后，一步完成选定、记录同意并开始验证，取代“propose 生成新 ID 再 approve”的两步。同意规则不变：必须是报告之后的那条回复、一条回复只用于一次决定；卡在列出后被改过会拒绝并要求重新列出；验证失败后可重新列出、在新请求下重新选择。`propose-switch` / `approve-switch` 保留。
-- 备用改为可选：`configure` 和安装助手只要求主渠道，备用只是清单里的推荐项（单说“同意”时指它）。
-- 修复：备用卡在 CCSwitch 里被改动或删除后，网关会拒绝所有请求，连主渠道也无法使用；现在只校验主渠道，备用在被选中时才重新核对身份。
-- **第三方渠道改为网关直连，不再需要 CCSwitch 聚合**：切到 CCSwitch 里按 key 计费的普通渠道时，网关每次请求都从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，按 Codex 自己的方式直接发往该地址。原生 ChatGPT 登录、账号和其他凭据类请求头不会发给中转；key 只在内存中使用，不写日志、回执或状态；中转的重定向一律拦下；卡的身份摘要（含配置）变了就拒绝转发，需重新选择。直连保留 Codex 原生请求头，只认官方客户端的中转不会再因 Stack 清理请求头而 403（10-20 实测 API2 经 Stack 36 次全部 403）。
-- **主渠道也改为直连，CCSwitch 只当渠道目录**：新配置的主渠道只要能直连就保存为直连，新会话的请求和 Codex 的模型列表请求都直接发往主渠道自己的地址；CCSwitch 不再需要开代理模式、把主渠道设为默认卡或关闭故障转移（在 CCSwitch 里换默认卡也不会再让 Codex 报错）。不能直连的主渠道（如需要 CCSwitch 转换格式、由 CCSwitch 管登录）自动保留 CCSwitch 默认路由及其要求。0.5 之前保存的主渠道配置保持原来的 CCSwitch 路由，重新 configure 后才改为直连（配置 ID 会变，之前的会话需要新开）；切回主渠道时沿用配置时选定的路由。没有 CCSwitch 代理端口时也能完成配置（`upstream` 为空），此时只有 CCSwitch 路由不可用。
-- **不再强制 ChatGPT 登录**：接入、开启监测和切换到中转只要求 Codex 已登录（ChatGPT、ChatGPT tokens 或 API key），因为经 CCSwitch 的路由会替换原生凭据、直连中转根本收不到它；只有切到 OpenAI 官方需要 ChatGPT 登录，否则在同意前拒绝且不消耗用户的回复，候选清单也会把官方标为不可选。没有 OpenAI 账号的用户可以用 `codex login --with-api-key` 登录任意 key。
-- 环境检查按主渠道的路由判断：主渠道直连时不再要求 CCSwitch 代理、默认卡和故障转移；候选清单对需要 CCSwitch 的卡在其代理关闭时标明原因。
-- 由 CCSwitch 管登录的卡（GitHub Copilot、xAI OAuth 等）网关无法直连，仍经 Stack 交给 CCSwitch，需要加入聚合；只支持 Chat Completions、从环境变量取 key 或读环境变量请求头的卡不能直连，在清单里标为不可选并说明原因。
-- CCSwitch 不再必须开启聚合模式；主渠道不再需要是 Stack 成员（之前保存的主渠道 Stack 键不影响身份校验）。
+- **不再强制 ChatGPT 登录**：接入、开启监测和切换到中转只要求 Codex 已登录（ChatGPT、ChatGPT tokens 或 API key），因为经 CCSwitch 的路由会替换原生凭据、直连中转根本收不到它；只有用 OpenAI 官方需要 ChatGPT 登录，否则在同意前拒绝且不消耗用户的回复，候选清单也会把官方标为不可选。没有 OpenAI 账号的用户可以用 `codex login --with-api-key` 登录任意 key。
+- 安装简化：Codex CLI 0.163+ 可以直接从 GitHub 添加插件市场，安装只需 `codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch` 和 `codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch` 两条命令，升级用 `codex plugin marketplace upgrade modeltrace-autoswitch`（已在隔离的 CODEX_HOME 里实测安装与升级）。源码安装保留给开发，文档注明本地插件市场会在 Codex 重启时同步目录当时的文件。
+- 技能可由“开启指纹监测”“enable fingerprint monitoring”等说法触发，原有“使用 modeltrace-guard-autoswitch”继续有效。
+- 只改推荐备用时保留配置 ID：网关运行中也可以改，已打开的会话不受影响；改端口或 CCSwitch 目录才会生成新配置 ID。
+- 对话内切换的边界：没有策略的会话只在全部检查通过后才创建切换策略，被拒的切换不留下任何状态；用 `guard start` 开着独立监测的会话需先停掉它；会话模型不在指纹库时直接拒绝（目标无法验证），不浪费探针。没开监测的会话切换成功后，Codex 收到的说明是“监测保持关闭”，候选清单上的“切换后是否监测”也与实际一致。
+- 独立监测（`guard start`）的网关会话，探针绑定到会话自己的卡，不会因 CCSwitch 默认卡变更而测到别的卡。
+- 异常进行中执行 disable、恢复任务再“开启指纹监测”后，之后的异常会照常询问是否切换。
+- 修复：推荐备用卡在 CCSwitch 里被改动或删除后，网关会拒绝所有请求；现在备用只在被选中时才核对身份。
 - 新增依赖：随插件附带 smol-toml 1.9.1 的解析模块（BSD-3-Clause，`scripts/vendor/smol-toml/`），用于读取卡里的 config.toml，避免把 key 发往错误的地址。
 - 直连不猜目的地：卡里没写 `model_provider` 也没有显式 `openai_base_url`、通过 Codex profile 选渠道、`base_url` 不是字符串或带 `?`/`#` 的卡都不能直连；卡不能覆盖 `content-type`、`accept-encoding`、`expect` 等由网关负责的请求头；本机中转不能指向网关自己或 CCSwitch 的监听端口。直连中转与 Official 一样，遇到明确的 `invalid_encrypted_content` 拒绝时只去掉被拒的推理内容重试一次。
-- 升级注意：网关实现版本升至 0.5.0，升级后需重启插件网关（`gateway-stop` 再 `gateway-start`）。升级前已经切到第三方渠道（经 Stack）的会话保持原路由，可以照常切换；之后新选的普通渠道一律直连。
+- 升级注意：网关实现版本升至 0.5.0。升级后开场提示会说明配置需要更新，并给出终端里的 `connect` 命令；`connect` 先检查 CCSwitch 默认卡、登录和 hook 信任，全部通过才停旧网关、更新配置并启动新网关（也可以对 Codex 说“重新接入 ModelTrace”，但这个会话会随之断开）。配置过期期间 `gateway-stop` 能停掉旧网关，`gateway-start` 和 `configure` 会拒绝，避免旧网关成为占着端口的孤儿进程。之前打开的会话需要新开。
 
 ## 0.4.3
 
