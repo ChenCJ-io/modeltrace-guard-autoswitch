@@ -52,7 +52,7 @@
 
 | 依赖 | 要求 |
 | --- | --- |
-| Codex CLI | 支持插件和 hooks 的版本，并在 Codex 中使用原生 ChatGPT 登录 |
+| Codex CLI | 支持插件和 hooks 的版本，并且已登录：ChatGPT 账号或 API key 都可以，只有切到 OpenAI 官方需要 ChatGPT 登录。没有 OpenAI 账号时，可以用 `codex login --with-api-key` 登录任意一个 key（比如中转的 key）：它只发给本机网关，网关转发时会换成渠道卡自己的 key |
 | CCSwitch | 4.0.15，里面有你的 Codex 渠道卡即可。只有用到 Copilot、xAI 这类由 CCSwitch 管登录的卡（要开代理模式并加入聚合），或主渠道不能直连时，才需要 CCSwitch 的代理 |
 | Node.js | 推荐 24.5+；22.x 需 ≥ 22.21；25+ 也支持（需要 zstd 和原生 `proxyEnv`）。版本不够时网关会拒绝启动并说明原因 |
 | sqlite3 | 命令行版本，且支持 `sha3()`（用于只读检查 CCSwitch 配置） |
@@ -234,7 +234,7 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 ## 安全与隐私
 
 - 网关只监听 `127.0.0.1`，会校验 Host 和 Origin。网关 URL 中带有访问凭证，请不要公开。
-- 网关会接收 Codex 的认证头（你的 ChatGPT 登录），但只转发给本机 CCSwitch（经 CCSwitch 的路由）或固定的 OpenAI 官方地址，从不发给直连的中转。插件不解析、不保存登录 token。
+- 网关会接收 Codex 的认证头（你的 ChatGPT 登录或 API key），但只转发给本机 CCSwitch（经 CCSwitch 的路由）或固定的 OpenAI 官方地址，从不发给直连的中转。插件不解析、不保存登录 token。
 - **直连会读取所选那张卡的 key**：会话走某个直连渠道（包括直连的主渠道）时，网关每次请求都从 CCSwitch 只读取出这张卡的 `base_url`、key 和自定义请求头，只发往这张卡自己的地址；key 只在内存里用，不写日志、回执或状态文件，也不输出。卡在 CCSwitch 里被改过（换了 key 或地址），之前的同意即失效，需要重新选择。
 - 中转返回的重定向一律拦下，不会让 Codex 带着任何凭据跟随跳转；`base_url` 只接受 https（本机地址可用 http）。
 - 检查 CCSwitch 配置时只使用只读 SQL，不修改数据库。

@@ -17,7 +17,7 @@ import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegrat
 import { createOfficialNetwork, officialNetworkStatus, writeNetworkSetting } from './network-route.mjs';
 import { directRouteConnection } from './direct-route.mjs';
 import {
-  UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
+  NATIVE_LOGINS, UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch, officialLogin,
   loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady, verifyGatewayRoute,
 } from './provider-config.mjs';
 import {
@@ -217,7 +217,8 @@ export async function runAutoSwitch(args, env = process.env, {
     const client = await openClient(env, { nativeOpenai: true });
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
-      if (account?.type !== 'chatgpt') throw new Error('This native Codex process did not read a ChatGPT login. Check the active Codex home/provider; do not infer that the user has never signed in');
+      // Any native login works for relay routes; only Official needs ChatGPT.
+      if (!NATIVE_LOGINS.includes(account?.type)) throw new Error('This native Codex process did not read a login. Sign in with `codex login` (ChatGPT, needed only for OpenAI Official, or an API key); check the active Codex home/provider and do not infer that the user has never signed in');
       const { requireTrustedStartupHook } = await import('./startup.mjs');
       await requireTrustedStartupHook(client, process.cwd());
     } finally { await client.close(); }
@@ -266,7 +267,8 @@ export async function runAutoSwitch(args, env = process.env, {
     const client = await openClient(env, { nativeOpenai: true });
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
-      if (account?.type !== 'chatgpt') throw new Error('Sign into the native Codex client with ChatGPT before launch');
+      if (!NATIVE_LOGINS.includes(account?.type)) throw new Error('Sign into the native Codex client before launch');
+      if (provider.transport === 'official' && !officialLogin(account.type)) throw new Error('OpenAI Official needs Codex signed in with ChatGPT before launch');
     } finally { await client.close(); }
     await startGateway(directory);
     // Recheck the chosen descriptor after runtime preparation. Neither a

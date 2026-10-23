@@ -13,6 +13,11 @@ export const SQLITE_BUSY_TIMEOUT_MS = 3000;
 export const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const KEY = /^[a-z0-9][a-z0-9-]{0,23}$/;
 export const configPath = directory => path.join(directory, 'gateway-config.json');
+// Any native Codex login works for CCSwitch and direct routes: CCSwitch replaces
+// the native credential and a direct relay never receives it. Only the Official
+// route passes the native login through, so it needs a ChatGPT login.
+export const NATIVE_LOGINS = Object.freeze(['chatgpt', 'chatgptAuthTokens', 'apiKey']);
+export const officialLogin = type => type === 'chatgpt';
 export const runtimePath = directory => path.join(directory, 'gateway-runtime.json');
 
 export async function atomicJSON(filename, value) {

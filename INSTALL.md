@@ -78,7 +78,7 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs check
 
 安装完成后，在兼容 Codex CLI 的 `/hooks` 中由用户审阅并信任插件。v0.4 增加同步 `SessionStart` 启动 hook，旧版信任不保证覆盖新定义；不要替用户执行信任修改。加载新插件后，由技能处理后续 setup 或“使用 modeltrace-guard-autoswitch”请求，不再让用户手输专用启动器。
 
-CCSwitch 4.0.15 里有用户的 Codex 渠道卡即可：能直连的主渠道和其他普通渠道都不需要 CCSwitch 的代理、默认卡或故障转移设置，也不需要加入 Stack。只有主渠道不能直连（例如需要 CCSwitch 转换格式），或用到 Copilot、xAI 这类由 CCSwitch 管登录的卡时，才需要开代理模式（路由或聚合）；前者还要把主渠道设为默认卡并关闭自动故障转移，后者要加入聚合。保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。接入要求当前 Codex home 的原生 ChatGPT 登录与 `openai` 契约；Official 目标还须没有 managed account 或存储的登录快照。
+CCSwitch 4.0.15 里有用户的 Codex 渠道卡即可：能直连的主渠道和其他普通渠道都不需要 CCSwitch 的代理、默认卡或故障转移设置，也不需要加入 Stack。只有主渠道不能直连（例如需要 CCSwitch 转换格式），或用到 Copilot、xAI 这类由 CCSwitch 管登录的卡时，才需要开代理模式（路由或聚合）；前者还要把主渠道设为默认卡并关闭自动故障转移，后者要加入聚合。保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。接入要求当前 Codex home 已登录并使用 `openai` 契约：ChatGPT 账号或 API key 都可以（没有 OpenAI 账号时可用 `codex login --with-api-key` 登录任意 key，网关转发时会换成渠道卡自己的 key）；只有 Official 目标需要 ChatGPT 登录，且须没有 managed account 或存储的登录快照。
 
 备用为 Official 且本机需要代理才能访问 `chatgpt.com` 时，接入后执行 `node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs network` 确认 `gateway.reachable` 为 `true`。默认 `auto` 会自动使用网关进程的 `HTTPS_PROXY` 或系统 HTTPS 代理；只有用户明确给出代理地址时，才执行 `network --official-proxy http://HOST:PORT`。
 

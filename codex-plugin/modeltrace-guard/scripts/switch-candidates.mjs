@@ -25,6 +25,7 @@ const HINTS = {
   primary_default_changed: "This primary uses CCSwitch's default route, and CCSwitch's default card is no longer the primary; make it CCSwitch's default card first.",
   primary_changed: 'The primary card changed in CCSwitch; choose the primary again before switching back to it.',
   ccswitch_proxy_off: "This card needs CCSwitch's local proxy for Codex; turn on Routing or Aggregation mode in CC Switch.",
+  official_needs_chatgpt_login: 'OpenAI Official uses the current Codex login, which is not a ChatGPT login; sign in with ChatGPT (codex login) to use it.',
   ccswitch_failover_enabled: 'Turn off CCSwitch automatic failover before switching back to the primary.',
   invalid_card: 'The card has no usable name or identity in CCSwitch.',
 };
@@ -34,7 +35,7 @@ const displayName = value => (typeof value === 'string' && value.trim() && value
 // Every CCSwitch Codex card as a possible target for one conversation. Selectable
 // cards are numbered: the recommended backup, the primary, Official, then the
 // rest in CCSwitch order. Entries carry identity only, never credentials.
-export function listCandidates(layout, config, current, history = new Map(), directProblems = new Map()) {
+export function listCandidates(layout, config, current, history = new Map(), directProblems = new Map(), login = null) {
   const entries = [];
   for (const row of layout.providers || []) {
     if (typeof row?.id !== 'string' || !row.id) continue;
@@ -48,6 +49,7 @@ export function listCandidates(layout, config, current, history = new Map(), dir
     // A third-party card is reached directly; its saved configuration must be usable.
     if (!reason && descriptor.transport === 'direct' && directProblems.has(row.id)) reason = directProblems.get(row.id);
     if (current && row.id === current.id) reason = 'current_route';
+    else if (!reason && descriptor.transport === 'official' && login && login !== 'chatgpt') reason = 'official_needs_chatgpt_login';
     else if (!reason && descriptor.transport === 'ccswitch' && !(layout.mode === 'proxy' && layout.attached && !layout.pending)) reason = 'ccswitch_proxy_off';
     else if (!reason && row.id === config.primary.id && descriptor.transport === 'ccswitch') {
       if (layout.defaultProvider !== config.primary.id) reason = 'primary_default_changed';
@@ -98,7 +100,8 @@ export async function listSwitchCandidates(directory, session, requestId = null)
   const current = state?.autoSwitch?.current || state?.initialRoute?.provider || config.primary;
   // Only whether each card is usable leaves this read; keys stay in this process.
   const problems = new Map([...await readDirectCards(config.ccSwitchDirectory)].filter(([, card]) => card.problem).map(([id, card]) => [id, card.problem]));
-  const entries = listCandidates(layout, config, current, await providerHistory(directory), problems);
+  // The login recorded when monitoring was enabled; approval checks the live one.
+  const entries = listCandidates(layout, config, current, await providerHistory(directory), problems, state?.autoSwitch?.accountType ?? null);
   if (requestId) await recordCandidates(directory, session, requestId, entries);
   return { requestId, current: { id: current.id, name: current.name, kind: current.transport === 'official' ? 'official' : 'third_party' },
     candidates: entries.map(publicEntry), keepCurrent: { number: 0, name: current.name },

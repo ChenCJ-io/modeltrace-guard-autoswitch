@@ -4,7 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { openAppServer } from './app-server-client.mjs';
 import { nativeIntegrationStatus } from './native-integration.mjs';
-import { assertProviderCurrent, inspectCCSwitch, loadGatewayConfig } from './provider-config.mjs';
+import { NATIVE_LOGINS, assertProviderCurrent, inspectCCSwitch, loadGatewayConfig } from './provider-config.mjs';
 import { readDirectCards } from './direct-route.mjs';
 import { listCandidates } from './switch-candidates.mjs';
 import { gatewayRuntimeProblem } from './switch-gateway.mjs';
@@ -33,6 +33,7 @@ export async function checkEnvironment(directory, env = process.env, {
   loadConfig = loadGatewayConfig, integration = nativeIntegrationStatus, readCards = readDirectCards, trustCheck = requireTrustedStartupHook,
 } = {}) {
   const checks = [];
+  let login = null;
   const runtime = runtimeProblem(nodeVersion);
   checks.push(runtime ? item('node', 'fail', runtime, 'Install Node.js 24.5+ (or 22.21+ on the 22 line) and make it the node that Codex hooks run') : item('node', 'ok', `Node.js ${nodeVersion}`));
   const sqliteIssue = await sqlite();
@@ -46,8 +47,11 @@ export async function checkEnvironment(directory, env = process.env, {
       checks.push(item('codex', 'ok', 'Codex CLI responds'));
       let account = null;
       try { ({ account } = await client.request('account/read', { refreshToken: false })); } catch {}
-      checks.push(account?.type === 'chatgpt' ? item('login', 'ok', 'Codex is signed in with ChatGPT')
-        : item('login', 'fail', account?.type ? `Codex is signed in with ${account.type}; this version needs a ChatGPT login` : 'Codex is not signed in', 'Run `codex login` and sign in with your ChatGPT account'));
+      login = account?.type ?? null;
+      checks.push(login === 'chatgpt' ? item('login', 'ok', 'Codex is signed in with ChatGPT')
+        : NATIVE_LOGINS.includes(login) ? item('login', 'ok', `Codex is signed in (${login}); relays work, but OpenAI Official needs a ChatGPT login`)
+          : item('login', 'fail', login ? `Codex login type ${login} is not supported` : 'Codex is not signed in',
+            'Run `codex login`: sign in with ChatGPT (needed only for OpenAI Official), or pipe any API key to `codex login --with-api-key`; the gateway replaces it on every relay route'));
       try { await trustCheck(client, cwd); checks.push(item('hooks', 'ok', 'ModelTrace hooks are trusted')); }
       catch { checks.push(item('hooks', 'todo', 'ModelTrace hooks are not trusted yet', 'In Codex, open /hooks, review ModelTrace Guard Autoswitch and trust it')); }
     } finally { await client.close().catch(() => {}); }
@@ -116,7 +120,7 @@ export async function checkEnvironment(directory, env = process.env, {
   if (layout && config) {
     const problems = new Map();
     try { for (const [id, card] of await readCards(ccDir)) if (card.problem) problems.set(id, card.problem); } catch {}
-    const entries = listCandidates({ ...layout, primaryId: config.primary.id }, config, config.primary, new Map(), problems);
+    const entries = listCandidates({ ...layout, primaryId: config.primary.id }, config, config.primary, new Map(), problems, login);
     const selectable = entries.filter(entry => entry.selectable).map(entry => entry.name);
     const unavailable = entries.filter(entry => !entry.selectable && entry.reason !== 'current_route').map(entry => `${entry.name ?? '?'} (${entry.reason})`);
     checks.push(item('routes', selectable.length ? 'ok' : 'todo', `Switch targets: ${selectable.join(', ') || 'none'}${unavailable.length ? `; unavailable: ${unavailable.join(', ')}` : ''}`,

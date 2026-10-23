@@ -582,3 +582,14 @@ test('a directly connected primary is monitored and an incident can move the thr
   await f.request(f.sibling);
   assert.equal(f.upstreamRequests.at(-1).route, 'relay', 'new conversations still start on the direct primary');
 });
+
+test('with an API-key login Official is refused without spending the reply, and a relay can still be chosen', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  await f.acknowledge(); await f.reply();
+  const apiKey = { accountType: 'apiKey', modelProvider: 'openai', model: halted.model };
+  await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
+  await assert.rejects(chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { pick: 1 }, apiKey), { code: 'OFFICIAL_NEEDS_CHATGPT_LOGIN' });
+  const chosen = await chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { name: 'Relay' }, apiKey);
+  assert.equal(chosen.status, 'verifying'); assert.equal(chosen.target.transport, 'direct');
+  await assert.rejects(chooseSwitchTarget(f.directory, f.session, chosen.id, { pick: 1 }, { ...apiKey, accountType: null }), /login\/model settings changed|pending or settled failed/);
+});

@@ -34,7 +34,7 @@ connect 的数据目录必须与普通启动一致，不能仅用命令行 `--da
 
 名称先完全匹配，未命中时允许唯一的不区分大小写匹配；重名时从 `inspect` 选 ID，使用 `configure --primary-provider ID --backup-provider ID`，不能混用 name/ID。配置须在网关停止时更新；新配置 ID 不会自动迁移旧路由会话。
 
-接入要求当前 Codex home 的原生 ChatGPT 登录和 `openai` 契约。认证检查为自己的 app-server 进程显式选用 `openai`，避免 CCSwitch 全局 `custom` 配置掩盖原生认证状态，不会代为登录。若返回 `account: null`，核对这个进程的 home/provider 与原生登录；不推断用户从未登录，不复制另一配置的凭据。
+接入要求当前 Codex home 已登录（ChatGPT、ChatGPT tokens 或 API key 均可；只有切到 Official 需要 ChatGPT 登录）并使用 `openai` 契约。认证检查为自己的 app-server 进程显式选用 `openai`，避免 CCSwitch 全局 `custom` 配置掩盖原生认证状态，不会代为登录。若返回 `account: null`，核对这个进程的 home/provider 与原生登录；不推断用户从未登录，不复制另一配置的凭据。
 
 同步 `SessionStart` hook 的 `startup.mjs` 在本插件拥有且有效的接入配置就绪时保证网关启动，不启用监测、不改默认值、不自动修复 CCSwitch 漂移。会话打开或恢复时（上下文压缩不算），它还会直接向用户显示一行渠道提示：本会话走哪个渠道、监测是否开启以及开启方法；没经过网关的会话会说明实际去向（CCSwitch 当前卡、OpenAI 官方个人订阅等），不输出任何 URL 或凭证。新会话的提示是首个请求将获得的路由，实际路由仍以网关回执为准。`gateway-start` 单独启动服务，不等于接入默认入口。`connection-status` 说明未来新会话的配置；当前请求渠道要看对应 thread 的成功回执，账号或额度 UI 不是路由证据。
 

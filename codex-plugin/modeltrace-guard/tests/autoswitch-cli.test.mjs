@@ -246,11 +246,15 @@ test('launch defaults to primary and passes explicit valid Stack or Official cho
   assert.equal(native.children.length, 3);
 });
 
-test('launch rejects non-native authentication and provider changes before spawning the client', async t => {
-  const f = await fixture(t), apiKey = await nativeFixture(f.directory, { accountType: 'apiKey' });
-  await assert.rejects(runAutoSwitch(['launch', '--data-dir', f.directory], f.env, apiKey.runtime), /ChatGPT/);
-  assert.equal(apiKey.children.length, 0); assert.equal(apiKey.closed.length, 1);
+test('launch rejects a missing login, Official without ChatGPT, and provider changes before spawning the client', async t => {
+  const f = await fixture(t), signedOut = await nativeFixture(f.directory, { accountType: null });
+  await assert.rejects(runAutoSwitch(['launch', '--data-dir', f.directory], f.env, signedOut.runtime), /Sign into the native Codex client/);
+  assert.equal(signedOut.children.length, 0); assert.equal(signedOut.closed.length, 1);
   assert.equal((await f.invoke('gateway-status')).running, false);
+  // An API-key login works for relay routes, but cannot stand in for the ChatGPT login Official passes through.
+  const apiKey = await nativeFixture(f.directory, { accountType: 'apiKey' });
+  await assert.rejects(runAutoSwitch(['launch', '--data-dir', f.directory, '--provider-name', 'OpenAI Official'], f.env, apiKey.runtime), /ChatGPT/);
+  assert.equal(apiKey.children.length, 0);
   const drift = await nativeFixture(f.directory, { onAccountRead: () => f.sql(`UPDATE providers SET settings_config='{"auth":{"OPENAI_API_KEY":"fixture-change"},"config":""}' WHERE id='other';`) });
   await assert.rejects(runAutoSwitch(['launch', '--data-dir', f.directory, '--provider-name', 'Doro'], f.env, drift.runtime), /configuration changed/);
   assert.equal(drift.children.length, 0);

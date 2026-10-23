@@ -130,3 +130,11 @@ test('switching back to a directly connected primary keeps its configured route 
   const edited = listCandidates(layout({ providers: layout().providers.map(p => (p.id === 'company' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) }), direct, official);
   assert.equal(edited.find(entry => entry.id === 'company').reason, 'primary_changed');
 });
+
+test('without a ChatGPT login Official is listed as unavailable, with how to fix it', () => {
+  const entries = listCandidates(layout(), config, primary, new Map(), new Map(), 'apiKey');
+  const officialEntry = entries.find(entry => entry.id === 'official');
+  assert.equal(officialEntry.reason, 'official_needs_chatgpt_login'); assert.equal(officialEntry.selectable, false);
+  assert.equal(entries.find(entry => entry.name === 'API2').number, 1);
+  assert.equal(listCandidates(layout(), config, primary, new Map(), new Map(), null).find(entry => entry.id === 'official').selectable, true, 'an unknown login does not hide Official; approval checks the live login');
+});

@@ -12,6 +12,7 @@
 - 修复：备用卡在 CCSwitch 里被改动或删除后，网关会拒绝所有请求，连主渠道也无法使用；现在只校验主渠道，备用在被选中时才重新核对身份。
 - **第三方渠道改为网关直连，不再需要 CCSwitch 聚合**：切到 CCSwitch 里按 key 计费的普通渠道时，网关每次请求都从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，按 Codex 自己的方式直接发往该地址。原生 ChatGPT 登录、账号和其他凭据类请求头不会发给中转；key 只在内存中使用，不写日志、回执或状态；中转的重定向一律拦下；卡的身份摘要（含配置）变了就拒绝转发，需重新选择。直连保留 Codex 原生请求头，只认官方客户端的中转不会再因 Stack 清理请求头而 403（10-20 实测 API2 经 Stack 36 次全部 403）。
 - **主渠道也改为直连，CCSwitch 只当渠道目录**：新配置的主渠道只要能直连就保存为直连，新会话的请求和 Codex 的模型列表请求都直接发往主渠道自己的地址；CCSwitch 不再需要开代理模式、把主渠道设为默认卡或关闭故障转移（在 CCSwitch 里换默认卡也不会再让 Codex 报错）。不能直连的主渠道（如需要 CCSwitch 转换格式、由 CCSwitch 管登录）自动保留 CCSwitch 默认路由及其要求。0.5 之前保存的主渠道配置保持原来的 CCSwitch 路由，重新 configure 后才改为直连（配置 ID 会变，之前的会话需要新开）；切回主渠道时沿用配置时选定的路由。没有 CCSwitch 代理端口时也能完成配置（`upstream` 为空），此时只有 CCSwitch 路由不可用。
+- **不再强制 ChatGPT 登录**：接入、开启监测和切换到中转只要求 Codex 已登录（ChatGPT、ChatGPT tokens 或 API key），因为经 CCSwitch 的路由会替换原生凭据、直连中转根本收不到它；只有切到 OpenAI 官方需要 ChatGPT 登录，否则在同意前拒绝且不消耗用户的回复，候选清单也会把官方标为不可选。没有 OpenAI 账号的用户可以用 `codex login --with-api-key` 登录任意 key。
 - 环境检查按主渠道的路由判断：主渠道直连时不再要求 CCSwitch 代理、默认卡和故障转移；候选清单对需要 CCSwitch 的卡在其代理关闭时标明原因。
 - 由 CCSwitch 管登录的卡（GitHub Copilot、xAI OAuth 等）网关无法直连，仍经 Stack 交给 CCSwitch，需要加入聚合；只支持 Chat Completions、从环境变量取 key 或读环境变量请求头的卡不能直连，在清单里标为不可选并说明原因。
 - CCSwitch 不再必须开启聚合模式；主渠道不再需要是 Stack 成员（之前保存的主渠道 Stack 键不影响身份校验）。

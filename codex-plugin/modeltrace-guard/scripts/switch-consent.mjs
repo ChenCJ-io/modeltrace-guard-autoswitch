@@ -4,8 +4,8 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { drainingRelay } from './stream-relay.mjs';
 import { consumeUserReply, digest, isMismatch, readState, record, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
-import { UUID, asConfiguredPrimary, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
-  readJSON, resolveProvider, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
+import { NATIVE_LOGINS, UUID, asConfiguredPrimary, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
+  officialLogin, readJSON, resolveProvider, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
 const live = state => Boolean(state?.enabled && !state.runtimePaused && !state.compacting && !state.runtimeEndedAt);
 const consentPolicy = state => state?.autoSwitch?.protocol === 3 && state.autoSwitch.approvalMode === 'per_incident';
@@ -64,6 +64,18 @@ const checkedRoute = (config, layout, provider, revision, extra) => {
   return route;
 };
 
+// The thread still runs the same native model through openai, signed in; an
+// Official target also needs the ChatGPT login it passes through. Checked
+// before the user's reply is consumed, so a refusal leaves it unused.
+function assertReadiness(readiness, state, target, action) {
+  if (!NATIVE_LOGINS.includes(readiness?.accountType) || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
+    throw new Error(`Native login/model settings changed; ${action}`);
+  }
+  if (target?.transport === 'official' && !officialLogin(readiness.accountType)) {
+    throw Object.assign(new Error('OpenAI Official needs Codex signed in with ChatGPT (codex login); nothing was approved'), { code: 'OFFICIAL_NEEDS_CHATGPT_LOGIN' });
+  }
+}
+
 function currentRequest(state, id, { allowFailed = false } = {}) {
   const p = state.autoSwitch, r = state.switchRequest;
   if (!consentPolicy(state) || !p.enabled || !r || r.id !== id || !(unresolved(r) || (allowFailed && r.status === 'failed'))
@@ -120,8 +132,8 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
 }
 
 export async function enableAutoSwitch(directory, session, { accountType, modelProvider, model }, now = Date.now()) {
-  if (!UUID.test(session) || accountType !== 'chatgpt' || modelProvider !== 'openai' || !model) {
-    throw new Error('Approval-based switching requires a native ChatGPT-authenticated openai thread started through the gateway');
+  if (!UUID.test(session) || !NATIVE_LOGINS.includes(accountType) || modelProvider !== 'openai' || !model) {
+    throw new Error('Approval-based switching requires a signed-in native openai thread started through the gateway');
   }
   const config = await loadGatewayConfig(directory);
   verifyRouteLayout(config, await verifyGatewayReady(directory, config));
@@ -139,7 +151,7 @@ export async function enableAutoSwitch(directory, session, { accountType, modelP
     state.enabled = true; state.startedAt ||= now; state.enabledAt = now; state.runtimePaused = false;
     state.runtimeEndedAt = null; state.monitoringStoppedReason = null;
     segment(state, now, 'approval_monitor_enabled');
-    state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, policyId: randomUUID(), configId: config.id,
+    state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, policyId: randomUUID(), configId: config.id, accountType,
       primary: config.primary, backup: config.backup, current: config.primary, phase: 'armed', route: 'source', revision: 1,
       enabledAt: now, attempts: 0, noticePending: false };
     record(state, 'approval_monitor_enabled', now, { policyId: state.autoSwitch.policyId, primary: config.primary.id, backup: config.backup?.id ?? null });
@@ -205,9 +217,7 @@ export async function approveSwitch(directory, session, id, targetId, readiness,
       || state.pending || state.probeRun || state.alerts.some(a => !a.acknowledgedAt)) {
       throw new Error('Switch approval requires the live pending request, its exact target, and reported alerts');
     }
-    if (readiness?.accountType !== 'chatgpt' || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
-      throw new Error('Native login/model settings changed; approval cannot start verification');
-    }
+    assertReadiness(readiness, state, r.target, 'approval cannot start verification');
     assertProviderCurrent(layout, r.source); assertProviderCurrent(layout, r.target);
     consumeUserReply(state, 'Switch approval');
     r.approval = { id: randomUUID(), requestId: r.id, haltId: r.haltId, providerId: r.target.id, fingerprint: r.target.fingerprint,
@@ -298,9 +308,7 @@ export async function chooseSwitchTarget(directory, session, id, selection, read
     if (sameProvider(target, old.source) || target.id === old.source.id) throw new Error('Choose a different provider from the current route');
     // Returning to the primary needs its default card and disabled failover.
     verifyRouteLayout(config, layout, routeFor(config, target, state.autoSwitch.revision + 1));
-    if (readiness?.accountType !== 'chatgpt' || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
-      throw new Error('Native login/model settings changed; approval cannot start verification');
-    }
+    assertReadiness(readiness, state, target, 'approval cannot start verification');
     consumeUserReply(state, 'Switch approval');
     let r = old;
     if (old.status !== 'pending' || !sameProvider(target, old.target)) {
@@ -344,9 +352,7 @@ export async function requestManualSwitch(directory, session, selection, readine
     }
     if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before switching');
     if (sameProvider(target, p.current)) throw new Error(`This thread already uses ${JSON.stringify(target.name)}`);
-    if (readiness?.accountType !== 'chatgpt' || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
-      throw new Error('Native login/model settings changed; the switch cannot start verification');
-    }
+    assertReadiness(readiness, state, target, 'the switch cannot start verification');
     assertProviderCurrent(layout, p.current); assertProviderCurrent(layout, target);
     // Returning to the primary needs its default card and disabled failover.
     verifyRouteLayout(config, layout, routeFor(config, target, p.revision + 1));

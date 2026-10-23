@@ -55,7 +55,9 @@ test('CCSwitch drift, a stale gateway and a rewritten Codex config are reported 
     inspect: async () => layout({ mode: 'direct', defaultProvider: 'doro', listener: { listen_port: 15721, auto_failover_enabled: 1 } }),
     gatewayStatus: async () => ({ running: true, readiness: 'upgrade_required' }), integration: async () => ({ phase: 'conflict', readyForNewThreads: false }) });
   const by = id => result.checks.find(check => check.id === id);
-  assert.equal(by('login').status, 'fail'); assert.match(by('login').fix, /codex login/);
+  assert.equal(by('login').status, 'ok'); assert.match(by('login').summary, /OpenAI Official needs a ChatGPT login/);
+  assert.doesNotMatch(by('routes').summary, /Switch targets: [^;]*OpenAI Official/, 'Official is not a target without a ChatGPT login');
+  assert.match(by('routes').summary, /OpenAI Official \(official_needs_chatgpt_login\)/);
   assert.equal(by('ccswitch_proxy').status, 'fail'); assert.match(by('ccswitch_proxy').fix, /Routing or Aggregation/);
   assert.equal(by('primary_default').status, 'fail'); assert.match(by('primary_default').fix, /API2 copy/);
   assert.equal(by('failover').status, 'fail');
@@ -80,4 +82,11 @@ test('a directly connected primary needs no CCSwitch proxy, default card or fail
   assert.equal(by('ccswitch_proxy').status, 'ok'); assert.match(by('ccswitch_proxy').summary, /not needed/);
   assert.match(by('primary').summary, /connects directly/);
   assert.equal(by('primary_default'), undefined); assert.equal(by('failover'), undefined);
+});
+
+test('without any Codex login the check says how to sign in, including the API-key option', async () => {
+  const result = await checkEnvironment('/data', {}, { ...healthy, openClient: client(null) });
+  const login = result.checks.find(check => check.id === 'login');
+  assert.equal(login.status, 'fail'); assert.match(login.fix, /codex login --with-api-key/);
+  assert.equal(result.ready, false);
 });
