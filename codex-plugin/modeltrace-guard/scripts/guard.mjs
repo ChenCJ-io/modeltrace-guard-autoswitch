@@ -452,9 +452,18 @@ export async function run(args, env = process.env, receipt = null) {
         return { accountType: account?.type, modelProvider: settings.provider, model: settings.model };
       } finally { await client.close(); }
     };
-    // An unreachable Official target would only burn this consent on a canary
-    // that cannot run. Check egress first, before the user's reply is consumed.
+    // An unreachable Official target or an unusable relay card would only burn
+    // this consent on a canary that cannot run. Check before the reply is used.
     const requireReachable = async (target) => {
+      if (target?.transport === 'direct') {
+        const { loadGatewayConfig } = await import('./provider-config.mjs');
+        const { readDirectCards } = await import('./direct-route.mjs');
+        const config = await loadGatewayConfig(directory);
+        const card = (await readDirectCards(config.ccSwitchDirectory, { id: target.id })).get(target.id);
+        if (!card || card.fingerprint !== target.fingerprint) throw new Error('The selected card changed in CCSwitch; list the candidates again. Nothing was approved');
+        if (card.problem) throw Object.assign(new Error(`This card cannot be reached directly (${card.problem}); nothing was approved`), { code: 'DIRECT_CARD_UNUSABLE' });
+        return;
+      }
       if (target?.transport !== 'official') return;
       const { requireOfficialReachable } = await import('./network-route.mjs');
       await requireOfficialReachable(directory);

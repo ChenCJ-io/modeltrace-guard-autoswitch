@@ -16,6 +16,7 @@ import {
   readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayRoute,
 } from '../scripts/switch-policy.mjs';
 import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
+import { createDirectTransport, directRouteConnection } from '../scripts/direct-route.mjs';
 
 // These arrays are deliberately synthetic classifier fixtures. They validate
 // orchestration, never model identity. All HTTP requests terminate at a local
@@ -47,7 +48,7 @@ async function fixture(t) {
   const originalHistory = [{ id: 'original-turn', status: 'completed', goal: 'Keep the original task unchanged' }];
   const historyBefore = structuredClone(originalHistory);
   const fallbackStarted = deferred(), releaseFallback = deferred();
-  let holdFallback = false, fallbackValue = 7, clientsClosed = 0, gateway, config, officialDown = false, lateEof = false, nativeClose = false, sourceValue = 1;
+  let holdFallback = false, fallbackValue = 7, relayValue = 7, clientsClosed = 0, gateway, config, officialDown = false, lateEof = false, nativeClose = false, sourceValue = 1;
   const closed = createServer();
   await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
   const deadPort = closed.address().port;
@@ -56,7 +57,8 @@ async function fixture(t) {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw), threadId = req.headers['thread-id'];
-    const route = req.url.startsWith('/backend-api/codex/') ? 'fallback' : 'source';
+    // A direct relay is recognised by the card key it must carry instead of the native login.
+    const route = req.url.startsWith('/backend-api/codex/') ? 'fallback' : req.headers.authorization === 'Bearer relay-fixture-key' ? 'relay' : 'source';
     assert.equal(body.model, expected.model, 'primary and Official retain the native model ID');
     upstreamRequests.push({ threadId, route, model: body.model });
     if (route === 'fallback' && holdFallback) {
@@ -64,7 +66,7 @@ async function fixture(t) {
       await releaseFallback.promise;
     }
     if (res.destroyed) return;
-    const text = sampleText(counts.get(threadId) || 300, route === 'source' ? sourceValue : fallbackValue);
+    const text = sampleText(counts.get(threadId) || 300, route === 'source' ? sourceValue : route === 'relay' ? relayValue : fallbackValue);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     const completed = `data: ${JSON.stringify({ type: 'response.completed', response: {
       status: 'completed', model: body.model,
@@ -93,7 +95,8 @@ async function fixture(t) {
     CREATE TABLE providers(id TEXT,name TEXT,category TEXT,app_type TEXT,settings_config TEXT,meta TEXT);
     INSERT INTO providers VALUES
       ('fixture-api2','API2',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-fixture-only"},"config":""}',NULL),
-      ('fixture-official','Official','official','codex','{"auth":{},"config":""}',NULL);
+      ('fixture-official','Official','official','codex','{"auth":{},"config":""}',NULL),
+      ('fixture-relay','Relay',NULL,'codex','${JSON.stringify({ auth: {}, config: 'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.fixture.invalid/v1"\nwire_api = "responses"\nexperimental_bearer_token = "relay-fixture-key"\n' })}',NULL);
     CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
     INSERT INTO proxy_config VALUES('codex','127.0.0.1',${upstreamPort},0);
   `]);
@@ -107,6 +110,12 @@ async function fixture(t) {
       assert.equal(target.origin, 'https://chatgpt.com');
       return httpRequest(`http://127.0.0.1:${officialDown ? deadPort : upstreamPort}${target.pathname}`, { method, headers, agent: false }, callback);
     },
+    resolveDirect: route => directRouteConnection(directory, route),
+    directTransport: createDirectTransport({ resolveEgress: async () => ({ mode: 'auto', source: 'direct', proxy: null, proxyEnv: {} }),
+      httpsRequestImpl: (target, { method, headers }, callback) => {
+        assert.equal(target.href, 'https://relay.fixture.invalid/v1/responses');
+        return httpRequest(`http://127.0.0.1:${upstreamPort}/v1/responses`, { method, headers, agent: false }, callback);
+      } }),
     onReceipt: async receipt => {
       // Exercise the real race: response completion precedes receipt publication.
       await delay(25);
@@ -217,7 +226,7 @@ async function fixture(t) {
   return { directory, session, sibling, state, background, acknowledge, reply, approve, reachHalt, request, manualSwitch,
     bases, forks, nativeCalls, upstreamRequests, originalHistory, historyBefore, clientsClosed: () => clientsClosed,
     holdFallback() { holdFallback = true; }, fallbackStarted: fallbackStarted.promise,
-    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; }, officialUnreachable() { officialDown = true; }, officialLateEof() { lateEof = true; nativeClose = true; }, primaryRecovered() { sourceValue = 7; } };
+    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; }, mismatchRelay() { relayValue = 1; }, officialUnreachable() { officialDown = true; }, officialLateEof() { lateEof = true; nativeClose = true; }, primaryRecovered() { sourceValue = 7; } };
 }
 
 test('first mismatch asks, acknowledgement spends no backup quota, and explicit consent verifies and switches this thread', async t => {
@@ -472,16 +481,16 @@ test('an incident lists every route and one listed answer selects, approves and 
   assert.match(acknowledged.controlContext, / candidates /);
   const listed = await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
   assert.deepEqual(listed.candidates.map(e => [e.number, e.name, e.selectable, e.reason, e.recommended, e.monitoringAfterSwitch]),
-    [[1, 'Official', true, null, true, 'stops'], [null, 'API2', false, 'current_route', false, 'continues']]);
+    [[1, 'Official', true, null, true, 'stops'], [2, 'Relay', true, null, false, 'continues'], [null, 'API2', false, 'current_route', false, 'continues']]);
   assert.deepEqual(listed.keepCurrent, { number: 0, name: 'API2' });
-  assert.equal(listed.candidates[1].lastCheck.prediction, halted.samples.at(-1).prediction, 'the current route shows its mismatching check');
+  assert.equal(listed.candidates.find(e => e.name === 'API2').lastCheck.prediction, halted.samples.at(-1).prediction, 'the current route shows its mismatching check');
   assert.ok(!JSON.stringify(listed).includes('synthetic-fixture-only'), 'listing never reads credentials');
-  assert.deepEqual((await f.state()).switchRequest.candidates.entries.map(e => [e.number, e.id]), [[1, 'fixture-official']]);
+  assert.deepEqual((await f.state()).switchRequest.candidates.entries.map(e => [e.number, e.id]), [[1, 'fixture-official'], [2, 'fixture-relay']]);
   const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model };
   const choose = selection => chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, selection, readiness);
   await assert.rejects(choose({ pick: 1 }), /user's reply/, 'the agent cannot choose within its own turn');
   await f.reply();
-  await assert.rejects(choose({ pick: 2 }), /not listed/);
+  await assert.rejects(choose({ pick: 3 }), /not listed/);
   await assert.rejects(choose({ name: 'API2' }), /different provider/);
   await assert.rejects(chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { pick: 1 }, { ...readiness, model: 'other' }), /settings changed/);
   const chosen = await choose({ pick: 1 });
@@ -512,5 +521,43 @@ test('after a failed verification a fresh list and a new answer start a new requ
   assert.notEqual(again.id, failed.id);
   assert.equal(again.status, 'verifying');
   assert.notEqual(again.approval.id, failed.approval.id);
-  assert.deepEqual(again.candidates.entries.map(e => e.id), ['fixture-official']);
+  assert.deepEqual(again.candidates.entries.map(e => e.id), ['fixture-official', 'fixture-relay']);
+});
+
+test('choosing a key-based third-party card connects to it directly and keeps monitoring after the switch', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  await f.acknowledge();
+  const listed = await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
+  const relay = listed.candidates.find(entry => entry.name === 'Relay');
+  assert.deepEqual([relay.number, relay.selectable, relay.kind, relay.monitoringAfterSwitch], [2, true, 'third_party', 'continues']);
+  assert.ok(!JSON.stringify(listed).includes('relay-fixture-key'), 'listing never returns a card key');
+  await f.reply();
+  const chosen = await chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { pick: 2 },
+    { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model });
+  assert.notEqual(chosen.id, halted.switchRequest.id, 'a different target than the proposal gets a new request');
+  assert.equal(chosen.target.transport, 'direct');
+  await f.background();
+  const result = await waitForSwitch(f.directory, f.session, chosen.id, { timeoutMs: 3000, pollMs: 5 });
+  assert.equal(result.agentAction, 'autoswitch_verified');
+  const current = await f.state();
+  assert.equal(current.autoSwitch.current.id, 'fixture-relay'); assert.equal(current.autoSwitch.current.transport, 'direct');
+  assert.equal(current.enabled, true, 'monitoring continues on a third-party relay');
+  assert.equal(f.upstreamRequests.filter(row => row.route === 'relay').length, 1, 'one verification probe went to the relay');
+  await f.request(f.session); await f.request(f.sibling);
+  assert.deepEqual(f.upstreamRequests.slice(-2).map(row => row.route), ['relay', 'source'], 'only this conversation moved');
+});
+
+test('a relay still serving another model fails verification and keeps the current route and pause', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  f.mismatchRelay();
+  await f.acknowledge();
+  await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
+  await f.reply();
+  const chosen = await chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { name: 'Relay' },
+    { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model });
+  await f.background();
+  await waitForSwitch(f.directory, f.session, chosen.id, { timeoutMs: 0 });
+  const current = await f.state();
+  assert.equal(current.autoSwitch.phase, 'failed'); assert.equal(current.autoSwitch.current.id, 'fixture-api2');
+  assert.equal(current.taskHalt.id, halted.taskHalt.id);
 });

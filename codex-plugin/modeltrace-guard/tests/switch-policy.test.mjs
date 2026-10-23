@@ -122,7 +122,7 @@ test('primary resolution rejects default drift and CCSwitch failover before any 
   const official = await resolveSessionRoute(f.directory, f.config, randomUUID(), fallbackId);
   assert.equal(official.transport, 'official'); assert.equal(official.ccswitchMode, null);
   const alternate = await resolveSessionRoute(f.directory, f.config, randomUUID(), alternateId);
-  assert.equal(alternate.ccswitchMode, 'stack'); assert.equal(alternate.providerId, alternateId);
+  assert.equal(alternate.transport, 'direct'); assert.equal(alternate.ccswitchMode, null); assert.equal(alternate.providerId, alternateId);
 });
 
 test('only a valid current-route mismatch can request consent, including a clearly labelled weak disagreement', () => {

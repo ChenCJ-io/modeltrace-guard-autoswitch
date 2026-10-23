@@ -57,7 +57,7 @@ test('inspection returns only identity metadata and flags, leaves storage unchan
   const beforeDB = await readFile(f.db), beforeLive = await readFile(path.join(f.directory, 'live-state.json'));
   const layout = await f.inspect();
   for (const row of layout.providers) {
-    assert.deepEqual(Object.keys(row), ['id', 'name', 'category', 'fingerprint', 'nativeOfficial', 'followsNativeLogin', 'managedCodexAccount']);
+    assert.deepEqual(Object.keys(row), ['id', 'name', 'category', 'fingerprint', 'nativeOfficial', 'followsNativeLogin', 'managedCodexAccount', 'delegatedAuth']);
     assert.match(row.fingerprint, /^[a-f0-9]{64}$/i);
   }
   const output = JSON.stringify(layout);
@@ -124,8 +124,9 @@ test('schema 2 config preserves the company default and exposes stable primary a
   const thirdPartyBackup = await configureGateway(f.directory, {
     primaryName: 'API2copy', backupName: 'Other Relay', ccSwitchDirectory: f.directory,
   });
-  assert.equal(thirdPartyBackup.backup.transport, 'ccswitch');
-  assert.equal(thirdPartyBackup.backup.key, 'other');
+  // An ordinary third-party card is a direct relay, even when it is also a Stack member.
+  assert.equal(thirdPartyBackup.backup.transport, 'direct');
+  assert.equal(thirdPartyBackup.backup.key, null);
 });
 
 test('primary readiness fails closed on default drift, enabled or unknown failover, without changing configuration', async t => {
@@ -277,4 +278,16 @@ test('inspection waits out CCSwitch\'s brief commit lock instead of failing the 
   assert.ok(Date.now() - started >= 500, 'the read waited for the lock');
   assert.ok(layout.providers.some(row => row.id === 'company'));
   await exited;
+});
+
+test('a pre-0.5 Stack route to a card that is now direct keeps working until the user switches it', () => {
+  const fingerprint = 'a'.repeat(64);
+  const layout = { primaryId: 'company', defaultProvider: 'company', stack: { enabled: true, members: ['company', 'relay'], keys: { company: 'company', relay: 'relay' } },
+    providers: [{ id: 'company', name: 'Company', category: null, fingerprint: 'b'.repeat(64), nativeOfficial: 0, followsNativeLogin: 0, managedCodexAccount: 0, delegatedAuth: 0 },
+      { id: 'relay', name: 'Relay', category: null, fingerprint, nativeOfficial: 0, followsNativeLogin: 0, managedCodexAccount: 0, delegatedAuth: 0 }] };
+  assert.equal(describeProvider(layout, 'relay').transport, 'direct');
+  const legacy = { id: 'relay', name: 'Relay', fingerprint, transport: 'ccswitch', key: 'relay' };
+  assertProviderCurrent(layout, legacy);
+  assert.throws(() => assertProviderCurrent(layout, { ...legacy, fingerprint: 'c'.repeat(64) }), /fresh consent/, 'an edited card still needs a new choice');
+  assert.throws(() => assertProviderCurrent(layout, { ...legacy, transport: 'official', key: null }), /fresh consent/);
 });

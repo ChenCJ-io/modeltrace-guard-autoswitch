@@ -8,6 +8,12 @@
 - 新增 `guard.mjs choose --request ID --pick N`（或 `--target-name`）：用户回复编号或渠道名后，一步完成选定、记录同意并开始验证，取代“propose 生成新 ID 再 approve”的两步。同意规则不变：必须是报告之后的那条回复、一条回复只用于一次决定；卡在列出后被改过会拒绝并要求重新列出；验证失败后可重新列出、在新请求下重新选择。`propose-switch` / `approve-switch` 保留。
 - 备用改为可选：`configure` 和安装助手只要求主渠道，备用只是清单里的推荐项（单说“同意”时指它）。
 - 修复：备用卡在 CCSwitch 里被改动或删除后，网关会拒绝所有请求，连主渠道也无法使用；现在只校验主渠道，备用在被选中时才重新核对身份。
+- **第三方渠道改为网关直连，不再需要 CCSwitch 聚合**：切到 CCSwitch 里按 key 计费的普通渠道时，网关每次请求都从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，按 Codex 自己的方式直接发往该地址。原生 ChatGPT 登录、账号和其他凭据类请求头不会发给中转；key 只在内存中使用，不写日志、回执或状态；中转的重定向一律拦下；卡的身份摘要（含配置）变了就拒绝转发，需重新选择。直连保留 Codex 原生请求头，只认官方客户端的中转不会再因 Stack 清理请求头而 403（10-20 实测 API2 经 Stack 36 次全部 403）。
+- 由 CCSwitch 管登录的卡（GitHub Copilot、xAI OAuth 等）网关无法直连，仍经 Stack 交给 CCSwitch，需要加入聚合；只支持 Chat Completions、从环境变量取 key 或读环境变量请求头的卡不能直连，在清单里标为不可选并说明原因。
+- CCSwitch 不再必须开启聚合模式；主渠道不再需要是 Stack 成员（之前保存的主渠道 Stack 键不影响身份校验）。
+- 新增依赖：随插件附带 smol-toml 1.9.1 的解析模块（BSD-3-Clause，`scripts/vendor/smol-toml/`），用于读取卡里的 config.toml，避免把 key 发往错误的地址。
+- 直连不猜目的地：卡里没写 `model_provider` 也没有显式 `openai_base_url`、通过 Codex profile 选渠道、`base_url` 不是字符串或带 `?`/`#` 的卡都不能直连；卡不能覆盖 `content-type`、`accept-encoding`、`expect` 等由网关负责的请求头；本机中转不能指向网关自己或 CCSwitch 的监听端口。直连中转与 Official 一样，遇到明确的 `invalid_encrypted_content` 拒绝时只去掉被拒的推理内容重试一次。
+- 升级注意：网关实现版本升至 0.5.0，升级后需重启插件网关（`gateway-stop` 再 `gateway-start`）。升级前已经切到第三方渠道（经 Stack）的会话保持原路由，可以照常切换；之后新选的普通渠道一律直连。
 
 ## 0.4.3
 

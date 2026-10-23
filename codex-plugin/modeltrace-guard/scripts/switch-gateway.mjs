@@ -5,9 +5,10 @@ import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 import * as zlib from 'node:zlib';
 import { createOfficialTransport, encryptedReasoningRetryBody, redactProxyURL, transportErrorCode } from './official-transport.mjs';
+import { createDirectTransport } from './direct-route.mjs';
 
 // A healthy old daemon is not evidence that newly installed forwarding code is running.
-export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.3';
+export const GATEWAY_IMPLEMENTATION_VERSION = '0.5.0';
 
 // Codex sends zstd request bodies and the Official route needs native proxyEnv.
 // Without both, every ordinary request would fail after Codex is pointed here,
@@ -352,10 +353,13 @@ function terminalObserver(contentType, encoding) {
   };
 }
 
-function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official, endpoint, body } = {}) {
+// `remote` is the Official transport or a bound direct relay; without it the
+// request goes to the local CCSwitch listener.
+function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { remote, endpoint, body } = {}) {
   return new Promise((resolve) => {
     let upstream, incoming, observer, ended = false, settled = false, blockedRedirect = false, statusCode = 502, transportError = null;
-    const route = official?.route?.();
+    const route = remote?.route?.();
+    const service = remote ? remote.label || 'Official transport' : 'CCSwitch';
     const finish = (completed) => {
       if (settled) return;
       settled = true;
@@ -374,14 +378,13 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
       if (settled || blockedRedirect) return;
       transportError ||= transportErrorCode(error);
       // Re-resolve egress on the next request: the proxy may have changed.
-      official?.failed?.();
+      remote?.failed?.();
       if (res.headersSent) { res.destroy(); finish(false); }
       else {
         if (statusCode !== 504) statusCode = 502;
         res.once('finish', () => finish(false));
-        const service = official ? 'Official transport' : 'CCSwitch';
         // Error code and redacted egress only; the client (Codex) surfaces this text.
-        const detail = official ? ` (${transportError}; network ${route?.source || 'unknown'}: ${route?.proxy ? redactProxyURL(route.proxy) : 'direct'})` : ` (${transportError})`;
+        const detail = remote ? ` (${transportError}; network ${route?.source || 'unknown'}: ${route?.proxy ? redactProxyURL(route.proxy) : 'direct'})` : ` (${transportError})`;
         jsonError(req, res, statusCode, (statusCode === 504 ? `${service} request timed out` : `${service} is unavailable`) + detail);
       }
     };
@@ -403,18 +406,18 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
       if (payload) headers['content-length'] = String(payload.length);
       const received = (response) => {
         incoming = response; statusCode = response.statusCode || 502;
-        if (official && statusCode >= 300 && statusCode < 400) {
+        if (remote && statusCode >= 300 && statusCode < 400) {
           // Native clients may follow a proxy's Location themselves. Do not let
           // a remote redirect move native Authorization outside the fixed origin.
           blockedRedirect = true; statusCode = 502;
           response.on('error', () => {});
           res.once('finish', () => finish(false));
-          jsonError(req, res, 502, 'Official redirects are not allowed');
+          jsonError(req, res, 502, `${remote.label || 'Official'} redirects are not allowed`);
           response.destroy();
           return;
         }
         const encoding = String(response.headers['content-encoding'] || 'identity').toLowerCase();
-        if (!official || retried || statusCode !== 400 || encoding !== 'identity'
+        if (!remote || remote.retriesEncryptedReasoning === false || retried || statusCode !== 400 || encoding !== 'identity'
             || !/^application\/json(?:\s*;|$)/i.test(response.headers['content-type'] || '')) { forward(response); return; }
         // Only a complete, bounded JSON rejection is inspected before sending
         // headers. Large, compressed, partial, and ordinary errors are not retried.
@@ -439,7 +442,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
       try {
         // The local query never changes the destination/path. Official requests
         // ignore that local URL completely and construct their fixed HTTPS target.
-        upstream = official ? official.request(endpoint, { method: req.method, headers }, received)
+        upstream = remote ? remote.request(endpoint, { method: req.method, headers }, received)
           : httpRequest(target, { method: req.method, headers, agent, path: `${target.pathname}${query}` }, received);
       } catch (error) { transportFailed(error); return; }
       const outgoing = upstream;
@@ -457,10 +460,12 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
 }
 
 /**
- * Session-scoped, capability-protected Responses bridge to CCSwitch Stack.
- * `url` is a provider base URL ending in /<token>/v1. No auth.json or OAuth flow
- * is involved; Authorization goes only to numeric loopback CCSwitch or, for an
- * explicitly resolved official route, the fixed TLS-verified ChatGPT endpoint.
+ * Session-scoped, capability-protected Responses bridge for one primary CCSwitch
+ * route, Official and direct relays. `url` is a provider base URL ending in
+ * /<token>/v1. No auth.json or OAuth flow is involved; the native Authorization
+ * goes only to numeric loopback CCSwitch or, for an explicitly resolved official
+ * route, the fixed TLS-verified ChatGPT endpoint. A direct relay never receives
+ * it: the request carries the consented card's own key and headers instead.
  * An optional /<token>/provider/<encodedProviderId>/v1 prefix supplies an initial
  * provider hint to the resolver; it never determines a remote URL or overrides
  * an existing route. Model listing always uses the local CCSwitch endpoint.
@@ -483,7 +488,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
 export async function startSwitchGateway({
   upstream, token, port = 0, resolveRoute, verifyReady, onReceipt = async () => {},
   instanceId = randomUUID(), onShutdown = async () => {},
-  officialRequestImpl, officialNetwork = null,
+  officialRequestImpl, officialNetwork = null, resolveDirect = null, directTransport = null,
   maxBodyBytes = 32 * 1024 * 1024, bodyTimeoutMs = 30_000, upstreamTimeoutMs = 600_000, maxTrackedThreads = 4096,
 } = {}) {
   const base = upstreamUrl(upstream);
@@ -496,6 +501,7 @@ export async function startSwitchGateway({
   const capability = Buffer.from(token), threads = new Map(), sockets = new Set(), receipts = new Set(), handlers = new Set();
   const agent = new Agent({ keepAlive: true });
   let closing = false, origin, closed, shutdownRequested = false, officialTransport;
+  const relays = directTransport || createDirectTransport();
   const openOfficial = () => createOfficialTransport({ requestImpl: officialRequestImpl, network: officialNetwork });
   const officialNetworkStatus = async () => {
     let transport;
@@ -569,19 +575,21 @@ export async function startSwitchGateway({
       let route;
       try { route = await resolveRoute(normalizedThread, initialProviderId); } catch { throw failure(503, 'Session routing is unavailable'); }
       if (!route || !['source', 'fallback'].includes(route.route) || !Number.isSafeInteger(route.revision) || route.revision < 0
-          || (route.transport != null && !['ccswitch', 'official'].includes(route.transport))
+          || (route.transport != null && !['ccswitch', 'official', 'direct'].includes(route.transport))
           || (route.ccswitchMode != null && (!['default', 'stack'].includes(route.ccswitchMode) || route.transport !== 'ccswitch'))
           || (route.ccswitchMode === 'default' && (route.route !== 'source' || !route.providerId))
           || (route.providerId != null && (typeof route.providerId !== 'string' || !route.providerId || route.providerId.length > 512 || /[\x00-\x1f\x7f]/.test(route.providerId)))
-          || ((route.transport === 'ccswitch' || (route.transport == null && route.route === 'source')) && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
+          || (route.transport === 'direct' && (!route.providerId || typeof route.providerFingerprint !== 'string' || route.sourceKey != null || route.ccswitchMode != null))
+          // A Stack (non-default) CCSwitch route needs its explicit member selector.
+          || ((route.transport === 'ccswitch' || route.transport == null) && route.ccswitchMode !== 'default' && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
           || (route.sourceKey != null && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
           || ROUTE_RECEIPT_FIELDS.some((field) => route[field] != null && !(Number.isSafeInteger(route[field])
             || (typeof route[field] === 'string' && route[field].length <= 512 && !/[\x00-\x1f\x7f]/.test(route[field]))))) throw failure(503, 'Session route is invalid');
       // Saved selectors remain part of provider identity. Only an explicit,
       // independently verified primary default route bypasses Stack rewriting.
       route = Object.freeze({ route: route.route, transport: route.transport || 'ccswitch', providerId: route.providerId ?? null,
-        sourceKey: route.transport === 'official' ? null : route.sourceKey ?? null, revision: route.revision,
-        ccswitchMode: route.transport === 'official' ? null : route.ccswitchMode ?? (route.sourceKey ? 'stack' : null),
+        sourceKey: route.transport === 'ccswitch' ? route.sourceKey ?? null : null, revision: route.revision,
+        ccswitchMode: route.transport === 'ccswitch' ? route.ccswitchMode ?? (route.sourceKey ? 'stack' : null) : null,
         ...Object.fromEntries(ROUTE_RECEIPT_FIELDS.map((field) => [field, route[field] ?? null])) });
       receipt = { requestId: randomUUID(), threadId: normalizedThread, ...route, startedAt };
       try { if (await verifyReady(route) === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
@@ -592,13 +600,29 @@ export async function startSwitchGateway({
       threads.delete(normalizedThread); threads.set(normalizedThread, context);
       if (threads.size > maxTrackedThreads) threads.delete(threads.keys().next().value);
       if (body.previous_response_id != null && !context.established) throw failure(409, 'Route continuity is unknown or changed; resend complete input without previous_response_id');
-      const forwarded = route.transport === 'ccswitch' && route.sourceKey && route.ccswitchMode !== 'default'
+      // The primary keeps its ordinary default route; a card whose login CCSwitch
+      // manages uses its explicit Stack selector; any other card is a direct relay.
+      const forwarded = route.transport === 'ccswitch' && route.sourceKey && route.ccswitchMode === 'stack'
         ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
+      let remote;
       // Unsupported official environments never prevent the default company
       // gateway from starting. Selection still belongs entirely to the resolver.
-      if (route.transport === 'official') { officialTransport ||= openOfficial(); await officialTransport.prepare(); }
-      const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), forwarded, agent, upstreamTimeoutMs, '',
-        route.transport === 'official' ? { official: officialTransport, endpoint: path, body } : undefined);
+      if (route.transport === 'official') { officialTransport ||= openOfficial(); await officialTransport.prepare(); remote = officialTransport; }
+      if (route.transport === 'direct') {
+        let connection;
+        // Re-read the card for each request; it must still be the consented one.
+        try { if (typeof resolveDirect !== 'function') throw new Error(); connection = await resolveDirect(route); }
+        catch { throw failure(503, 'The selected relay card is unavailable or changed; switch again'); }
+        // A loopback relay must be neither this gateway nor CCSwitch's listener,
+        // which would silently serve its own default card under this card's name.
+        if (connection.baseURL.protocol === 'http:' && [Number(new URL(origin).port), Number(base.port)].includes(Number(connection.baseURL.port || 80))) {
+          throw failure(503, 'A relay cannot point at this gateway or at CCSwitch');
+        }
+        try { remote = await relays.bind(connection); }
+        catch { throw failure(503, 'Relay transport is unavailable'); }
+      }
+      const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), remote ? bytes : forwarded, agent, upstreamTimeoutMs, '',
+        remote ? { remote, endpoint: path, body } : undefined);
       const success = outcome.completed && outcome.success && outcome.statusCode >= 200 && outcome.statusCode < 300;
       if (success && threads.get(normalizedThread) === context) context.established = true;
       emitReceipt({ ...receipt, ...outcome, success, finishedAt: Date.now() }); receipt = null;
@@ -636,6 +660,7 @@ export async function startSwitchGateway({
       for (const socket of sockets) socket.destroy();
       agent.destroy();
       officialTransport?.close();
+      relays.close();
     }).then(async () => {
       await Promise.allSettled([...handlers]);
       await Promise.allSettled([...receipts]);

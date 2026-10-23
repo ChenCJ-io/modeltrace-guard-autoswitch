@@ -11,6 +11,11 @@ const TOKEN = 'synthetic-capability-123456789';
 const AUTH = 'Bearer synthetic-official-oauth';
 const DONE = 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","model":"upstream-original-model"}}\n\n';
 const defaultBody = { model: 'gpt-example', stream: true, input: [{ role: 'user', content: 'synthetic input' }] };
+const RELAY_KEY = 'synthetic-relay-card-key';
+// The primary uses CCSwitch's default route; every other card is a direct relay.
+const primaryRoute = (extra = {}) => ({ route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0, ...extra });
+const relayRoute = (extra = {}) => ({ route: 'fallback', transport: 'direct', providerId: 'relay', providerFingerprint: 'f'.repeat(64), revision: 1, ...extra });
+const relayConnection = (base, extra = {}) => ({ baseURL: new URL(base), key: RELAY_KEY, headers: { 'x-relay-card': 'synthetic-card-header' }, query: [], ...extra });
 
 async function until(predicate, message = 'condition was not reached') {
   const end = Date.now() + 3000;
@@ -30,14 +35,21 @@ async function fixture(t, handle = (_req, res) => { res.writeHead(200, { 'conten
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const upstreamUrl = `http://127.0.0.1:${upstream.address().port}/v1`;
+  // A relay is a separate loopback server (never CCSwitch's own listener) that
+  // shares the handler and the received log.
+  const relay = createServer((req, res) => upstream.emit('request', req, res));
+  await new Promise((resolve) => relay.listen(0, '127.0.0.1', resolve));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}/v1`;
   const gateway = await startSwitchGateway({ upstream: upstreamUrl, token: TOKEN,
-    resolveRoute: async () => ({ route: 'source', sourceKey: 'API2', revision: 0 }),
+    resolveRoute: async () => primaryRoute(),
+    resolveDirect: async () => relayConnection(relayUrl),
     verifyReady: async () => { readyCalls++; }, onReceipt: async (receipt) => { receipts.push(receipt); }, ...options });
   t.after(async () => {
     await gateway.close();
     await new Promise((resolve) => { upstream.close(resolve); upstream.closeAllConnections(); });
+    await new Promise((resolve) => { relay.close(resolve); relay.closeAllConnections(); });
   });
-  return { gateway, received, receipts, upstreamUrl, readyCalls: () => readyCalls };
+  return { gateway, received, receipts, upstreamUrl, relayUrl, readyCalls: () => readyCalls };
 }
 
 async function officialFixture(t, handle, options = {}) {
@@ -72,7 +84,7 @@ function send(gateway, { path = '/responses', rawPath, method = 'POST', thread =
   });
 }
 
-test('source forwarding changes only model, carries native authorization, and preserves SSE bytes', async (t) => {
+test('primary forwarding keeps the request, carries native authorization to local CCSwitch, and preserves SSE bytes', async (t) => {
   const sse = ': ping\r\nevent: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"中文 ✓ synthetic"}\r\n\r\n' + DONE;
   const f = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream', connection: 'x-private-hop, keep-alive', 'x-private-hop': 'omit', 'x-retained': 'yes' });
@@ -89,7 +101,7 @@ test('source forwarding changes only model, carries native authorization, and pr
   assert.equal(response.status, 200); assert.equal(response.body, sse);
   assert.equal(response.headers['x-private-hop'], undefined); assert.equal(response.headers['x-retained'], 'yes');
   assert.equal(f.received.length, 1); assert.equal(f.received[0].path, '/v1/responses');
-  assert.deepEqual(f.received[0].body, { ...body, model: 'ccs-API2/gpt-example' });
+  assert.deepEqual(f.received[0].body, body);
   assert.equal(f.received[0].headers.authorization, AUTH);
   assert.equal(f.received[0].headers['x-private-hop'], undefined);
   assert.equal(f.received[0].headers['accept-encoding'], 'identity');
@@ -101,7 +113,7 @@ test('source forwarding changes only model, carries native authorization, and pr
   assert.equal(receipt.route, 'source'); assert.equal(receipt.revision, 0); assert.equal(receipt.threadId, A);
   assert.equal(receipt.statusCode, 200); assert.equal(receipt.completed, true); assert.equal(receipt.success, true); assert.equal(receipt.responseEvent, 'response.completed');
   assert.match(receipt.requestId, /^[0-9a-f-]{36}$/); assert.equal(typeof receipt.startedAt, 'number'); assert.ok(receipt.finishedAt >= receipt.startedAt);
-  assert.equal(receipt.providerId, null); assert.equal(receipt.transport, 'ccswitch'); assert.equal(receipt.sourceKey, 'API2');
+  assert.equal(receipt.providerId, 'company'); assert.equal(receipt.transport, 'ccswitch'); assert.equal(receipt.sourceKey, 'API2'); assert.equal(receipt.ccswitchMode, 'default');
   assert.equal(receipt.providerFingerprint, null); assert.equal(receipt.proposalId, null); assert.equal(receipt.approvalId, null); assert.equal(receipt.challenge, null);
   assert.doesNotMatch(JSON.stringify(receipt), /synthetic|encrypted|Bearer|capability/);
 });
@@ -167,7 +179,7 @@ test('default route is rechecked immediately before forwarding and cannot be app
 test('client Stack selectors cannot redirect primary or backup requests or falsify route receipts', async t => {
   const routes = [
     { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0 },
-    { route: 'fallback', transport: 'ccswitch', ccswitchMode: 'stack', providerId: 'backup', sourceKey: 'BACKUP', revision: 1 },
+    relayRoute({ providerId: 'backup' }),
     { route: 'fallback', transport: 'official', providerId: 'official', revision: 1 },
   ];
   for (const route of routes) {
@@ -182,13 +194,14 @@ test('client Stack selectors cannot redirect primary or backup requests or falsi
 });
 
 test('switching one session preserves the other session and fallback body bytes', async (t) => {
-  const routes = new Map([[A, { route: 'source', sourceKey: 'API2', revision: 0 }], [B, { route: 'source', sourceKey: 'SECOND', revision: 4 }]]);
+  const routes = new Map([[A, primaryRoute()], [B, primaryRoute({ revision: 4 })]]);
   const f = await fixture(t, undefined, { resolveRoute: async (thread) => routes.get(thread) });
   await send(f.gateway); await send(f.gateway, { thread: B });
-  routes.set(A, { route: 'fallback', revision: 1 });
+  routes.set(A, relayRoute());
   const bytes = Buffer.from('{ "model" : "gpt-example", "input": "preserve whitespace", "metadata":{"value":9007199254740993} }');
   await send(f.gateway, { bytes }); await send(f.gateway, { thread: B });
-  assert.deepEqual(f.received.map(({ body }) => body.model), ['ccs-API2/gpt-example', 'ccs-SECOND/gpt-example', 'gpt-example', 'ccs-SECOND/gpt-example']);
+  assert.deepEqual(f.received.map(({ body }) => body.model), ['gpt-example', 'gpt-example', 'gpt-example', 'gpt-example']);
+  assert.deepEqual(f.received.map(({ headers }) => headers.authorization), [AUTH, AUTH, `Bearer ${RELAY_KEY}`, AUTH]);
   assert.deepEqual(f.received[2].bytes, bytes);
   await until(() => f.receipts.length === 4);
   assert.deepEqual(f.receipts.map(({ threadId, route, revision }) => [threadId, route, revision]), [[A, 'source', 0], [B, 'source', 4], [A, 'fallback', 1], [B, 'source', 4]]);
@@ -196,21 +209,21 @@ test('switching one session preserves the other session and fallback body bytes'
 });
 
 test('continuations retain all content within a revision and fail closed after a switch', async (t) => {
-  let route = { route: 'source', sourceKey: 'API2', revision: 0 };
+  let route = primaryRoute();
   const f = await fixture(t, undefined, { resolveRoute: async () => route });
   const continuation = { ...defaultBody, previous_response_id: 'resp-synthetic', input: [{ type: 'function_call_output', call_id: 'call-test', output: 'synthetic' }] };
   assert.equal((await send(f.gateway, { body: continuation })).status, 409);
   assert.equal(f.received.length, 0);
   await send(f.gateway);
   assert.equal((await send(f.gateway, { body: continuation })).status, 200);
-  assert.deepEqual(f.received[1].body, { ...continuation, model: 'ccs-API2/gpt-example' });
-  route = { route: 'fallback', revision: 1 };
+  assert.deepEqual(f.received[1].body, continuation);
+  route = relayRoute({ revision: 1 });
   assert.equal((await send(f.gateway, { body: continuation })).status, 409);
   assert.equal(f.received.length, 2);
   await send(f.gateway);
   assert.equal((await send(f.gateway, { body: continuation })).status, 200);
   assert.deepEqual(f.received[3].body, continuation);
-  route = { route: 'fallback', revision: 2 };
+  route = relayRoute({ revision: 2 });
   assert.equal((await send(f.gateway, { body: continuation })).status, 409);
   assert.equal(f.received.length, 4);
   assert.equal(f.readyCalls(), 7);
@@ -423,7 +436,7 @@ test('bounded gzip, deflate and available zstd decoding retain request content a
   for (const [encoding, encode] of encoders) {
     assert.equal((await send(f.gateway, { bytes: encode(Buffer.from(JSON.stringify(body))), headers: { 'content-encoding': encoding } })).status, 200);
     const last = f.received.at(-1);
-    assert.deepEqual(last.body, { ...body, model: 'ccs-API2/gpt-example' });
+    assert.deepEqual(last.body, body);
     assert.equal(last.headers['content-encoding'], undefined);
     assert.equal(Number(last.headers['content-length']), last.bytes.length);
   }
@@ -614,7 +627,7 @@ test('health and shutdown control only the capability-owned instance and never p
 test('a request pins its resolved route across asynchronous readiness checks', async (t) => {
   let ready;
   const gate = new Promise((resolve) => { ready = resolve; });
-  const route = { route: 'source', sourceKey: 'API2', revision: 5 };
+  const route = primaryRoute({ revision: 5 });
   let checking = false;
   const f = await fixture(t, undefined, { resolveRoute: async () => route, verifyReady: async () => { checking = true; await gate; } });
   const pending = send(f.gateway);
@@ -622,7 +635,7 @@ test('a request pins its resolved route across asynchronous readiness checks', a
   route.route = 'fallback'; route.revision = 6;
   ready();
   assert.equal((await pending).status, 200);
-  assert.equal(f.received[0].body.model, 'ccs-API2/gpt-example');
+  assert.equal(f.received[0].body.model, 'gpt-example');
   await until(() => f.receipts.length === 1);
   assert.equal(f.receipts[0].route, 'source'); assert.equal(f.receipts[0].revision, 5);
 });
@@ -649,22 +662,21 @@ test('incoming body timeout rejects a stalled upload without contacting upstream
   assert.equal(result, 408); assert.equal(f.received.length, 0);
 });
 
-test('primary uses the native CCSwitch default while approved third-party backup uses an explicit Stack selector', async (t) => {
+test('primary uses the native CCSwitch default while an approved third-party card is a direct relay', async (t) => {
   let route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 };
   const f = await fixture(t, undefined, { resolveRoute: async () => route });
   await send(f.gateway);
-  route = { route: 'fallback', transport: 'ccswitch', providerId: 'approved-backup', sourceKey: 'BACKUP', revision: 1,
-    providerFingerprint: 'f'.repeat(64), proposalId: 'proposal-test', approvalId: 'approval-test', challenge: 7 };
+  route = relayRoute({ providerId: 'approved-backup', revision: 1, proposalId: 'proposal-test', approvalId: 'approval-test', challenge: 7 });
   await send(f.gateway);
-  assert.deepEqual(f.received.map(({ body }) => body.model), ['gpt-example', 'ccs-BACKUP/gpt-example']);
+  assert.deepEqual(f.received.map(({ body }) => body.model), ['gpt-example', 'gpt-example']);
   await until(() => f.receipts.length === 2);
   assert.deepEqual(f.receipts.map(({ providerId, transport, sourceKey }) => ({ providerId, transport, sourceKey })), [
     { providerId: 'company-config', transport: 'ccswitch', sourceKey: 'API2-copy' },
-    { providerId: 'approved-backup', transport: 'ccswitch', sourceKey: 'BACKUP' },
+    { providerId: 'approved-backup', transport: 'direct', sourceKey: null },
   ]);
   assert.equal(f.receipts[1].providerFingerprint, route.providerFingerprint); assert.equal(f.receipts[1].proposalId, route.proposalId);
   assert.equal(f.receipts[1].approvalId, route.approvalId); assert.equal(f.receipts[1].challenge, 7);
-  assert.equal(f.receipts[0].ccswitchMode, 'default'); assert.equal(f.receipts[1].ccswitchMode, 'stack');
+  assert.equal(f.receipts[0].ccswitchMode, 'default'); assert.equal(f.receipts[1].ccswitchMode, null);
   route = { route: 'fallback', transport: 'ccswitch', providerId: 'missing-selector', revision: 2 };
   assert.equal((await send(f.gateway)).status, 503);
   route = { route: 'fallback', transport: 'unknown', providerId: 'untrusted-transport', revision: 3 };
@@ -675,12 +687,12 @@ test('primary uses the native CCSwitch default while approved third-party backup
 test('provider launch paths supply a decoded initial hint while the resolver owns the current route and models stay local', async (t) => {
   const selected = '公司 / API2?copy#selection', hints = [];
   const f = await fixture(t, undefined, { resolveRoute: async (thread, hint) => {
-    hints.push({ thread, hint }); return { route: 'fallback', transport: 'ccswitch', providerId: 'current-approved', sourceKey: 'CURRENT', revision: 8 };
+    hints.push({ thread, hint }); return relayRoute({ providerId: 'current-approved', revision: 8 });
   }, officialRequestImpl: () => { assert.fail('models and third-party requests must not open official transport'); } });
   const selectedGateway = { url: f.gateway.url.replace('/v1', `/provider/${encodeURIComponent(selected)}/v1`) };
   assert.equal((await send(selectedGateway)).status, 200);
   assert.deepEqual(hints, [{ thread: A, hint: selected }]);
-  assert.equal(f.received[0].body.model, 'ccs-CURRENT/gpt-example');
+  assert.equal(f.received[0].body.model, 'gpt-example');
   await until(() => f.receipts.length === 1); assert.equal(f.receipts[0].providerId, 'current-approved');
   assert.equal((await send(selectedGateway, { path: '/models?client_version=0.163.0', method: 'GET', thread: null, body: null })).status, 200);
   assert.equal(f.received[1].path, '/v1/models?client_version=0.163.0'); assert.equal(hints.length, 1);
@@ -717,7 +729,7 @@ test('unsupported official environments do not block startup, company traffic or
     let official = false;
     const f = await officialFixture(t, undefined, { resolveRoute: async () => official
       ? { route: 'fallback', transport: 'official', providerId: 'approved-official', revision: 1 }
-      : { route: 'source', transport: 'ccswitch', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 } });
+      : { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 } });
     assert.equal((await send(f.gateway)).status, 200);
     assert.equal((await send(f.gateway, { path: '/models', method: 'GET', thread: null, body: null })).status, 200);
     official = true;
@@ -876,4 +888,61 @@ test('an unsupported Official environment is reported by the network endpoint wi
   assert.equal(official.reachable, false); assert.equal(official.error, 'OFFICIAL_TRANSPORT_UNSUPPORTED_ENV');
   assert.match(official.message, /ALL_PROXY/); assert.doesNotMatch(response.body, /synthetic-password/);
   assert.equal(f.officialCalls.length, 0);
+});
+
+test('a direct relay gets the card key and headers and never the ChatGPT login, account or cookies', async (t) => {
+  const f = await fixture(t, undefined, { resolveRoute: async () => relayRoute() });
+  const bytes = Buffer.from(JSON.stringify({ ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic-encrypted' }] }));
+  const encoded = zlib.zstdCompressSync ? zlib.zstdCompressSync(bytes) : zlib.gzipSync(bytes);
+  const result = await send(f.gateway, { bytes: encoded, headers: { 'content-encoding': zlib.zstdCompressSync ? 'zstd' : 'gzip',
+    'chatgpt-account-id': 'synthetic-account', cookie: 'session=synthetic', originator: 'codex_cli_rs', 'x-codex-beta-features': 'synthetic' } });
+  assert.equal(result.status, 200); assert.equal(result.body, DONE);
+  const seen = f.received[0];
+  assert.equal(seen.path, '/v1/responses'); assert.deepEqual(seen.bytes, bytes);
+  assert.equal(seen.headers.authorization, `Bearer ${RELAY_KEY}`); assert.equal(seen.headers['x-relay-card'], 'synthetic-card-header');
+  for (const name of ['chatgpt-account-id', 'cookie', 'content-encoding']) assert.equal(seen.headers[name], undefined, name);
+  assert.equal(seen.headers.originator, 'codex_cli_rs'); assert.equal(seen.headers['x-codex-beta-features'], 'synthetic');
+  assert.ok(!JSON.stringify(seen.headers).includes('synthetic-official-oauth'), 'the native login never reaches a relay');
+  await until(() => f.receipts.length === 1);
+  assert.equal(f.receipts[0].transport, 'direct'); assert.equal(f.receipts[0].providerId, 'relay'); assert.equal(f.receipts[0].success, true);
+  assert.doesNotMatch(JSON.stringify(f.receipts[0]), new RegExp(RELAY_KEY));
+});
+
+test('a relay redirect becomes 502 without Location, so Codex never follows it', async (t) => {
+  const f = await fixture(t, (_req, res) => { res.writeHead(307, { location: 'https://external.invalid/steal' }); res.end(); },
+    { resolveRoute: async () => relayRoute() });
+  const result = await send(f.gateway);
+  assert.equal(result.status, 502); assert.equal(result.headers.location, undefined);
+  assert.match(result.body, /Relay redirects are not allowed/); assert.doesNotMatch(result.body, /external\.invalid/);
+  await until(() => f.receipts.length === 1); assert.equal(f.receipts[0].success, false);
+});
+
+test('a changed or unusable relay card, or one pointing back at the gateway, is refused before any request', async (t) => {
+  let connection = () => { throw Object.assign(new Error(`changed ${RELAY_KEY}`), { code: 'DIRECT_CARD_CHANGED' }); };
+  const f = await fixture(t, undefined, { resolveRoute: async () => relayRoute(), resolveDirect: async () => connection() });
+  const changed = await send(f.gateway);
+  assert.equal(changed.status, 503); assert.match(changed.body, /relay card is unavailable or changed/); assert.doesNotMatch(changed.body, new RegExp(RELAY_KEY));
+  connection = () => relayConnection(`http://127.0.0.1:${f.gateway.port}/v1`);
+  const loop = await send(f.gateway);
+  assert.equal(loop.status, 503); assert.match(loop.body, /cannot point at this gateway/);
+  // CCSwitch's listener would serve its own default card under this card's name.
+  connection = () => relayConnection(f.upstreamUrl.replace('127.0.0.1', 'localhost'));
+  const ccswitch = await send(f.gateway);
+  assert.equal(ccswitch.status, 503); assert.match(ccswitch.body, /or at CCSwitch/);
+  assert.equal(f.received.length, 0);
+});
+
+test('a relay that rejects another route\'s encrypted reasoning is repaired once, like Official', async (t) => {
+  const rejection = JSON.stringify({ error: { code: 'invalid_encrypted_content', param: 'input[0].encrypted_content', message: 'synthetic rejection' } });
+  const f = await fixture(t, (_req, res, _seen, index) => {
+    res.writeHead(index === 1 ? 400 : 200, { 'content-type': index === 1 ? 'application/json' : 'text/event-stream' });
+    res.end(index === 1 ? rejection : DONE);
+  }, { resolveRoute: async () => relayRoute() });
+  const body = { ...defaultBody, input: [{ type: 'reasoning', encrypted_content: 'synthetic-other-route-state', summary: [] }, { role: 'user', content: 'synthetic task' }] };
+  const result = await send(f.gateway, { body });
+  assert.equal(result.status, 200); assert.equal(result.body, DONE);
+  assert.equal(f.received.length, 2);
+  assert.ok(f.received.every(seen => seen.headers.authorization === `Bearer ${RELAY_KEY}`));
+  assert.ok(!JSON.stringify(f.received[1].body).includes('synthetic-other-route-state'), 'only the rejected reasoning is removed');
+  assert.deepEqual(f.received[1].body.input.at(-1), { role: 'user', content: 'synthetic task' });
 });

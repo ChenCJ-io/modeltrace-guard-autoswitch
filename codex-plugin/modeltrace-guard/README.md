@@ -1,6 +1,6 @@
 # ModelTrace Guard Autoswitch
 
-独立 fork `0.4.3`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+独立 fork `0.5.0`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
 
 内置指纹库包含 `gpt-6.1-sol` 的 36 条官方原生参考（max、Standard、Codex CLI 0.163.0）。新参考采集须由用户另行明确请求；普通监测不运行采集入口，也不自动扩展指纹库。
 
@@ -55,7 +55,7 @@ node scripts/guard.mjs propose-switch --request REQUEST_ID --target-name "另一
 node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TARGET_ID
 ```
 
-清单按“推荐备用、主渠道、官方、其他”编号，每项写明切换后是否继续监测和上次抽查结果；未加入 CCSwitch 聚合、绑定了其他账号等不可选的卡也会列出并说明原因。编号绑定列出时的卡身份，卡被改过会拒绝并要求重新列出。`choose` 改选与提议不同的目标、或在验证失败后重新选择时，都会创建新请求；每次 `propose-switch` 也都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 另一个渠道”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
+清单按“推荐备用、主渠道、官方、其他”编号，每项写明切换后是否继续监测和上次抽查结果；不能直连（非 Responses API、key 来自环境变量等）、由 CCSwitch 管登录但未加入聚合、绑定了其他账号等不可选的卡也会列出并说明原因。编号绑定列出时的卡身份，卡被改过会拒绝并要求重新列出。`choose` 改选与提议不同的目标、或在验证失败后重新选择时，都会创建新请求；每次 `propose-switch` 也都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 另一个渠道”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
 
 批准后才运行目标路由的原生 canary，真实 `completed` 回执与兼容指纹全部通过才切换并解除本次暂停；失败保持 halt。失败收尾后，用户明确改选目标时可从当前失败请求创建新 proposal，使用新 ID 记录对新目标的本次同意；已经说清的同意不重复询问，不能继承旧批准。Official 成功后停止探针，第三方目标成功后继续监测，下一次异常再次询问。拒绝待批准的切换会保留当前路由、恢复任务与普通间隔监测。不会自动回主。
 
@@ -69,9 +69,9 @@ node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TAR
 
 用户也可在对话中主动切换当前会话的渠道（「切回主渠道」「切到 API2 copy」）：技能执行 `guard.mjs switch-route --target-name NAME`，只改该会话的网关路由，不改 CCSwitch 默认卡；切换前同样先做一次目标验证（完整回执 + 指纹兼容），切回仍在降智的中转时验证失败、保留当前渠道并自动解除暂停。成功切到主渠道或第三方后恢复监测，切到 Official 后停止监测。需已执行 use，且没有未处理的异常。
 
-主配置及第三方目标须加入 CCSwitch 4.0.15 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收认证头，不读取凭据存储、不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
+CCSwitch 4.0.15 需开启代理模式，主渠道为默认卡；普通渠道不需要加入 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收原生认证头，只转发给本机 CCSwitch 或固定官方地址，不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
 
-0.4.1 主通道使用普通默认路由，模型名和原生 Codex 请求头保持不变；转发前校验默认卡仍为主通道、CCSwitch 自动故障切换关闭。第三方备用才使用 Stack 前缀，其协议头清理行为须与上游兼容。主通道检测到漂移会拒绝请求，不自动改卡或降级到 Stack。
+主通道使用普通默认路由，模型名和原生 Codex 请求头保持不变；转发前校验默认卡仍为主通道、CCSwitch 自动故障切换关闭，检测到漂移会拒绝请求，不自动改卡。0.5 起其他按 key 计费的渠道由网关直连：该渠道成为会话路由后，每次请求从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，去掉原生登录、账号和其他凭据类请求头后发往这张卡自己的地址，拒绝重定向；卡的身份摘要变了就拒绝转发，需要重新选择。只有 Copilot、xAI 等由 CCSwitch 管登录的卡仍使用 Stack 前缀。
 
 安装后在 Codex CLI 的 `/hooks` 中审阅并信任 ModelTrace Guard Autoswitch。v0.4 新增同步启动 hook，定义变更后须按原生机制重新审阅；智能体不能代改信任。可用 `node scripts/guard.mjs doctor` 检查打包文件；`doctor --fork true` 另检查原生 fork、hook 与清理能力，会创建临时分支但不生成探针。存在多个运行时时可用 `MODELTRACE_CODEX_PATH` 选择正确可执行文件，不通过换账户绕过检查。
 

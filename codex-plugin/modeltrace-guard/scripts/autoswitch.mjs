@@ -15,6 +15,7 @@ import { loadArtifacts } from './guard.mjs';
 import { GATEWAY_IMPLEMENTATION_VERSION, gatewayRuntimeProblem, startSwitchGateway } from './switch-gateway.mjs';
 import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
 import { createOfficialNetwork, officialNetworkStatus, writeNetworkSetting } from './network-route.mjs';
+import { directRouteConnection } from './direct-route.mjs';
 import {
   UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
   loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady, verifyGatewayRoute,
@@ -113,6 +114,8 @@ async function serveGateway(directory) {
     // The spawning hook/tool call may lack the user's proxy variables; resolve
     // the saved setting and OS system proxy here, re-read without a restart.
     officialNetwork: createOfficialNetwork({ directory }),
+    // A direct relay route re-reads its consented card for every request.
+    resolveDirect: route => directRouteConnection(config.ccSwitchDirectory, route),
     onShutdown: () => resolveDone(),
   });
   await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port,

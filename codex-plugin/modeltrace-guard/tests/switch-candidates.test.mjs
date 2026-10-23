@@ -15,9 +15,10 @@ const layout = (extra = {}) => ({
     row('official', 'OpenAI Official', { category: 'official', nativeOfficial: 1, followsNativeLogin: 1 }),
     row('managed', 'Work ChatGPT', { category: 'official', managedCodexAccount: 1 }),
     row('bound', 'Bound Official', { category: 'official' }),
+    row('copilot', 'Copilot', { delegatedAuth: 1 }), row('xai', 'xAI', { delegatedAuth: 1 }),
     row('evil', 'bad\nname'),
   ],
-  stack: { enabled: true, members: ['company', 'a-api2'], keys: { 'api2-copy': 'company', api2: 'a-api2' } },
+  stack: { enabled: true, members: ['company', 'a-api2', 'xai'], keys: { 'api2-copy': 'company', api2: 'a-api2', xai: 'xai' } },
   defaultProvider: 'company', listener: { listen_address: '127.0.0.1', listen_port: 15721, auto_failover_enabled: 0 }, ...extra,
 });
 const descriptor = (id, name, transport, key) => ({ id, name, fingerprint: digest(id), transport, key });
@@ -27,24 +28,36 @@ const config = { id: '11111111-1111-4111-8111-111111111111', primary, backup: of
 const summary = entries => entries.map(e => [e.number, e.name, e.reason, e.recommended, e.monitoringAfterSwitch]);
 
 test('every CCSwitch card is listed: selectable ones numbered with the recommendation first, the rest with a reason', () => {
-  const entries = listCandidates(layout(), config, primary);
+  const entries = listCandidates(layout(), config, primary, new Map(), new Map([['doro', 'needs_ccswitch_conversion']]));
   assert.deepEqual(summary(entries), [
     [1, 'OpenAI Official', null, true, 'stops'],
     [2, 'API2', null, false, 'continues'],
+    [3, 'xAI', null, false, 'continues'],
     [null, 'API2 copy', 'current_route', false, 'continues'],
-    [null, 'Doro', 'not_in_ccswitch_stack', false, 'continues'],
+    [null, 'Doro', 'needs_ccswitch_conversion', false, 'continues'],
     [null, 'Work ChatGPT', 'managed_official_account', false, 'stops'],
     [null, 'Bound Official', 'official_card_not_native', false, 'stops'],
+    [null, 'Copilot', 'needs_ccswitch_aggregation', false, 'continues'],
     [null, null, 'invalid_card', false, 'continues'],
   ]);
   assert.deepEqual(entries[0].descriptor, official, 'a selectable entry binds the exact card identity');
-  assert.equal(entries[3].descriptor, null);
+  // Ordinary cards connect directly, even as Stack members; only CCSwitch-managed logins use Stack.
+  assert.equal(entries[1].descriptor.transport, 'direct'); assert.equal(entries[1].descriptor.key, null);
+  assert.equal(entries[2].descriptor.transport, 'ccswitch'); assert.equal(entries[2].descriptor.key, 'xai');
+  assert.equal(entries[4].descriptor, null);
+});
+
+test('without any problem a key-based card is selectable without CCSwitch Aggregation', () => {
+  const plain = layout({ stack: { enabled: false, members: [], keys: {} } });
+  const entries = listCandidates(plain, config, primary);
+  assert.deepEqual(entries.filter(e => e.selectable).map(e => [e.number, e.name]), [[1, 'OpenAI Official'], [2, 'API2'], [3, 'Doro']]);
+  assert.equal(entries.find(e => e.name === 'xAI').reason, 'needs_ccswitch_aggregation');
 });
 
 test('without a configured backup nothing is recommended and the primary comes first when it is not current', () => {
   const entries = listCandidates(layout(), { ...config, backup: null }, official);
-  assert.deepEqual(summary(entries).slice(0, 3), [[1, 'API2 copy', null, false, 'continues'], [2, 'API2', null, false, 'continues'],
-    [null, 'Doro', 'not_in_ccswitch_stack', false, 'continues']]);
+  assert.deepEqual(summary(entries).slice(0, 4), [[1, 'API2 copy', null, false, 'continues'], [2, 'API2', null, false, 'continues'],
+    [3, 'Doro', null, false, 'continues'], [4, 'xAI', null, false, 'continues']]);
   assert.equal(entries.find(e => e.name === 'OpenAI Official').reason, 'current_route');
 });
 
