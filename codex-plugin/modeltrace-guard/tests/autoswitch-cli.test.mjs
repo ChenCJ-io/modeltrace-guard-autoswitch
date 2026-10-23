@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
-import { atomicJSON, gatewayURL, loadGatewayConfig, runtimePath } from '../scripts/provider-config.mjs';
+import { atomicJSON, configPath, gatewayURL, loadGatewayConfig, runtimePath } from '../scripts/provider-config.mjs';
 import { resolveSessionRoute, saveReceipt } from '../scripts/switch-policy.mjs';
 import { runAutoSwitch } from '../scripts/autoswitch.mjs';
 import { dataDirectory, readState, withState } from '../scripts/state.mjs';
@@ -34,16 +34,18 @@ async function fixture(t) {
     await invoke('gateway-stop').catch(() => {});
     await rm(directory, { recursive: true, force: true });
   });
+  // API2 copy is CCSwitch's default card and only CCSwitch reaches it; Doro is
+  // a key-based relay the gateway connects to directly.
   await sql(`CREATE TABLE providers(id TEXT,name TEXT,category TEXT,app_type TEXT,settings_config TEXT,meta TEXT);
     INSERT INTO providers VALUES
       ('company','API2 copy',NULL,'codex','{"auth":{},"config":""}','{}'),
-      ('other','Doro',NULL,'codex','{"auth":{},"config":""}','{}'),
+      ('other','Doro',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":"openai_base_url = \\"https://doro.example.invalid/v1\\""}','{}'),
       ('official','OpenAI Official','official','codex','{"auth":{},"config":""}','{}');
     CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER DEFAULT 0);
     INSERT INTO proxy_config(app_type,listen_address,listen_port) VALUES('codex','127.0.0.1',15721);`);
   await atomicJSON(path.join(directory, 'live-state.json'), { version: 1, apps: { codex: { mode: 'proxy', attached: true,
-    proxy_route: 'company', stack: { enabled: true, members: ['company', 'other'], keys: { company: 'company', doro: 'other' } } } } });
-  const configured = await invoke('configure', '--cc-switch-dir', directory, '--primary-name', 'API2 copy', '--backup-name', 'OpenAI Official', '--port', String(await freePort()));
+    proxy_route: 'company', stack: { enabled: false, members: [], keys: {} } } } });
+  const configured = await invoke('configure', '--cc-switch-dir', directory, '--backup-name', 'OpenAI Official', '--port', String(await freePort()));
   return { directory, env, invoke, sql, configured, config: await loadGatewayConfig(directory) };
 }
 
@@ -93,22 +95,26 @@ async function connectedNativeFixture(f) {
     layers: [{ name, version: 'fixture-version', config: owned, disabledReason: null }] } });
 }
 
-test('schema 2 gateway starts once, hides its capability, preserves company default and stops only its own instance', async t => {
+test('the gateway starts once, hides its capability, leaves CCSwitch untouched and stops only its own instance', async t => {
   const f = await fixture(t), { invoke, config, configured } = f;
-  assert.equal(configured.schema, 2);
-  assert.equal(configured.primary.id, 'company'); assert.equal(configured.backup.id, 'official');
+  assert.equal(configured.schema, 3); assert.equal(configured.primary, undefined);
+  assert.equal(configured.backup.id, 'official');
   assert.equal(configured.token, undefined);
   const original = (await f.sql('.dump')).stdout;
   const live = await readFile(path.join(f.directory, 'live-state.json'), 'utf8');
   const started = await invoke('gateway-start');
-  assert.equal(started.running, true); assert.equal(started.readiness, 'ready');
+  assert.equal(started.running, true); assert.equal(started.readiness, 'ready'); assert.equal(started.newConversations, 'ready');
   assert.equal((await invoke('gateway-start')).instanceId, started.instanceId);
   const status = await invoke('status', '--session', randomUUID());
-  assert.equal(status.configuration.primary.name, 'API2 copy');
   assert.equal(status.configuration.backup.name, 'OpenAI Official');
   assert.equal(status.configuration.token, undefined);
   assert.ok(!JSON.stringify({ configured, started, status }).includes(config.token));
-  await assert.rejects(invoke('configure', '--primary-provider', 'company', '--backup-provider', 'official'), /Stop this gateway/);
+  // Only the recommended backup changes: the running gateway and its configuration ID stay.
+  const recommended = await invoke('configure', '--backup-provider', 'other');
+  assert.equal(recommended.configurationKept, true); assert.equal((await loadGatewayConfig(f.directory)).id, config.id);
+  assert.equal((await invoke('gateway-status')).readiness, 'ready');
+  await assert.rejects(invoke('configure', '--port', String(await freePort())), /Stop this gateway/);
+  assert.equal((await loadGatewayConfig(f.directory)).id, config.id);
   assert.deepEqual(await invoke('gateway-stop'), { stopped: true });
   assert.equal((await invoke('gateway-status')).running, false);
   assert.equal((await f.sql('.dump')).stdout, original);
@@ -173,47 +179,115 @@ test('an old running gateway cannot be reported ready after installing a newer i
   assert.equal((await f.invoke('gateway-start')).readiness, 'ready');
 });
 
-test('a changed primary reports gateway readiness instead of telling connected users to start another conversation', async t => {
+test('an unusable default card reports why new conversations fail instead of telling users to start another one', async t => {
   const f = await fixture(t), native = await connectedNativeFixture(f);
   await f.sql("UPDATE proxy_config SET auto_failover_enabled=1 WHERE app_type='codex'");
   const result = await runAutoSwitch(['use', '--session', randomUUID(), '--data-dir', f.directory], f.env, native.runtime);
   assert.equal(result.status, 'gateway_not_ready');
-  assert.match(result.gateway.readiness, /automatic failover/);
+  assert.equal(result.gateway.readiness, 'ready'); assert.match(result.gateway.newConversations, /automatic failover/);
   assert.equal(result.monitoringEnabled, false); assert.equal(result.switchApproved, false);
   await f.invoke('gateway-stop');
   const restarted = await f.invoke('gateway-start');
-  assert.equal(restarted.running, true, 'transport can restart for already selected Official threads');
-  assert.match(restarted.readiness, /automatic failover/);
+  assert.equal(restarted.running, true, 'the gateway still starts for conversations on their own cards');
+  assert.match(restarted.newConversations, /automatic failover/);
+  // A directly reachable default card does not depend on CCSwitch failover.
+  await atomicJSON(path.join(f.directory, 'live-state.json'), { version: 1, apps: { codex: { mode: 'proxy', attached: true,
+    proxy_route: 'other', stack: { enabled: false, members: [], keys: {} } } } });
+  assert.equal((await f.invoke('gateway-status')).newConversations, 'ready');
 });
 
-test('configuration accepts complete names or IDs and rejects mixed or incomplete selectors before mutation', async t => {
+test('configuration only records an optional recommended backup and keeps the gateway address', async t => {
   const f = await fixture(t);
-  for (const args of [
-    ['--backup-name', 'Doro'],
-    ['--backup-provider', 'other'],
-    ['--primary-name', 'API2 copy', '--backup-provider', 'official'],
-    ['--primary-name', 'API2 copy', '--backup-name', 'Doro', '--primary-provider', 'company'],
-    ['--primary-name', '', '--backup-name', 'Doro'],
+  for (const [args, message] of [
+    [['--backup-name', 'Doro', '--backup-provider', 'other'], /not both/],
+    [['--primary-name', 'API2 copy'], /no primary to configure/],
+    [['--primary-provider', 'company', '--backup-name', 'Doro'], /no primary to configure/],
+    [['--backup-name', ''], /Invalid value/],
   ]) {
-    await assert.rejects(f.invoke('configure', ...args), /both|mix|Invalid/);
+    await assert.rejects(f.invoke('configure', ...args), message);
     assert.deepEqual(await loadGatewayConfig(f.directory), f.config);
   }
-  const byId = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-provider', 'company', '--backup-provider', 'other', '--port', String(f.config.port));
-  assert.equal(byId.primary.id, 'company'); assert.equal(byId.backup.id, 'other');
-  const byCase = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-name', 'api2 COPY', '--backup-name', 'doro', '--port', String(f.config.port));
-  assert.equal(byCase.primary.id, 'company'); assert.equal(byCase.backup.id, 'other');
+  const byId = await f.invoke('configure', '--cc-switch-dir', f.directory, '--backup-provider', 'other');
+  assert.equal(byId.backup.id, 'other'); assert.equal(byId.backup.transport, 'direct');
+  const saved = await loadGatewayConfig(f.directory);
+  assert.equal(saved.token, f.config.token, 'Codex keeps the same entry URL'); assert.equal(saved.port, f.config.port);
+  assert.equal(byId.configurationKept, true); assert.equal(saved.id, f.config.id, 'changing only the recommended backup keeps every conversation');
+  // Another port is another gateway address for routes: a new configuration ID.
+  const moved = await f.invoke('configure', '--port', String(await freePort()));
+  assert.equal(moved.configurationKept, false); assert.notEqual((await loadGatewayConfig(f.directory)).id, f.config.id);
+  assert.equal((await loadGatewayConfig(f.directory)).token, f.config.token);
+  const byCase = await f.invoke('configure', '--cc-switch-dir', f.directory, '--backup-name', 'doro');
+  assert.equal(byCase.backup.id, 'other');
+  // Recommending CCSwitch's default card (reachable only through CCSwitch) would just restart where conversations begin.
+  await assert.rejects(f.invoke('configure', '--cc-switch-dir', f.directory, '--backup-name', 'API2 copy'), /Recommend a card/);
   // The backup is optional: incidents list every card and only mark it as recommended.
-  const primaryOnly = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-name', 'API2 copy', '--port', String(f.config.port));
-  assert.equal(primaryOnly.primary.id, 'company'); assert.equal(primaryOnly.backup, null);
-  assert.equal((await loadGatewayConfig(f.directory)).backup, null);
-  const idOnly = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-provider', 'company', '--port', String(f.config.port));
-  assert.equal(idOnly.backup, null);
+  const none = await f.invoke('configure', '--cc-switch-dir', f.directory);
+  assert.equal(none.backup, null); assert.equal((await loadGatewayConfig(f.directory)).backup, null);
+});
+
+// A configuration from before 0.5 and a stand-in for its gateway still running.
+async function legacyFixture(t) {
+  const f = await fixture(t);
+  const legacy = { schema: 2, id: randomUUID(), ccSwitchDirectory: f.directory,
+    primary: { id: 'company', name: 'API2 copy', fingerprint: 'a'.repeat(64), transport: 'ccswitch', key: null },
+    backup: f.config.backup, upstream: f.config.upstream, port: f.config.port, token: f.config.token };
+  await atomicJSON(configPath(f.directory), legacy);
+  const old = { shutdowns: 0 };
+  old.server = createHttpServer((req, res) => {
+    if (req.url.endsWith('/shutdown')) { old.shutdowns++; res.once('finish', () => { old.server.close(); old.server.closeAllConnections(); }); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, instanceId: randomUUID(), implementationVersion: '0.4.3' }));
+  });
+  await new Promise(resolve => old.server.listen(legacy.port, '127.0.0.1', resolve));
+  t.after(() => { if (old.server.listening) { old.server.closeAllConnections(); old.server.close(); } });
+  const env = { ...f.env, MODELTRACE_AUTOSWITCH_DATA: f.directory };
+  return { ...f, legacy, old, env, saved: async () => JSON.parse(await readFile(configPath(f.directory), 'utf8')) };
+}
+
+test('connect updates a configuration from before 0.5 only after every check passes, keeping its address and backup', async t => {
+  const f = await legacyFixture(t);
+  const status = await runAutoSwitch(['gateway-status'], f.env);
+  assert.equal(status.readiness, 'config_outdated'); assert.equal(status.running, true);
+  const unchanged = async () => { assert.deepEqual(await f.saved(), f.legacy); assert.equal(f.old.shutdowns, 0); };
+  // Without CCSwitch's proxy no default card is defined.
+  const live = await readFile(path.join(f.directory, 'live-state.json'), 'utf8');
+  await atomicJSON(path.join(f.directory, 'live-state.json'), { version: 1, apps: { codex: { mode: 'direct', attached: false } } });
+  await assert.rejects(runAutoSwitch(['connect'], f.env, (await nativeFixture(f.directory)).runtime), /local proxy/);
+  await unchanged();
+  await writeFile(path.join(f.directory, 'live-state.json'), live);
+  // A missing login stops connect before the old gateway is touched.
+  await assert.rejects(runAutoSwitch(['connect'], f.env, (await nativeFixture(f.directory, { accountType: null })).runtime), /did not read a login/);
+  await unchanged();
+  // Starting or reconfiguring cannot orphan the old gateway either.
+  await assert.rejects(runAutoSwitch(['gateway-start'], f.env), /predates 0\.5/);
+  await assert.rejects(runAutoSwitch(['configure', '--backup-name', 'Doro'], f.env), /Stop this gateway/);
+  await unchanged();
+  // Every check passes: the old gateway is stopped, the configuration updated in place and the new gateway started.
+  // (This stand-in Codex cannot read its configuration, so connect stops right after starting the gateway.)
+  await assert.rejects(runAutoSwitch(['connect'], f.env, (await nativeFixture(f.directory)).runtime), /Native configuration could not be read/);
+  assert.equal(f.old.shutdowns, 1);
+  const migrated = await loadGatewayConfig(f.directory);
+  assert.equal(migrated.schema, 3); assert.equal(migrated.primary, undefined); assert.notEqual(migrated.id, f.legacy.id);
+  assert.equal(migrated.token, f.legacy.token); assert.equal(migrated.port, f.legacy.port);
+  assert.equal(migrated.backup.id, 'official'); assert.equal(migrated.ccSwitchDirectory, f.directory);
+  assert.equal((await runAutoSwitch(['gateway-status'], f.env)).readiness, 'ready', 'the updated gateway runs on the same address');
+});
+
+test('gateway-stop stops a gateway still running a configuration from before 0.5', async t => {
+  const f = await legacyFixture(t);
+  assert.deepEqual(await runAutoSwitch(['gateway-stop'], f.env), { stopped: true });
+  assert.equal(f.old.shutdowns, 1);
+  assert.deepEqual(await runAutoSwitch(['gateway-stop'], f.env), { stopped: false, reason: 'not_running' });
+  // With it stopped, configure writes the current configuration (connect then updates the entry).
+  const configured = await runAutoSwitch(['configure', '--backup-name', 'Doro'], f.env);
+  assert.equal(configured.schema, 3); assert.equal(configured.configurationKept, false); assert.equal(configured.backup.id, 'other');
+  assert.equal((await f.saved()).token, f.legacy.token);
 });
 
 test('ambiguous names retain structured candidate IDs in CLI errors without exposing the capability', async t => {
   const f = await fixture(t);
   await f.sql(`INSERT INTO providers VALUES('company-2','API2 copy',NULL,'codex','{"auth":{},"config":""}','{}');`);
-  const args = ['configure', '--data-dir', f.directory, '--cc-switch-dir', f.directory, '--primary-name', 'API2 copy', '--backup-name', 'OpenAI Official'];
+  const args = ['configure', '--data-dir', f.directory, '--cc-switch-dir', f.directory, '--backup-name', 'API2 copy'];
   await assert.rejects(runAutoSwitch(args, f.env), error => {
     assert.equal(error.code, 'AMBIGUOUS_PROVIDER');
     assert.deepEqual(error.candidates.map(item => item.id), ['company', 'company-2']);
@@ -228,7 +302,7 @@ test('ambiguous names retain structured candidate IDs in CLI errors without expo
   });
 });
 
-test('launch defaults to primary and passes explicit valid Stack or Official choices as argv without enabling monitoring', async t => {
+test('launch defaults to CCSwitch\'s default card and passes explicit valid choices as argv without enabling monitoring', async t => {
   const f = await fixture(t), native = await nativeFixture(f.directory), session = randomUUID();
   const launch = (...args) => runAutoSwitch(['launch', '--data-dir', f.directory, ...args], f.env, native.runtime);
   for (const args of [[], ['--provider-name', 'Doro'], ['--provider-id', 'official', '--resume', session]]) assert.deepEqual(await launch(...args), { exited: true, code: 0 });
@@ -263,24 +337,24 @@ test('launch rejects a missing login, Official without ChatGPT, and provider cha
 test('launch and enable request native OpenAI mode for both authentication checks', async t => {
   const f = await fixture(t), native = await nativeFixture(f.directory);
   await runAutoSwitch(['launch', '--data-dir', f.directory], f.env, native.runtime);
-  await assert.rejects(runAutoSwitch(['enable', '--data-dir', f.directory, '--session', randomUUID()], f.env, native.runtime), /primary/i);
+  await assert.rejects(runAutoSwitch(['enable', '--data-dir', f.directory, '--session', randomUUID()], f.env, native.runtime), /no gateway route/);
   assert.deepEqual(native.clientOptions, [{ nativeOpenai: true }, { nativeOpenai: true }]);
   assert.equal(native.calls.filter(call => call.method === 'account/read').length, 2);
 });
 
-test('enable cannot move an explicitly selected Official thread to the primary or start probes without a primary receipt', async t => {
+test('enable never monitors a thread on personal Official or moves it to another card', async t => {
   const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
   const route = await resolveSessionRoute(f.directory, f.config, session, 'official');
   assert.equal(route.transport, 'official');
   const before = await readState(f.directory, session);
-  await assert.rejects(runAutoSwitch(['enable', '--data-dir', f.directory, '--session', session], f.env, native.runtime), /primary/i);
+  await assert.rejects(runAutoSwitch(['enable', '--data-dir', f.directory, '--session', session], f.env, native.runtime), /personal Official/);
   assert.deepEqual(await readState(f.directory, session), before);
   assert.ok(native.calls.every(call => ['account/read', 'thread/read', 'hooks/list'].includes(call.method)));
   assert.equal(native.children.length, 0);
   assert.equal((await resolveSessionRoute(f.directory, f.config, session)).transport, 'official');
 });
 
-test('enable monitors a verified primary thread without selecting another route or approving a switch', async t => {
+test('enable monitors a thread on the card it started on without selecting another route or approving a switch', async t => {
   const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
   const route = await resolveSessionRoute(f.directory, f.config, session);
   assert.equal(route.providerId, 'company');
@@ -331,7 +405,7 @@ test('new fork storage is isolated per Codex home and ignores the upstream stora
   assert.equal(dataDirectory(undefined, { MODELTRACE_AUTOSWITCH_DATA: '/explicit-new', MODELTRACE_GUARD_DATA: '/old' }), path.resolve('/explicit-new'));
 });
 
-test('natural-language use enables only the already-connected primary thread and is idempotent', async t => {
+test('natural-language use enables only an already-connected thread and is idempotent', async t => {
   const f = await fixture(t), session = randomUUID(), native = await nativeFixture(f.directory);
   const route = await resolveSessionRoute(f.directory, f.config, session);
   await saveReceipt(f.directory, f.config, { ...route, threadId: session, requestId: randomUUID(), statusCode: 200,

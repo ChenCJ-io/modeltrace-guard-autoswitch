@@ -34,9 +34,10 @@ async function backgroundNotice(event, directory, session, confirmationId) {
         return injected(event, `ModelTrace AutoSwitch: the user-requested switch to ${JSON.stringify(r.target.name)} did not pass verification (${JSON.stringify(r.reason)}). This thread keeps ${JSON.stringify(state.autoSwitch.current?.name)} and the pause is released.${candidate} Tell the user briefly; a fingerprint candidate is not proof of substitution. Continue the original task on the current route only if it is still requested; another attempt needs a new explicit user request.`);
       }
       const personal = state.autoSwitch.current?.transport === 'official';
-      const monitoring = !personal ? 'Monitoring continues on the selected third-party route; any later switch requires new consent.' : state.enabled
-        ? 'Diagnostic monitoring is currently enabled again; its probes use the personal subscription. Automatic switching remains stopped.'
-        : 'Automatic monitoring and switching are stopped; no further probes are scheduled on the personal subscription.';
+      const monitoring = !personal ? (state.enabled ? 'Monitoring continues on the selected third-party route; any later switch requires new consent.'
+        : 'Fingerprint monitoring stays off on this route, as before the switch; it starts only if the user asks (“开启指纹监测”).')
+        : state.enabled ? 'Diagnostic monitoring is currently enabled again; its probes use the personal subscription. Automatic switching remains stopped.'
+          : 'Fingerprint monitoring is off on the personal subscription, so no probes are scheduled there. The user can still ask to switch routes.';
       return injected(event, `ModelTrace AutoSwitch: target verification completed successfully and this same thread now uses the user-approved route ${JSON.stringify(state.autoSwitch.current?.name || 'Official')}. ${monitoring} Tell the user briefly and continue the original task only if it is still requested. This is fingerprint compatibility and a completed request receipt, not backend identity verification. No previous tool call was replayed.`);
     }
     const alerts = pendingAlerts(state).filter((alert) => alert.lastDeliveryTurn !== (state.turn || 'no-turn')).slice(0, 5);

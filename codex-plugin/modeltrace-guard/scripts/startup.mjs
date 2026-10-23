@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dataDirectory } from './state.mjs';
 import { nativeIntegrationStatus } from './native-integration.mjs';
-import { startupNotice } from './session-notice.mjs';
+import { outdatedNotice, startupNotice } from './session-notice.mjs';
 // Keep this import lazy: `autoswitch connect` imports the trust check while its
 // CLI top-level await is active. A static import back would deadlock that CLI.
 const startGateway = async directory => (await import('./autoswitch.mjs')).startGateway(directory);
@@ -34,7 +34,7 @@ export async function requireTrustedStartupHook(client, cwd) {
 // When a conversation opens it also tells the user which route it uses, so a
 // personal subscription or an unmonitored route is never used unnoticed.
 export async function ensureGatewayForStartup(event, directory, env = process.env, {
-  integrationStatus = nativeIntegrationStatus, start = startGateway, notice = startupNotice,
+  integrationStatus = nativeIntegrationStatus, start = startGateway, notice = startupNotice, outdated = outdatedNotice,
 } = {}) {
   if (env.MODELTRACE_PROBE_PROCESS === '1' || event?.hook_event_name !== 'SessionStart'
     || event.agent_id || event.parent_session_id) return {};
@@ -44,6 +44,8 @@ export async function ensureGatewayForStartup(event, directory, env = process.en
     const connection = await integrationStatus(directory, env, announce
       ? { describe: true, threadId: event.source === 'resume' ? event.session_id : null } : {});
     if (['not_installed', 'removed'].includes(connection.phase)) return {};
+    // After an upgrade from before 0.5, only an explicit connect updates the configuration.
+    if (connection.phase === 'config_outdated') return { systemMessage: await outdated(env) };
     const route = connection.threadRoute || connection.effectiveRoute;
     if (!connection.readyForNewThreads) {
       const message = announce && route && route.kind !== 'gateway' ? await notice(event, directory, connection, env) : null;

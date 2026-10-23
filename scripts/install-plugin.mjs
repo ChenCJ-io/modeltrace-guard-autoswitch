@@ -15,13 +15,11 @@ const pluginRelativePath = './codex-plugin/modeltrace-guard';
 
 export function parseInstallArgs(args) {
   if (args.length === 1 && ['--help', '-h'].includes(args[0])) return { help: true };
-  const allowed = new Map([
-    ['--source', 'source'], ['--codex', 'codex'],
-    ['--primary-name', 'primaryName'], ['--backup-name', 'backupName'],
-  ]);
+  const allowed = new Map([['--source', 'source'], ['--codex', 'codex'], ['--backup-name', 'backupName']]);
   const options = {};
   for (let index = 0; index < args.length; index += 2) {
     const flag = args[index], key = allowed.get(flag), value = args[index + 1];
+    if (flag === '--primary-name') throw new Error('Since 0.5 new conversations start on CCSwitch\'s default card; select it in CC Switch instead of --primary-name');
     if (!key || Object.hasOwn(options, key) || typeof value !== 'string' || !value.trim() || value.includes('\0') || value.startsWith('--')) {
       throw new Error(`Invalid installer option: ${flag}`);
     }
@@ -33,12 +31,9 @@ export function parseInstallArgs(args) {
 
 function validateOptions(options) {
   for (const key of Object.keys(options)) {
-    if (!['source', 'codex', 'primaryName', 'backupName'].includes(key)) throw new Error(`Unknown installer option: ${key}`);
+    if (!['source', 'codex', 'backupName'].includes(key)) throw new Error(`Unknown installer option: ${key}`);
     if (typeof options[key] !== 'string' || !options[key].trim() || options[key].includes('\0')) throw new Error(`Invalid installer value: ${key}`);
   }
-  const primary = Object.hasOwn(options, 'primaryName'), backup = Object.hasOwn(options, 'backupName');
-  if (backup && !primary) throw new Error('--backup-name needs --primary-name; the backup is only an optional recommendation');
-  if (backup && options.primaryName === options.backupName) throw new Error('Primary and backup names must differ');
   if (options.source && /^[a-z][a-z\d+.-]*:\/\//i.test(options.source)) throw new Error('Use a local checkout; read INSTALL.md before obtaining a repository URL');
 }
 
@@ -64,15 +59,14 @@ async function inspectSource(source, configure) {
 export async function installPlugin(options = {}, { run = execute, env = process.env, node = process.execPath } = {}) {
   validateOptions(options);
   const source = path.resolve(options.source || defaultSource);
-  const configure = Object.hasOwn(options, 'primaryName');
+  const configure = Object.hasOwn(options, 'backupName');
   const { version, configureScript } = await inspectSource(source, configure);
   const codex = options.codex || env.MODELTRACE_CODEX_PATH || 'codex';
   const commands = [
     { stage: 'marketplace-add', file: codex, args: ['plugin', 'marketplace', 'add', source] },
     { stage: 'plugin-add', file: codex, args: ['plugin', 'add', `${pluginName}@${marketplaceName}`] },
   ];
-  if (configure) commands.push({ stage: 'configure', file: node, args: [configureScript, 'configure', '--primary-name', options.primaryName,
-    ...(Object.hasOwn(options, 'backupName') ? ['--backup-name', options.backupName] : [])] });
+  if (configure) commands.push({ stage: 'configure', file: node, args: [configureScript, 'configure', '--backup-name', options.backupName] });
   for (const command of commands) {
     try {
       await run(command.file, command.args, { cwd: source, env, shell: false, encoding: 'utf8', windowsHide: true, maxBuffer: 1024 * 1024, timeout: 120000 });
@@ -86,7 +80,7 @@ export async function installPlugin(options = {}, { run = execute, env = process
     monitoringStarted: false, switchApproved: false, hookTrustChanged: false };
 }
 
-const usage = 'node scripts/install-plugin.mjs [--source LOCAL_CHECKOUT] [--codex CODEX_EXECUTABLE] [--primary-name NAME [--backup-name NAME]]\nInstalls the local plugin; optional names only configure preferences (the backup is just the recommended target). No monitoring, route switch, credential access or hook trust changes.\n';
+const usage = 'node scripts/install-plugin.mjs [--source LOCAL_CHECKOUT] [--codex CODEX_EXECUTABLE] [--backup-name NAME]\nInstalls the local plugin; the optional backup name only records the recommended switch target. New conversations start on CCSwitch\'s default card. No monitoring, route switch, credential access or hook trust changes.\n';
 
 if (process.argv[1] && realpathSync(process.argv[1]) === entrypoint) {
   try {

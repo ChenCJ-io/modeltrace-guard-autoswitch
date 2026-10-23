@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "ModelTrace Guard Autoswitch",
     "shortDescription": "普通 codex 对话启用 · 异常先询问再切换",
-    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护。一次性接入未来新会话后，照常运行 codex，在对话中说使用插件即可逐会话开启监测。安装和接入不会监测全部会话，也不会热改旧会话。默认走主服务；首次指纹不一致暂停询问，本次同意后才验证目标，验证通过才切换并继续。个人路线不持续消耗探针；第三方路线继续监测，每次切换都需新同意。指纹不是后端身份或降智证明。",
+    "longDescription": "基于 xqy2006/ModelTrace 的独立 fork，由 ChenCJ-io 维护。一次性接入未来新会话后，照常运行 codex，在对话中说使用插件即可逐会话开启监测。安装和接入不会监测全部会话，也不会热改旧会话。新会话走 CCSwitch 当前默认卡，开场告知所走渠道，对话里可随时切换；首次指纹不一致暂停询问，本次同意后才验证目标，验证通过才切换并继续。个人路线不持续消耗探针；第三方路线继续监测，每次切换都需新同意。指纹不是后端身份或降智证明。",
     "developerName": "xqy2006 · fork: ChenCJ-io",
     "category": "Productivity",
     "capabilities": [],

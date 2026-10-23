@@ -47,7 +47,7 @@ export function summarize(state, directory, now = Date.now()) {
     latest: state.samples.slice(-3).map(publicSample),
     stateFile: sessionPath(directory, state.session), warning: WARNING,
     coverageNote: state.autoSwitch?.protocol === 3
-      ? 'Work-tool checkpoints on the opted-in primary; the first candidate mismatch pauses for per-incident consent. No target probe before approval. Official success stops monitoring.'
+      ? 'Work-tool checkpoints on this conversation\'s current route; the first candidate mismatch pauses for per-incident consent. No target probe before approval. Official success stops monitoring.'
       : 'Normal checkpoints use work-tool counts only, with no per-turn or task-total probe limit. Mismatch retries are consecutive and bounded by retryCount. Only sampled continuations are observed.',
   };
 }

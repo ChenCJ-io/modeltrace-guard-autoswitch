@@ -111,7 +111,7 @@ async function jsonBody(req, limit, timeoutMs) {
   if (typeof body.model !== 'string' || !body.model.trim()) throw failure(400, 'A model is required');
   // CCSwitch treats these IDs as provider selectors, including malformed ones.
   // Accepting one from the client would bypass the consent-owned provider and
-  // falsely attribute its response to the primary/default route in receipts.
+  // falsely attribute its response to CCSwitch's default route in receipts.
   if (body.model.startsWith('ccs-') && body.model.includes('/')) throw failure(400, 'A plain model ID is required; CCSwitch provider selectors are not accepted');
   if (body.previous_response_id != null && (typeof body.previous_response_id !== 'string' || !body.previous_response_id)) {
     throw failure(400, 'Invalid previous_response_id');
@@ -460,15 +460,15 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { remote, 
 }
 
 /**
- * Session-scoped, capability-protected Responses bridge for one primary CCSwitch
- * route, Official and direct relays. `url` is a provider base URL ending in
+ * Session-scoped, capability-protected Responses bridge for CCSwitch routes,
+ * Official and direct relays. `url` is a provider base URL ending in
  * /<token>/v1. No auth.json or OAuth flow is involved; the native Authorization
  * goes only to numeric loopback CCSwitch or, for an explicitly resolved official
  * route, the fixed TLS-verified ChatGPT endpoint. A direct relay never receives
  * it: the request carries the consented card's own key and headers instead.
  * An optional /<token>/provider/<encodedProviderId>/v1 prefix supplies an initial
  * provider hint to the resolver; it never determines a remote URL or overrides
- * an existing route. Model listing always uses the local CCSwitch endpoint.
+ * an existing route. Model listing follows CCSwitch's default card.
  *
  * Continuation state is intentionally in-memory and bounded. A request carrying
  * previous_response_id is accepted only after a successful response on this
@@ -491,7 +491,7 @@ export async function startSwitchGateway({
   officialRequestImpl, officialNetwork = null, resolveDirect = null, resolveModels = null, directTransport = null,
   maxBodyBytes = 32 * 1024 * 1024, bodyTimeoutMs = 30_000, upstreamTimeoutMs = 600_000, maxTrackedThreads = 4096,
 } = {}) {
-  // CCSwitch's listener; absent when the primary connects directly and CCSwitch has no proxy port.
+  // CCSwitch's listener; absent while CCSwitch runs no local proxy for Codex.
   const base = upstream == null ? null : upstreamUrl(upstream);
   if (typeof token !== 'string' || !/^[a-z0-9_-]{16,256}$/i.test(token)) throw new Error('A capability token of 16-256 URL-safe characters is required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid gateway port');
@@ -577,11 +577,11 @@ export async function startSwitchGateway({
       }
       if (path === 'models') {
         try { if (await verifyReady() === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
-        // Model listing follows the primary: its relay when it connects directly,
-        // otherwise CCSwitch's listener (which forwards to its default card).
+        // Model listing follows CCSwitch's default card, where new conversations
+        // start: its relay when it connects directly, otherwise CCSwitch's listener.
         let connection = null;
         try { connection = typeof resolveModels === 'function' ? await resolveModels() : null; }
-        catch { throw failure(503, 'The primary relay card is unavailable or changed'); }
+        catch { throw failure(503, 'CCSwitch\'s default card is unavailable or changed'); }
         if (connection) {
           const remote = await bindRelay(connection);
           await proxy(req, res, null, undefined, agent, upstreamTimeoutMs, query, { remote, endpoint: 'models' }); return;
@@ -598,7 +598,7 @@ export async function startSwitchGateway({
       if (!route || !['source', 'fallback'].includes(route.route) || !Number.isSafeInteger(route.revision) || route.revision < 0
           || (route.transport != null && !['ccswitch', 'official', 'direct'].includes(route.transport))
           || (route.ccswitchMode != null && (!['default', 'stack'].includes(route.ccswitchMode) || route.transport !== 'ccswitch'))
-          || (route.ccswitchMode === 'default' && (route.route !== 'source' || !route.providerId))
+          || (route.ccswitchMode === 'default' && !route.providerId)
           || (route.providerId != null && (typeof route.providerId !== 'string' || !route.providerId || route.providerId.length > 512 || /[\x00-\x1f\x7f]/.test(route.providerId)))
           || (route.transport === 'direct' && (!route.providerId || typeof route.providerFingerprint !== 'string' || route.sourceKey != null || route.ccswitchMode != null))
           // A Stack (non-default) CCSwitch route needs its explicit member selector.
@@ -606,8 +606,8 @@ export async function startSwitchGateway({
           || (route.sourceKey != null && (typeof route.sourceKey !== 'string' || !SOURCE_KEY.test(route.sourceKey)))
           || ROUTE_RECEIPT_FIELDS.some((field) => route[field] != null && !(Number.isSafeInteger(route[field])
             || (typeof route[field] === 'string' && route[field].length <= 512 && !/[\x00-\x1f\x7f]/.test(route[field]))))) throw failure(503, 'Session route is invalid');
-      // Saved selectors remain part of provider identity. Only an explicit,
-      // independently verified primary default route bypasses Stack rewriting.
+      // Saved selectors remain part of provider identity. Only CCSwitch's default
+      // route, verified against CCSwitch's current default card, has no selector.
       route = Object.freeze({ route: route.route, transport: route.transport || 'ccswitch', providerId: route.providerId ?? null,
         sourceKey: route.transport === 'ccswitch' ? route.sourceKey ?? null : null, revision: route.revision,
         ccswitchMode: route.transport === 'ccswitch' ? route.ccswitchMode ?? (route.sourceKey ? 'stack' : null) : null,
@@ -621,8 +621,8 @@ export async function startSwitchGateway({
       threads.delete(normalizedThread); threads.set(normalizedThread, context);
       if (threads.size > maxTrackedThreads) threads.delete(threads.keys().next().value);
       if (body.previous_response_id != null && !context.established) throw failure(409, 'Route continuity is unknown or changed; resend complete input without previous_response_id');
-      // The primary keeps its ordinary default route; a card whose login CCSwitch
-      // manages uses its explicit Stack selector; any other card is a direct relay.
+      // CCSwitch's default card takes CCSwitch's ordinary route; another card whose
+      // login CCSwitch manages uses its explicit Stack selector.
       const forwarded = route.transport === 'ccswitch' && route.sourceKey && route.ccswitchMode === 'stack'
         ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
       let remote;

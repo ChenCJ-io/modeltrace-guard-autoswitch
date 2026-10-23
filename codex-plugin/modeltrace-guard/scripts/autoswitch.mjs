@@ -15,39 +15,36 @@ import { loadArtifacts } from './guard.mjs';
 import { GATEWAY_IMPLEMENTATION_VERSION, gatewayRuntimeProblem, startSwitchGateway } from './switch-gateway.mjs';
 import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
 import { createOfficialNetwork, officialNetworkStatus, writeNetworkSetting } from './network-route.mjs';
-import { directRouteConnection } from './direct-route.mjs';
+import { directRouteConnection, readDirectCards } from './direct-route.mjs';
 import {
-  NATIVE_LOGINS, UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch, officialLogin,
-  loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady, verifyGatewayRoute,
+  NATIVE_LOGINS, UUID, atomicJSON, assertProviderCurrent, configPath, configureGateway, defaultCardId, gatewayURL, inspectCCSwitch, officialLogin,
+  loadGatewayConfig, publicConfig, readJSON, resolveProvider, routeDescriptor, runtimePath, validateGatewayConfig, verifyGatewayReady, verifyGatewayRoute,
 } from './provider-config.mjs';
 import {
-  enableAutoSwitch, failAutoSwitch, readReceipt, resolveSessionRoute, saveReceipt,
+  enableAutoSwitch, failAutoSwitch, newThreadRoute, readReceipt, resolveSessionRoute, resumeMonitoring, saveReceipt,
 } from './switch-policy.mjs';
 
 const entrypoint = fileURLToPath(import.meta.url);
 function argumentsFor(args) {
   const command = args.shift() || 'help', options = {};
   const allowed = {
-    help: [], check: ['cc-switch-dir'], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
+    help: [], check: ['cc-switch-dir'], inspect: ['cc-switch-dir'], configure: ['backup-name', 'backup-provider', 'cc-switch-dir', 'port'],
     connect: [], disconnect: [], 'connection-status': [], network: ['official-proxy'],
     'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], use: ['session'], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command');
   while (args.length) {
     const flag = args.shift();
+    if (command === 'configure' && ['--primary-name', '--primary-provider'].includes(flag)) {
+      throw new Error('Since 0.5 new conversations start on CCSwitch\'s default card, so there is no primary to configure: select the default card in CC Switch');
+    }
     if (!flag.startsWith('--') || !args.length || Object.hasOwn(options, flag.slice(2)) || !['data-dir', ...allowed[command]].includes(flag.slice(2))) throw new Error(`Invalid option ${flag}`);
     const value = args.shift();
     if (!value.trim() || value.includes('\0') || value.startsWith('--')) throw new Error(`Invalid value for ${flag}`);
     options[flag.slice(2)] = value;
   }
-  if (command === 'configure') {
-    // The backup is an optional recommendation; incidents list every CCSwitch card.
-    const hasNames = ['primary-name', 'backup-name'].some(key => Object.hasOwn(options, key));
-    const hasIds = ['primary-provider', 'backup-provider'].some(key => Object.hasOwn(options, key));
-    if (hasNames === hasIds || !Object.hasOwn(options, hasNames ? 'primary-name' : 'primary-provider')) {
-      throw new Error('Provide --primary-name [--backup-name] or --primary-provider [--backup-provider]; do not mix names and IDs');
-    }
-  }
+  // The optional recommended backup is named by name or by ID, not both.
+  if (command === 'configure' && options['backup-name'] && options['backup-provider']) throw new Error('Choose --backup-name or --backup-provider, not both');
   if (command === 'launch' && options['provider-name'] && options['provider-id']) throw new Error('Choose --provider-name or --provider-id, not both');
   return { command, options };
 }
@@ -57,8 +54,32 @@ async function controlRequest(config, action, method = 'GET') {
   if (!response.ok) throw new Error('Gateway control request failed');
   return response.json();
 }
+// An outdated (pre-0.5) configuration still identifies its running gateway,
+// so it can be stopped before connect writes the current configuration.
+async function stopOutdatedGateway(directory) {
+  const raw = await readJSON(configPath(directory));
+  if (!/^[a-f0-9]{64}$/.test(raw?.token || '') || !Number.isInteger(raw?.port)) return false;
+  try { await controlRequest(raw, 'shutdown', 'POST'); } catch { return false; }
+  for (let n = 0; n < 30; n++) {
+    try { await controlRequest(raw, 'health'); } catch { return true; }
+    await delay(100);
+  }
+  throw new Error('The previous gateway did not stop; stop it before connecting again');
+}
+async function outdatedGatewayRunning(directory) {
+  const raw = await readJSON(configPath(directory));
+  if (!/^[a-f0-9]{64}$/.test(raw?.token || '') || !Number.isInteger(raw?.port)) return false;
+  try { await controlRequest(raw, 'health'); return true; } catch { return false; }
+}
 export async function gatewayStatus(directory) {
-  const config = await loadGatewayConfig(directory), runtime = await readJSON(runtimePath(directory));
+  let config;
+  try { config = await loadGatewayConfig(directory); }
+  catch (error) {
+    if (error.code !== 'CONFIG_OUTDATED') throw error;
+    return { running: await outdatedGatewayRunning(directory), readiness: 'config_outdated',
+      instruction: 'Run connect (the user says “重新接入 ModelTrace”) to update the configuration; it stops this gateway, keeps its address and starts the updated one. Conversations started before, including one that runs connect, need a new conversation' };
+  }
+  const runtime = await readJSON(runtimePath(directory));
   try {
     const health = await controlRequest(config, 'health');
     if (!runtime || health.instanceId !== runtime.instanceId || runtime.configId !== config.id) return { running: false, reason: 'gateway_instance_mismatch' };
@@ -68,9 +89,15 @@ export async function gatewayStatus(directory) {
         expectedVersion: GATEWAY_IMPLEMENTATION_VERSION,
         instruction: 'The owned gateway still runs an older implementation. Stop this gateway and start it from the installed updated plugin; preserve its configuration and existing thread routes.' };
     }
-    let readiness = 'ready';
-    try { await verifyGatewayRoute(directory, config); } catch (error) { readiness = error.message; }
-    return { running: true, readiness, pid: runtime.pid, instanceId: runtime.instanceId, port: config.port, configId: config.id,
+    // `readiness` is the gateway itself; `newConversations` whether a new
+    // conversation can start on CCSwitch's current default card. Started
+    // conversations keep their own card and are checked per request.
+    let readiness = 'ready', newConversations = 'ready';
+    try {
+      const layout = await verifyGatewayRoute(directory, config);
+      try { await newThreadRoute(config, layout); } catch (error) { newConversations = error.message; }
+    } catch (error) { readiness = newConversations = error.message; }
+    return { running: true, readiness, newConversations, pid: runtime.pid, instanceId: runtime.instanceId, port: config.port, configId: config.id,
       implementationVersion: GATEWAY_IMPLEMENTATION_VERSION };
   } catch { return { running: false, reason: 'gateway_unreachable', port: config.port }; }
 }
@@ -78,6 +105,9 @@ export async function gatewayStatus(directory) {
 export async function startGateway(directory) {
   const current = await gatewayStatus(directory);
   if (current.readiness === 'upgrade_required') throw new Error('Gateway upgrade required: stop the owned gateway, then start it from the updated installed plugin');
+  if (current.readiness === 'config_outdated') {
+    throw Object.assign(new Error('The gateway configuration predates 0.5; run connect to update it (it restarts the gateway)'), { code: 'CONFIG_OUTDATED' });
+  }
   if (current.running) return current;
   const runtime = gatewayRuntimeProblem();
   if (runtime) throw new Error(`${runtime}. Put a newer node first on the PATH that Codex hooks use, or run disconnect to restore the previous provider`);
@@ -116,9 +146,15 @@ async function serveGateway(directory) {
     officialNetwork: createOfficialNetwork({ directory }),
     // A direct relay route re-reads its consented card for every request.
     resolveDirect: route => directRouteConnection(config.ccSwitchDirectory, route),
-    // Model listing goes to a directly connected primary's own relay.
-    resolveModels: () => (config.primary.transport === 'direct'
-      ? directRouteConnection(config.ccSwitchDirectory, { providerId: config.primary.id, providerFingerprint: config.primary.fingerprint }) : null),
+    // Model listing follows CCSwitch's default card: its own relay when it can be
+    // reached directly, otherwise CCSwitch's listener.
+    resolveModels: async () => {
+      const layout = await inspectCCSwitch(config.ccSwitchDirectory), id = layout.defaultProvider;
+      if (!id) return null;
+      let route;
+      try { route = routeDescriptor(layout, id, (await readDirectCards(config.ccSwitchDirectory, { id })).get(id)); } catch { return null; }
+      return route.transport === 'direct' ? directRouteConnection(config.ccSwitchDirectory, { providerId: id, providerFingerprint: route.fingerprint }) : null;
+    },
     onShutdown: () => resolveDone(),
   });
   await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port,
@@ -154,13 +190,13 @@ function requestFailure(receipt) {
   if (!receipt.completed) return { reason: 'gateway_response_interrupted',
     hint: 'The gateway response did not finish. Check cancellation or transport interruption before retrying the current route.' };
   return { reason: 'response_completion_unconfirmed',
-    hint: 'The gateway response has no verified successful response.completed outcome. Monitoring remains off until a successful primary response is recorded.' };
+    hint: 'The gateway response has no verified successful response.completed outcome. Monitoring and switching need a successful response of this thread first.' };
 }
 
 function publicReceipt(receipt, state, config) {
   if (!receipt) return null;
   const identities = [state?.autoSwitch?.current, state?.autoSwitch?.primary, state?.autoSwitch?.backup,
-    state?.initialRoute?.provider, config?.primary, config?.backup];
+    state?.initialRoute?.provider, config?.backup];
   const provider = identities.find(candidate => candidate?.id === receipt.providerId);
   const failure = requestFailure(receipt);
   // Only fixed diagnostics and receipt metadata leave this boundary. Never
@@ -187,14 +223,14 @@ export async function runAutoSwitch(args, env = process.env, {
   const { command, options } = argumentsFor([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return { commands: ['check', 'inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'network', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
-    check: 'check [--cc-switch-dir PATH] (read-only setup checklist: Node, sqlite3, Codex login and hooks, CCSwitch, primary, gateway, connection and switch targets, each with its fix)',
+    check: 'check [--cc-switch-dir PATH] (read-only setup checklist: Node, sqlite3, Codex login and hooks, CCSwitch proxy and default card, gateway, connection and switch targets, each with its fix)',
     network: 'network [--official-proxy auto|direct|http(s)://HOST:PORT] (show or set how the gateway reaches OpenAI Official; auto = gateway HTTPS_PROXY, then the OS system proxy, then direct; applies without a restart or configuration change)',
     use: 'Natural-language entry: use enables monitoring only for this already-connected thread; it never launches another CLI or approves a switch.',
     connect: 'One-time setup for ordinary codex: connect this Codex home\'s future new conversations to the gateway. Existing running threads are unchanged; monitoring remains off.',
     disconnect: 'Restore only the two defaults still owned by this plugin. Existing gateway conversations and monitoring are unchanged; the gateway stays running.',
-    configure: 'configure --primary-name NAME [--backup-name NAME] (or --primary-provider ID [--backup-provider ID]) [--cc-switch-dir PATH] [--port 15722]; the optional backup is only the recommended target when an incident lists every CCSwitch card',
-    launch: 'launch [--resume THREAD_ID] [--provider-name NAME | --provider-id ID] (default: primary; no global config edits)',
-    enable: 'enable [--session THREAD_ID] (monitor an already successful primary-route thread; never changes its route)',
+    configure: 'configure [--backup-name NAME | --backup-provider ID] [--cc-switch-dir PATH] [--port N] (optional: connect creates the configuration; new conversations start on CCSwitch\'s default card, the backup is only a recommended switch target)',
+    launch: 'launch [--resume THREAD_ID] [--provider-name NAME | --provider-id ID] (default: CCSwitch\'s default card; no global config edits)',
+    enable: 'enable [--session THREAD_ID] (monitor a thread with a successful gateway request on its current route; never changes its route)',
     disable: 'Stop monitoring and cancel a pending switch request; keep the selected route and any halt',
     incidents: 'Use guard.mjs candidates / choose / decline-switch / wait-switch for an incident request (propose-switch and approve-switch remain for a single proposed target)',
     switching: 'On an explicit user request, guard.mjs switch-route --target-name NAME verifies the target (receipt + fingerprint) and then moves only this thread; failure keeps the current route',
@@ -212,8 +248,15 @@ export async function runAutoSwitch(args, env = process.env, {
     }
     const runtime = gatewayRuntimeProblem();
     if (runtime) throw new Error(`${runtime}. Upgrade Node before connecting ordinary Codex; nothing was changed`);
-    const config = await loadGatewayConfig(directory);
-    const layout = await verifyGatewayRoute(directory, config);
+    let config = await loadGatewayConfig(directory).catch(error => error);
+    if (config instanceof Error && !['NOT_CONFIGURED', 'CONFIG_OUTDATED'].includes(config.code)) throw config;
+    const raw = config instanceof Error ? await readJSON(configPath(directory)) : null;
+    const ccSwitchDirectory = !(config instanceof Error) ? config.ccSwitchDirectory
+      : path.isAbsolute(raw?.ccSwitchDirectory || '') ? raw.ccSwitchDirectory : undefined;
+    // Everything that can refuse is checked before anything changes: new
+    // conversations start on CCSwitch's default card, and connect needs a
+    // native login and the trusted startup hook.
+    defaultCardId(await inspectCCSwitch(ccSwitchDirectory));
     const client = await openClient(env, { nativeOpenai: true });
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
@@ -222,20 +265,33 @@ export async function runAutoSwitch(args, env = process.env, {
       const { requireTrustedStartupHook } = await import('./startup.mjs');
       await requireTrustedStartupHook(client, process.cwd());
     } finally { await client.close(); }
+    if (config instanceof Error) {
+      // No configuration yet, or one from before 0.5: create the current one,
+      // keeping its CCSwitch directory, port, capability token (so Codex's entry
+      // URL stays the same) and recommended backup where still valid. The old
+      // configuration's gateway is stopped first.
+      const kept = ccSwitchDirectory ? { ccSwitchDirectory } : {};
+      if (raw !== null) await stopOutdatedGateway(directory);
+      const backup = typeof raw?.backup?.id === 'string' ? raw.backup.id : null;
+      await (backup ? configureGateway(directory, { ...kept, fallbackProvider: backup }) : Promise.reject())
+        .catch(() => configureGateway(directory, kept));
+      config = await loadGatewayConfig(directory);
+    }
+    // New conversations start on CCSwitch's default card; it must be defined.
+    defaultCardId(await verifyGatewayReady(directory, config));
     await startGateway(directory);
     const connection = await nativeIntegrationStatus(directory, env, { connect: openClient });
-    // A CCSwitch card switch usually means the user moved away from the primary;
-    // that only matters while the primary itself uses CCSwitch's default route.
-    const reconnect = (config.primary.transport !== 'ccswitch' || layout.defaultProvider === config.primary.id)
-      && ['installed', 'conflict', 'repair_pending'].includes(connection.phase);
+    // An explicit connect may restore the two entry values after CCSwitch or the
+    // user changed them; known original/owned values only (installNativeIntegration).
+    const reconnect = ['installed', 'conflict', 'repair_pending'].includes(connection.phase);
     return installNativeIntegration(directory, env, { connect: openClient, reconnect });
   }
   if (command === 'configure') {
+    // A running gateway keeps running when only the recommended backup changes.
     const current = await gatewayStatus(directory).catch(() => ({ running: false }));
-    if (current.running) throw new Error('Stop this gateway before reconfiguring it');
-    return configureGateway(directory, { primaryName: options['primary-name'], backupName: options['backup-name'],
-      sourceProvider: options['primary-provider'], fallbackProvider: options['backup-provider'],
-      ccSwitchDirectory: options['cc-switch-dir'], port: options.port === undefined ? 15722 : Number(options.port) });
+    return configureGateway(directory, { backupName: options['backup-name'], fallbackProvider: options['backup-provider'],
+      ccSwitchDirectory: options['cc-switch-dir'], port: options.port === undefined ? undefined : Number(options.port),
+      requireSameId: current.running === true });
   }
   if (command === 'network') {
     // Egress is not route identity: no stopped gateway, new config ID or route migration.
@@ -247,6 +303,7 @@ export async function runAutoSwitch(args, env = process.env, {
   if (command === 'gateway-status') return gatewayStatus(directory);
   if (command === 'gateway-stop') {
     const status = await gatewayStatus(directory);
+    if (status.readiness === 'config_outdated') return status.running ? { stopped: await stopOutdatedGateway(directory) } : { stopped: false, reason: 'not_running' };
     if (!status.running) return { stopped: false, reason: status.reason };
     const config = await loadGatewayConfig(directory);
     await controlRequest(config, 'shutdown', 'POST');
@@ -261,8 +318,9 @@ export async function runAutoSwitch(args, env = process.env, {
     const config = await loadGatewayConfig(directory);
     const layout = await verifyGatewayReady(directory, config);
     const explicitProvider = Boolean(options['provider-name'] || options['provider-id']);
-    const provider = explicitProvider ? resolveProvider(layout, { name: options['provider-name'], id: options['provider-id'] }) : config.primary;
-    assertProviderCurrent(layout, provider);
+    // Without an explicit card the new thread starts on CCSwitch's default card.
+    const id = explicitProvider ? resolveProvider(layout, { name: options['provider-name'], id: options['provider-id'] }).id : defaultCardId(layout);
+    const provider = routeDescriptor(layout, id, (await readDirectCards(config.ccSwitchDirectory, { id })).get(id));
     const executable = await executableFor(env);
     const client = await openClient(env, { nativeOpenai: true });
     try {
@@ -313,9 +371,14 @@ export async function runAutoSwitch(args, env = process.env, {
     const current = state?.autoSwitch?.current || state?.initialRoute?.provider;
     if (current?.transport === 'official') return { session, monitoringEnabled: false, status: 'personal_route_unmonitored',
       provider: current.name, instruction: 'This thread selected the personal Official route. No automatic probes or route changes are needed.' };
-    if (state?.autoSwitch) return { session, monitoringEnabled: state.enabled === true, status: 'existing_policy',
-      autoSwitch: state.autoSwitch, taskHalt: state.taskHalt || null, switchRequest: state.switchRequest || null,
-      instruction: 'Keep the saved route and any halt. Repeated natural-language use never re-arms a disabled policy or grants switch consent.' };
+    if (state?.autoSwitch && (state.taskHalt || ['pending', 'approved', 'verifying'].includes(state.switchRequest?.status))) {
+      return { session, monitoringEnabled: state.enabled === true, status: 'existing_policy',
+        autoSwitch: state.autoSwitch, taskHalt: state.taskHalt || null, switchRequest: state.switchRequest || null,
+        instruction: 'Settle the open incident or switch first. Use never grants switch consent or clears a halt.' };
+    }
+    // A thread that already switches routes (or stopped monitoring) turns monitoring on for its current route.
+    if (state?.autoSwitch) return { session, monitoringEnabled: true, status: 'monitoring_enabled', switchApproved: false,
+      autoSwitch: await monitorThread(directory, session, env, openClient, { resume: true }) };
     const config = await loadGatewayConfig(directory);
     const deadline = Date.now() + 1000;
     let receipt;
@@ -334,12 +397,12 @@ export async function runAutoSwitch(args, env = process.env, {
           instruction: 'This thread has gateway evidence for an earlier configuration. Inspect the changed configuration and preserve its saved route; use does not migrate an existing thread or approve a switch.' };
       }
       if (receipt) return { session, monitoringEnabled: false, status: 'gateway_request_failed', connection, gateway, lastRequest, switchApproved: false,
-        instruction: 'This thread already reached the gateway, but its latest request failed or did not complete successfully. Diagnose the reported request failure on the current route, then retry use after a successful primary response. A new conversation is not required merely because this request failed; no target verification or switch is approved.' };
+        instruction: 'This thread already reached the gateway, but its latest request failed or did not complete successfully. Diagnose the reported request failure on the current route, then retry use after a successful response. A new conversation is not required merely because this request failed; no target verification or switch is approved.' };
       if (state?.initialRoute) return { session, monitoringEnabled: false, status: 'gateway_request_unconfirmed', connection, gateway, lastRequest, switchApproved: false,
-        instruction: 'The gateway selected a route for this thread, but no completed request receipt is available yet. Inspect the in-flight request and gateway health; do not treat this as an old unconnected thread or enable monitoring without a successful primary response.' };
-      if (connection.readyForNewThreads && (!gateway.running || gateway.readiness !== 'ready')) {
+        instruction: 'The gateway selected a route for this thread, but no completed request receipt is available yet. Inspect the in-flight request and gateway health; do not treat this as an old unconnected thread or enable monitoring without a successful response.' };
+      if (connection.readyForNewThreads && (!gateway.running || gateway.readiness !== 'ready' || gateway.newConversations !== 'ready')) {
         return { session, monitoringEnabled: false, status: 'gateway_not_ready', connection, gateway, lastRequest, switchApproved: false,
-          instruction: 'The ordinary entry is installed, but the gateway or its primary route is not ready. Resolve the reported gateway readiness condition first; a new conversation cannot repair an old daemon, changed default card, automatic failover, or unavailable service.' };
+          instruction: 'The ordinary entry is installed, but the gateway or CCSwitch (its proxy mode or default card, see gateway.newConversations) is not ready. Resolve the reported condition first; a new conversation cannot repair an old daemon, an unavailable service or an unusable default card.' };
       }
       return { session, monitoringEnabled: false, status: connection.readyForNewThreads ? 'new_conversation_required' : 'connection_setup_required',
         connection, gateway, lastRequest, switchApproved: false,
@@ -348,6 +411,14 @@ export async function runAutoSwitch(args, env = process.env, {
           : 'Complete the one-time connect setup from the installed skill. It configures future ordinary codex conversations; no special launcher and no automatic monitoring. Check changed user/CCSwitch defaults before replacing anything.' };
     }
   }
+  const policy = await monitorThread(directory, session, env, openClient, { resume: Boolean((await readState(directory, session))?.autoSwitch) });
+  return command === 'use' ? { session, monitoringEnabled: true, status: 'monitoring_enabled', autoSwitch: policy, switchApproved: false } : policy;
+}
+
+// Start fingerprint monitoring with the thread's native settings: a new route
+// policy on the card the thread started on, or (`resume`) on the current route
+// of a thread that already switches routes or stopped monitoring.
+async function monitorThread(directory, session, env, openClient, { resume }) {
   const { bank } = await loadArtifacts();
   const legacy = await readState(env.MODELTRACE_GUARD_DATA || path.join(env.CODEX_HOME || path.join(homedir(), '.codex'), 'modeltrace-guard'), session);
   if (legacy?.enabled || legacy?.taskHalt) throw new Error('The upstream ModelTrace Guard still monitors or halts this thread; finish/stop that monitor before opting into this fork');
@@ -358,8 +429,8 @@ export async function runAutoSwitch(args, env = process.env, {
     ]);
     if (!bank.models.some(m => m.id === settings.model)) throw new Error('This exact model label is absent from the fingerprint bank; monitored switching is unavailable');
     await requireTrustedGuard(client, settings.cwd);
-    const policy = await enableAutoSwitch(directory, session, { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
-    return command === 'use' ? { session, monitoringEnabled: true, status: 'monitoring_enabled', autoSwitch: policy, switchApproved: false } : policy;
+    const readiness = { accountType: account?.type, modelProvider: settings.provider, model: settings.model };
+    return resume ? resumeMonitoring(directory, session, readiness) : enableAutoSwitch(directory, session, readiness);
   } finally { await client.close(); }
 }
 
@@ -369,6 +440,7 @@ if (process.argv[1] && realpathSync(process.argv[1]) === entrypoint) {
     process.stderr.write(JSON.stringify({ error: error.message,
       ...(typeof error.code === 'string' ? { code: error.code } : {}),
       ...(Array.isArray(error.candidates) ? { candidates: error.candidates.map(({ id, name }) => ({ id, name })) } : {}),
+      ...(typeof error.problem === 'string' ? { problem: error.problem } : {}),
     }) + '\n');
     process.exitCode = 1;
   }

@@ -59,12 +59,16 @@ export function noteUserReply(state, now) {
 // Approving, declining or resuming needs such an answer after the incident was
 // reported and acknowledged, so the model under suspicion cannot decide on the
 // user's behalf within its own turn. Each answer settles at most one decision.
-export function consumeUserReply(state, action) {
-  const reportedAt = (state.alerts || []).reduce((latest, alert) => Math.max(latest, alert.acknowledgedAt || 0),
-    Math.max(state.taskHalt?.at || 0, state.userDecisionAt || 0));
-  if (!(state.lastUserReplyAt > reportedAt)) {
+// Throws unless the user sent a message after the last report and decision.
+export function requireUserReply(state, action) {
+  const reportedAt = (state?.alerts || []).reduce((latest, alert) => Math.max(latest, alert.acknowledgedAt || 0),
+    Math.max(state?.taskHalt?.at || 0, state?.userDecisionAt || 0));
+  if (!(state?.lastUserReplyAt > reportedAt)) {
     throw new Error(`${action} needs the user's reply after the alert was reported and acknowledged. Report it, acknowledge it, end your turn, and act only on the user's next message.`);
   }
+}
+export function consumeUserReply(state, action) {
+  requireUserReply(state, action);
   state.userDecisionAt = state.lastUserReplyAt;
 }
 

@@ -44,18 +44,17 @@ async function routingFixture(directory) {
     INSERT INTO proxy_config(app_type,listen_address,listen_port) VALUES('codex','127.0.0.1',15721);
   `]);
   await atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: {
-    mode: 'proxy', attached: true, proxy_route: 'company',
-    stack: { enabled: true, members: ['company'], keys: { company: 'company' } },
+    mode: 'proxy', attached: true, proxy_route: 'company', stack: { enabled: false, members: [], keys: {} },
   } } });
-  await configureGateway(directory, { primaryName: 'API2 copy', backupName: 'OpenAI Official', ccSwitchDirectory: directory });
+  await configureGateway(directory, { backupName: 'OpenAI Official', ccSwitchDirectory: directory });
   return loadGatewayConfig(directory);
 }
 
 test('initial personal use remains unmonitored across startup and work without per-tool state writes', async t => {
   const { directory, session } = await fixture(t);
   const config = await routingFixture(directory);
-  // Personal use is an explicit bootstrap selection. An unselected thread now
-  // defaults to the company primary rather than silently choosing Official.
+  // Personal use is an explicit bootstrap selection. An unselected thread starts
+  // on CCSwitch's default card rather than silently choosing Official.
   const initial = await resolveSessionRoute(directory, config, session, config.backup.id);
   assert.equal(initial.transport, 'official'); assert.equal(initial.providerId, config.backup.id);
   await handleBackgroundHook({ session_id: session, hook_event_name: 'SessionStart', source: 'startup', model: 'gpt-6-astra' }, directory, {}, noInference);
@@ -71,8 +70,8 @@ test('initial personal use remains unmonitored across startup and work without p
   assert.equal(state.autoSwitch, undefined); assert.equal(state.initialRoute.provider.transport, 'official');
   assert.equal((await resolveSessionRoute(directory, config, session)).providerId, config.backup.id);
   const sibling = randomUUID(), defaultRoute = await resolveSessionRoute(directory, config, sibling);
-  assert.equal(defaultRoute.providerId, config.primary.id);
-  assert.equal(defaultRoute.transport, 'ccswitch');
+  assert.equal(defaultRoute.providerId, 'company');
+  assert.equal(defaultRoute.transport, 'ccswitch'); assert.equal(defaultRoute.ccswitchMode, 'default');
   assert.equal((await readState(directory, sibling)).enabled, false);
 });
 

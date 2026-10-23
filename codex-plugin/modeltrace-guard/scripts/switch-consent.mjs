@@ -3,9 +3,9 @@ import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { drainingRelay } from './stream-relay.mjs';
-import { consumeUserReply, digest, isMismatch, readState, record, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
-import { NATIVE_LOGINS, UUID, asConfiguredPrimary, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
-  officialLogin, readJSON, resolveProvider, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
+import { consumeUserReply, digest, isMismatch, readState, record, requireUserReply, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
+import { NATIVE_LOGINS, UUID, assertProviderCurrent, atomicJSON, ccswitchMode, defaultCardId, gatewayURL, loadGatewayConfig,
+  officialLogin, readJSON, resolveProvider, routeDescriptor, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
 const live = state => Boolean(state?.enabled && !state.runtimePaused && !state.compacting && !state.runtimeEndedAt);
 const consentPolicy = state => state?.autoSwitch?.protocol === 3 && state.autoSwitch.approvalMode === 'per_incident';
@@ -52,17 +52,31 @@ export async function saveReceipt(directory, config, receipt) {
   }
   await atomicJSON(receiptPath(directory, receipt.threadId), { ...safe, configId: config.id });
 }
-const routeFor = (config, provider, revision, extra = {}) => ({ route: provider.id === config.primary.id ? 'source' : 'fallback',
+// A conversation's 'source' is the card it started on.
+const routeFor = (startId, provider, revision, extra = {}) => ({ route: provider.id === startId ? 'source' : 'fallback',
   revision, sourceKey: provider.key, providerId: provider.id, providerFingerprint: provider.fingerprint,
-  transport: provider.transport, ccswitchMode: provider.transport === 'ccswitch' ? (provider.id === config.primary.id ? 'default' : 'stack') : null, ...extra });
-const providerMatchesReceipt = (provider, receipt, primary) => receipt?.providerId === provider.id
+  transport: provider.transport, ccswitchMode: ccswitchMode(provider), ...extra });
+const providerMatchesReceipt = (provider, receipt) => receipt?.providerId === provider.id
   && receipt.providerFingerprint === provider.fingerprint && receipt.transport === provider.transport && receipt.sourceKey === provider.key
-  && (provider.transport !== 'ccswitch' || receipt.ccswitchMode === (provider.id === primary.id ? 'default' : 'stack'));
-const checkedRoute = (config, layout, provider, revision, extra) => {
-  const route = routeFor(config, provider, revision, extra);
+  && (provider.transport !== 'ccswitch' || receipt.ccswitchMode === ccswitchMode(provider));
+const checkedRoute = (config, layout, provider, revision, extra, startId) => {
+  const route = routeFor(startId, provider, revision, extra);
   verifyRouteLayout(config, layout, route);
   return route;
 };
+// The route for a named card, including whether it can be reached directly.
+async function cardRoute(config, layout, id) {
+  const { readDirectCards } = await import('./direct-route.mjs');
+  return routeDescriptor(layout, id, (await readDirectCards(config.ccSwitchDirectory, { id })).get(id));
+}
+const selectedRoute = (config, layout, selection) => cardRoute(config, layout, resolveProvider(layout, selection).id);
+// The route a new conversation takes now (CCSwitch's default card), checked as
+// its first request would be. Nothing is written.
+export async function newThreadRoute(config, layout) {
+  const provider = await cardRoute(config, layout, defaultCardId(layout));
+  checkedRoute(config, layout, provider, 0, {}, provider.id);
+  return provider;
+}
 
 // The thread still runs the same native model through openai, signed in; an
 // Official target also needs the ChatGPT login it passes through. Checked
@@ -92,6 +106,17 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
   if (binding) {
     if (binding.expiresAt <= Date.now() || binding.configId !== config.id) throw new Error('Probe route binding expired or changed');
     const state = await readState(directory, binding.session), p = state?.autoSwitch;
+    if (binding.initial) {
+      // A thread without a route policy (standalone monitoring) is probed on
+      // the card it started on, never on CCSwitch's current default card.
+      if (!live(state) || p || state.pending?.id !== binding.challenge || state.epoch !== binding.epoch
+        || state.initialRoute?.configId !== config.id || !sameProvider(state.initialRoute.provider, binding.provider) || binding.revision !== 0) {
+        throw new Error('Probe route binding no longer belongs to a live checkpoint');
+      }
+      const layout = await verifyGatewayReady(directory, config);
+      assertProviderCurrent(layout, binding.provider);
+      return checkedRoute(config, layout, binding.provider, 0, { challenge: binding.challenge }, binding.provider.id);
+    }
     if (!live(state) || !consentPolicy(state) || state.pending?.id !== binding.challenge
       || state.epoch !== binding.epoch || p?.policyId !== binding.policyId || p.configId !== config.id) {
       throw new Error('Probe route binding no longer belongs to a live checkpoint');
@@ -107,7 +132,7 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
     assertProviderCurrent(layout, binding.provider);
     return checkedRoute(config, layout, binding.provider, binding.revision, {
       proposalId: binding.proposalId, approvalId: binding.approvalId, challenge: binding.challenge,
-    });
+    }, p.primary.id);
   }
   let state = await readState(directory, thread);
   if (state?.autoSwitch) {
@@ -116,46 +141,103 @@ export async function resolveSessionRoute(directory, config, thread, initialProv
     const layout = await verifyGatewayReady(directory, config);
     assertProviderCurrent(layout, p.current);
     // Existing routes override launch's bootstrap selection after a switch.
-    return checkedRoute(config, layout, p.current, p.revision);
+    return checkedRoute(config, layout, p.current, p.revision, {}, p.primary.id);
   }
   if (!state?.initialRoute) {
+    // A new conversation starts on CCSwitch's current default card and stays on
+    // it: a later change of CCSwitch's default only affects newer conversations.
+    // An explicit launch choice replaces the default card.
     const layout = await verifyGatewayReady(directory, config);
-    const provider = initialProviderId ? describeProvider(layout, initialProviderId) : config.primary;
-    checkedRoute(config, layout, provider, 0);
+    let provider;
+    if (initialProviderId) {
+      provider = await cardRoute(config, layout, initialProviderId);
+      checkedRoute(config, layout, provider, 0, {}, provider.id);
+    } else provider = await newThreadRoute(config, layout);
     await withState(directory, thread, s => { s.initialRoute ||= { configId: config.id, provider }; });
     state = await readState(directory, thread);
   }
-  if (state.initialRoute.configId !== config.id) throw new Error('Initial thread route belongs to an earlier configuration; launch a new thread');
+  if (state.initialRoute.configId !== config.id) throw new Error('Initial thread route belongs to an earlier configuration; start a new conversation');
   const layout = await verifyGatewayReady(directory, config);
   assertProviderCurrent(layout, state.initialRoute.provider);
-  return checkedRoute(config, layout, state.initialRoute.provider, 0);
+  return checkedRoute(config, layout, state.initialRoute.provider, 0, {}, state.initialRoute.provider.id);
 }
 
-export async function enableAutoSwitch(directory, session, { accountType, modelProvider, model }, now = Date.now()) {
+// What a route policy needs, read outside the state lock: the card this thread
+// started on under the current configuration, still usable, and a recent
+// successful request of this thread on it (just written receipts get a moment).
+async function policyStart(directory, session, { accountType, modelProvider, model }, monitor, now) {
   if (!UUID.test(session) || !NATIVE_LOGINS.includes(accountType) || modelProvider !== 'openai' || !model) {
-    throw new Error('Approval-based switching requires a signed-in native openai thread started through the gateway');
+    throw new Error('Route switching needs a signed-in native openai thread started through the gateway');
   }
-  const config = await loadGatewayConfig(directory);
-  verifyRouteLayout(config, await verifyGatewayReady(directory, config));
-  if (config.primary.transport === 'official') throw new Error('The selected primary is personal Official; monitoring remains off to avoid extra inference');
-  const receipt = await readReceipt(directory, session);
-  if (!receipt || receipt.configId !== config.id || !receipt.success || !receipt.completed || !providerMatchesReceipt(config.primary, receipt, config.primary)
-    || now - receipt.finishedAt > 10 * 60 * 1000 || receipt.finishedAt > now) {
-    throw new Error('No recent successful primary request through the gateway; launch with the primary first. Personal sessions are not silently rerouted or monitored');
+  const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
+  const start = (await readState(directory, session))?.initialRoute;
+  if (!start || start.configId !== config.id) {
+    throw new Error('This thread has no gateway route under the current configuration; start a new conversation after connecting');
   }
+  assertProviderCurrent(layout, start.provider);
+  verifyRouteLayout(config, layout, routeFor(start.provider.id, start.provider, 1));
+  if (monitor && start.provider.transport === 'official') throw new Error('This thread uses the personal Official route; monitoring remains off to avoid extra inference');
+  const fresh = receipt => receipt && receipt.configId === config.id && receipt.success && receipt.completed && providerMatchesReceipt(start.provider, receipt)
+    && now - receipt.finishedAt <= 10 * 60 * 1000 && receipt.finishedAt <= Date.now();
+  const deadline = Date.now() + 1000;
+  let receipt = await readReceipt(directory, session);
+  while (!fresh(receipt) && Date.now() < deadline) { await delay(25); receipt = await readReceipt(directory, session); }
+  if (!fresh(receipt)) {
+    throw new Error('No recent successful request of this thread through the gateway; send a message in this conversation first. Sessions are never silently rerouted or monitored');
+  }
+  return { config, start: start.provider };
+}
+
+// Creates the policy inside the state lock, after policyStart.
+function attachPolicy(state, { config, start }, { accountType, model }, monitor, now) {
+  if (state.autoSwitch) throw new Error('This thread already has a route policy');
+  if (!state.initialRoute || !sameProvider(state.initialRoute.provider, start)) throw new Error('This thread\'s route changed; send a message and try again');
+  state.model = state.expected = model; state.expectedSource = 'auto';
+  state.enabled = monitor; state.startedAt ||= now; state.enabledAt = now; state.runtimePaused = false;
+  state.runtimeEndedAt = null; state.monitoringStoppedReason = monitor ? null : 'routing_only';
+  if (monitor) segment(state, now, 'approval_monitor_enabled');
+  state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, policyId: randomUUID(), configId: config.id, accountType,
+    primary: start, backup: config.backup, current: start, phase: 'armed', route: 'source', revision: 1,
+    enabledAt: now, attempts: 0, noticePending: false, ...(monitor ? {} : { monitoringStoppedAt: now }) };
+  record(state, monitor ? 'approval_monitor_enabled' : 'route_policy_enabled', now,
+    { policyId: state.autoSwitch.policyId, start: start.id, backup: config.backup?.id ?? null });
+  return state.autoSwitch;
+}
+
+/**
+ * The thread's route policy, starting from the card it started on (its
+ * `primary` in policy terms). With `monitor`, fingerprint monitoring starts too;
+ * without it the thread only gains in-conversation route switching (requested
+ * switches still verify their target once). Either way it needs a recent
+ * successful request of this thread through the gateway.
+ */
+export async function enableAutoSwitch(directory, session, readiness, { monitor = true } = {}, now = Date.now()) {
+  const prepared = await policyStart(directory, session, readiness, monitor, now);
   return withState(directory, session, state => {
     if (state.taskHalt || state.pending || state.probeRun || state.confirmation?.status === 'active') throw new Error('Finish the current monitoring checkpoint/halt before enabling');
-    if (state.autoSwitch) throw new Error('This thread already has a route policy; no implicit re-arming or switch-back');
-    if (state.initialRoute && !sameProvider(state.initialRoute.provider, config.primary)) throw new Error('This session was started on another provider; no implicit switch to the primary');
+    return attachPolicy(state, prepared, readiness, monitor, now);
+  });
+}
+
+// "开启指纹监测" on a thread that already switches routes (or stopped
+// monitoring): monitor its current route, unless that is personal Official.
+export async function resumeMonitoring(directory, session, { accountType, modelProvider, model }, now = Date.now()) {
+  if (!NATIVE_LOGINS.includes(accountType) || modelProvider !== 'openai' || !model) throw new Error('Monitoring needs a signed-in native openai thread');
+  const config = await loadGatewayConfig(directory);
+  return withState(directory, session, state => {
+    const p = state.autoSwitch;
+    if (!consentPolicy(state) || p.configId !== config.id) throw new Error('This thread has no route policy for the current gateway configuration; start a new conversation');
+    if (state.enabled) return p;
+    if (p.current.transport === 'official') throw new Error('This thread uses the personal Official route; monitoring remains off to avoid extra inference');
+    if (state.taskHalt || unresolved(state.switchRequest) || state.pending || state.probeRun) throw new Error('Settle the open incident or switch before turning monitoring on');
     state.model = state.expected = model; state.expectedSource = 'auto';
-    state.enabled = true; state.startedAt ||= now; state.enabledAt = now; state.runtimePaused = false;
-    state.runtimeEndedAt = null; state.monitoringStoppedReason = null;
-    segment(state, now, 'approval_monitor_enabled');
-    state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, policyId: randomUUID(), configId: config.id, accountType,
-      primary: config.primary, backup: config.backup, current: config.primary, phase: 'armed', route: 'source', revision: 1,
-      enabledAt: now, attempts: 0, noticePending: false };
-    record(state, 'approval_monitor_enabled', now, { policyId: state.autoSwitch.policyId, primary: config.primary.id, backup: config.backup?.id ?? null });
-    return state.autoSwitch;
+    state.enabled = true; state.monitoringStoppedReason = null; state.runtimePaused = false; state.runtimeEndedAt = null;
+    p.enabled = true; p.monitoringStoppedAt = null;
+    // A settled failed or disabled request must not keep later incidents from asking.
+    if (!['armed', 'switched'].includes(p.phase)) p.phase = 'armed';
+    segment(state, now, 'monitoring_resumed');
+    record(state, 'monitoring_resumed', now, { policyId: p.policyId, providerId: p.current.id });
+    return p;
   });
 }
 
@@ -165,7 +247,7 @@ export function eligibleForSwitch(state, sample = state.samples.at(-1)) {
     && p.current.transport !== 'official' && !state.taskHalt && !unresolved(state.switchRequest)
     && isMismatch(sample) && sample.epoch === state.epoch && sample.expected === state.expected
     && r?.configId === p.configId && r.policyId === p.policyId && r.revision === p.revision
-    && r.success === true && r.completed === true && providerMatchesReceipt(p.current, r, p.primary));
+    && r.success === true && r.completed === true && providerMatchesReceipt(p.current, r));
 }
 
 function proposal(state, target, evidence, now) {
@@ -194,7 +276,7 @@ export function queueAutoSwitch(state, now, sample = state.samples.at(-1)) {
 
 export async function proposeSwitch(directory, session, id, selection, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
-  const target = selection?.name || selection?.id ? asConfiguredPrimary(config, layout, resolveProvider(layout, selection)) : config.backup;
+  const target = selection?.name || selection?.id ? await selectedRoute(config, layout, selection) : config.backup;
   if (!target) throw new Error('No recommended backup is configured; list the candidates and let the user choose a target');
   return withState(directory, session, state => {
     const old = currentRequest(state, id, { allowFailed: true });
@@ -219,6 +301,7 @@ export async function approveSwitch(directory, session, id, targetId, readiness,
     }
     assertReadiness(readiness, state, r.target, 'approval cannot start verification');
     assertProviderCurrent(layout, r.source); assertProviderCurrent(layout, r.target);
+    verifyRouteLayout(config, layout, routeFor(state.autoSwitch.primary.id, r.target, state.autoSwitch.revision + 1));
     consumeUserReply(state, 'Switch approval');
     r.approval = { id: randomUUID(), requestId: r.id, haltId: r.haltId, providerId: r.target.id, fingerprint: r.target.fingerprint,
       configId: r.configId, policyId: r.policyId, revision: r.revision, approvedAt: now, recordedBy: 'agent_reported_user_consent' };
@@ -295,6 +378,7 @@ export async function previewChoice(directory, session, id, selection) {
  */
 export async function chooseSwitchTarget(directory, session, id, selection, readiness, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
+  const named = selection.pick == null ? await selectedRoute(config, layout, selection) : null;
   return withState(directory, session, state => {
     const old = currentRequest(state, id, { allowFailed: true });
     if (!live(state) || !['pending', 'failed'].includes(old.status) || state.pending || state.probeRun) {
@@ -302,12 +386,12 @@ export async function chooseSwitchTarget(directory, session, id, selection, read
     }
     if (config.id !== old.configId) throw new Error('Gateway configuration changed; old consent cannot authorize this incident');
     if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before recording the user\'s choice');
-    const target = selection.pick != null ? listedTarget(old, selection.pick) : asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
+    const target = named || listedTarget(old, selection.pick);
     // A card edited after it was listed needs a fresh list and a fresh answer.
     assertProviderCurrent(layout, target); assertProviderCurrent(layout, old.source);
     if (sameProvider(target, old.source) || target.id === old.source.id) throw new Error('Choose a different provider from the current route');
-    // Returning to the primary needs its default card and disabled failover.
-    verifyRouteLayout(config, layout, routeFor(config, target, state.autoSwitch.revision + 1));
+    // A CCSwitch route needs CCSwitch's current state (default card, Aggregation).
+    verifyRouteLayout(config, layout, routeFor(state.autoSwitch.primary.id, target, state.autoSwitch.revision + 1));
     assertReadiness(readiness, state, target, 'approval cannot start verification');
     consumeUserReply(state, 'Switch approval');
     let r = old;
@@ -328,7 +412,7 @@ export async function chooseSwitchTarget(directory, session, id, selection, read
 
 export async function resolveSwitchTarget(directory, selection) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
-  return asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
+  return selectedRoute(config, layout, selection);
 }
 
 /**
@@ -342,21 +426,38 @@ export async function resolveSwitchTarget(directory, selection) {
  */
 export async function requestManualSwitch(directory, session, selection, readiness, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
-  const target = asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
+  const target = await selectedRoute(config, layout, selection);
+  // Switching does not require monitoring: a thread without a policy gains one
+  // for routing only, and monitoring stays off after the switch. That policy is
+  // created only once every check below has passed, so a refused request
+  // leaves the thread as it was.
+  const standalone = 'This conversation runs standalone monitoring (guard start); stop it with guard stop, or turn on monitoring with use, before switching routes';
+  const existing = await readState(directory, session);
+  let prepared = null;
+  if (!existing?.autoSwitch) {
+    requireUserReply(existing, 'A route switch');
+    if (existing?.enabled) throw new Error(standalone);
+    prepared = await policyStart(directory, session, readiness, false, now);
+  }
   return withState(directory, session, state => {
-    const p = state.autoSwitch;
-    if (!consentPolicy(state) || p.configId !== config.id) throw new Error('This thread has no route policy for the current gateway configuration; enable it with use first');
+    const policy = state.autoSwitch;
+    if (!policy && !prepared) throw new Error('This thread changed while the switch was prepared; ask again');
+    if (!policy && state.enabled) throw new Error(standalone);
+    if (policy && (!consentPolicy(state) || policy.configId !== config.id)) throw new Error('This thread has no route policy for the current gateway configuration; start a new conversation');
+    const current = policy ? policy.current : prepared.start, startId = policy ? policy.primary.id : current.id, revision = policy ? policy.revision : 1;
     if (state.taskHalt || unresolved(state.switchRequest)) throw new Error('An incident or switch request is still open; settle it with propose-switch, approve-switch, decline-switch or an explicit resume first');
     if (state.pending || state.probeRun || state.compacting || state.runtimeEndedAt || state.runtimePaused || state.confirmation?.status === 'active') {
       throw new Error('A monitoring checkpoint is in progress; retry the switch after it completes');
     }
     if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before switching');
-    if (sameProvider(target, p.current)) throw new Error(`This thread already uses ${JSON.stringify(target.name)}`);
-    assertReadiness(readiness, state, target, 'the switch cannot start verification');
-    assertProviderCurrent(layout, p.current); assertProviderCurrent(layout, target);
-    // Returning to the primary needs its default card and disabled failover.
-    verifyRouteLayout(config, layout, routeFor(config, target, p.revision + 1));
+    if (sameProvider(target, current)) throw new Error(`This thread already uses ${JSON.stringify(target.name)}`);
+    // A new routing-only policy takes this model label; an existing one must still match it.
+    assertReadiness(readiness, policy ? state : { model: readiness.model }, target, 'the switch cannot start verification');
+    assertProviderCurrent(layout, current); assertProviderCurrent(layout, target);
+    // A CCSwitch route needs CCSwitch's current state (default card, Aggregation).
+    verifyRouteLayout(config, layout, routeFor(startId, target, revision + 1));
     consumeUserReply(state, 'A route switch');
+    const p = policy || attachPolicy(state, prepared, readiness, false, now);
     const previous = { phase: p.phase, enabled: state.enabled, autoSwitchEnabled: p.enabled,
       monitoringStoppedReason: state.monitoringStoppedReason ?? null, monitoringStoppedAt: p.monitoringStoppedAt ?? null };
     // The single canary needs live monitoring; a later Official success stops it
@@ -418,7 +519,7 @@ export function finishVerification(state, sample, checkpoint, now) {
     && receipt?.success === true && receipt.completed === true && receipt.configId === p.configId
     && receipt.policyId === p.policyId && receipt.revision === p.revision + 1
     && receipt.proposalId === r.id && receipt.approvalId === r.approval.id && receipt.challenge === checkpoint.id
-    && providerMatchesReceipt(r.target, receipt, p.primary) && sample.expected === state.taskHalt.expected
+    && providerMatchesReceipt(r.target, receipt) && sample.expected === state.taskHalt.expected
     && sample.outcome === 'compatible' && (sample.prediction === sample.expected || sameConfusableGroup(sample));
   if (!success) { failAutoSwitch(state, now, 'approved_target_verification_failed'); return true; }
   r.status = 'succeeded'; r.finishedAt = now;
@@ -428,7 +529,12 @@ export function finishVerification(state, sample, checkpoint, now) {
     proposalId: r.id, approvalId: r.approval.id, providerId: r.target.id, prediction: sample.prediction };
   record(state, 'autoswitch_verified', now, { haltId: state.taskHalt.id, requestId: r.id, providerId: r.target.id, approvalId: r.approval.id });
   state.taskHalt = null; state.pending = null; state.epoch++; state.forceProbe = false;
-  if (!stopMonitoringOnPersonalRoute(state, now)) schedule(state, now);
+  // Switching never starts monitoring on its own: monitoring the user never
+  // enabled (or disabled) stays off on any route. Monitoring that only paused
+  // for personal Official resumes on a third-party route.
+  if (r.kind === 'manual' && r.previous?.enabled === false && r.previous.monitoringStoppedReason !== 'personal_route') {
+    stopMonitoring(state, now, r.previous.monitoringStoppedReason || 'routing_only'); p.monitoringStoppedAt = now;
+  } else if (!stopMonitoringOnPersonalRoute(state, now)) schedule(state, now);
   return true;
 }
 
@@ -445,24 +551,31 @@ export function switchControlContext(state, directory, root) {
   }
   if (p.phase === 'verifying' && r.status === 'verifying' && r.kind === 'manual') return `ModelTrace AutoSwitch: the user asked to switch this thread from ${JSON.stringify(r.source.name)} to ${JSON.stringify(r.target.name)}. Its fingerprint and route are being verified with one probe before routing changes. Keep original task work paused; do not replay work tools. Use the bounded read-only command: ${command('wait-switch')}. On autoswitch_verified, report the new route; on failure the thread keeps ${JSON.stringify(r.source.name)}, the pause is released, and you report the reason.`;
   if (p.phase === 'verifying' && r.status === 'verifying') return `ModelTrace AutoSwitch: the user approved ${JSON.stringify(r.target.name)} for this incident. Keep original task work paused while the approved target is verified. Do not clear the halt or replay work tools. Use the bounded read-only command: ${command('wait-switch')}. Continue only after autoswitch_verified; failure retains the halt and current route.`;
-  return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, list the routes again with ${command('candidates')} and record the user's answer with ${command('choose', ' --pick <N>')}; it creates a NEW request ID. If comparison conditions changed, request a new primary check after an explicit resume instead.`;
+  return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, list the routes again with ${command('candidates')} and record the user's answer with ${command('choose', ' --pick <N>')}; it creates a NEW request ID. If comparison conditions changed, request a new check of the current route after an explicit resume instead.`;
 }
 
+// The probe fork is bound to the route the source thread uses: its policy's
+// current route (or an approved target), or, for a thread monitored without a
+// route policy, the card it started on. A thread that never went through the
+// gateway keeps its own provider (null).
 export async function prepareSwitchTransport(directory, snapshot, pending) {
   const state = await readState(directory, snapshot.sourceSession);
-  if (!state?.autoSwitch) return null;
-  if (!consentPolicy(state) || snapshot.provider !== 'openai') throw new Error('Switch probes require the v0.3 native openai consent contract');
+  const p = state?.autoSwitch;
+  if (!p && !state?.initialRoute) return null;
+  if ((p && !consentPolicy(state)) || snapshot.provider !== 'openai') throw new Error('Switch probes require the v0.3 native openai consent contract');
   const config = await loadGatewayConfig(directory);
-  if (config.id !== state.autoSwitch.configId) throw new Error('Switch configuration changed');
+  if (config.id !== (p ? p.configId : state.initialRoute.configId)) throw new Error('Switch configuration changed');
   const layout = await verifyGatewayReady(directory, config);
-  const canary = pending.kind === 'fallback_verification', p = state.autoSwitch;
+  const canary = pending.kind === 'fallback_verification';
+  if (canary && !p) throw new Error('No live incident approval for this canary');
   const request = canary ? currentRequest(state, pending.proposalId) : null;
   if (canary && (!isVerification(state) || pending.approvalId !== request.approval?.id)) throw new Error('No live incident approval for this canary');
-  const provider = canary ? request.target : p.current, revision = p.revision + (canary ? 1 : 0);
+  const provider = canary ? request.target : p ? p.current : state.initialRoute.provider;
+  const revision = p ? p.revision + (canary ? 1 : 0) : 0;
   assertProviderCurrent(layout, provider);
-  const binding = { session: snapshot.sourceSession, configId: config.id, policyId: p.policyId,
+  const binding = { session: snapshot.sourceSession, configId: config.id, policyId: p?.policyId ?? null,
     challenge: pending.id, epoch: state.epoch, provider, revision, expiresAt: pending.expiresAt,
-    proposalId: request?.id || null, approvalId: request?.approval?.id || null };
+    proposalId: request?.id || null, approvalId: request?.approval?.id || null, ...(p ? {} : { initial: true }) };
   let forkId;
   // The fork talks to a local relay that keeps reading the gateway response to
   // EOF. Native Codex stops reading at response.completed and the probe closes
@@ -482,7 +595,7 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
       const deadline = Math.min(pending.expiresAt, Date.now() + 10000);
       let receipt;
       const matches = receipt => receipt && receipt.configId === config.id && receipt.threadId === forkId && receipt.revision === revision
-        && providerMatchesReceipt(provider, receipt, p.primary) && receipt.challenge === pending.id
+        && providerMatchesReceipt(provider, receipt) && receipt.challenge === pending.id
         && receipt.proposalId === binding.proposalId && receipt.approvalId === binding.approvalId
         && receipt.startedAt >= pending.at && receipt.success === true && receipt.completed === true;
       do {
@@ -494,7 +607,7 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
         throw new Error('No completed successful gateway receipt for this exact approved/native probe');
       }
       await resolveSessionRoute(directory, config, forkId);
-      return { ...receipt, policyId: p.policyId };
+      return { ...receipt, policyId: p?.policyId ?? null };
     },
     // Read before close() deletes the per-fork files, so a failed probe keeps
     // the gateway's status/transport evidence instead of only "probe_failed".

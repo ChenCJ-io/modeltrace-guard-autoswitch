@@ -25,6 +25,18 @@ test('startup leaves absent, removed, changed or overridden connections alone', 
   }
 });
 
+test('a configuration from before 0.5 asks for an explicit reconnect instead of starting anything', async () => {
+  const output = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', source: 'startup' }, '/fixture', { MODELTRACE_LANG: 'zh' }, {
+    integrationStatus: async () => ({ phase: 'config_outdated', readyForNewThreads: false }), start: async () => assert.fail('must not start'),
+  });
+  assert.match(output.systemMessage, /^ModelTrace：插件已升级到 0\.5，网关配置需要更新：在终端运行 node ".+autoswitch\.mjs" connect/);
+  assert.match(output.systemMessage, /对 Codex 说“重新接入 ModelTrace”，但这个会话会随之断开/);
+  const english = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', source: 'resume' }, '/fixture', { MODELTRACE_LANG: 'en' }, {
+    integrationStatus: async () => ({ phase: 'config_outdated', readyForNewThreads: false }), start: async () => assert.fail('must not start'),
+  });
+  assert.match(english.systemMessage, /^ModelTrace: The plugin was upgraded to 0\.5/);
+});
+
 test('probe and subagent startup cannot recurse into gateway setup', async () => {
   for (const [event, env] of [[{ hook_event_name: 'SessionStart' }, { MODELTRACE_PROBE_PROCESS: '1' }],
     [{ hook_event_name: 'SessionStart', agent_id: 'child' }, {}], [{ hook_event_name: 'SessionStart', parent_session_id: 'parent' }, {}],

@@ -8,9 +8,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import {
-  assertProviderCurrent, atomicJSON, configPath, configureGateway, describeProvider,
-  inspectCCSwitch, loadGatewayConfig, resolveProvider, sameProvider, verifyGatewayReady, verifyGatewayRoute, verifyLayout,
+  assertProviderCurrent, atomicJSON, configPath, configureGateway, defaultCardId, describeProvider,
+  inspectCCSwitch, loadGatewayConfig, resolveProvider, routeDescriptor, sameProvider, verifyGatewayReady, verifyGatewayRoute, verifyRouteLayout,
 } from '../scripts/provider-config.mjs';
+import { readDirectCards } from '../scripts/direct-route.mjs';
 
 const execute = promisify(execFile);
 const sqlValue = value => value == null ? 'NULL' : `'${String(value).replaceAll("'", "''")}'`;
@@ -19,6 +20,8 @@ const syntheticLogin = 'synthetic-login-never-exported';
 const syntheticAccount = 'synthetic-bound-account-never-exported';
 const plainOfficial = { auth: {}, config: '' };
 const nativeMeta = { providerType: 'codex_oauth' };
+// A key-based card the gateway can connect to directly.
+const relayCard = { auth: {}, config: 'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example.invalid/v1"\nwire_api = "responses"\nexperimental_bearer_token = "synthetic-relay-token"\n' };
 
 async function fixture(t) {
   const directory = await mkdtemp(path.join(tmpdir(), 'provider-config-test-'));
@@ -96,63 +99,90 @@ test('provider names use exact matches first, then one case-insensitive match, n
   assert.throws(() => resolveProvider(layout, { name: 'API2COPY' }), { code: 'AMBIGUOUS_PROVIDER' });
 });
 
-test('schema 2 config preserves the company default and exposes stable primary and backup descriptors without a token', async t => {
+test('the configuration records only an optional recommended backup, keeps its capability token and never a key', async t => {
   const f = await fixture(t), before = await readFile(path.join(f.directory, 'live-state.json'), 'utf8');
-  const configured = await configureGateway(f.directory, {
-    primaryName: 'API2copy', backupName: 'OpenAI Official', ccSwitchDirectory: f.directory,
-  });
-  assert.equal(configured.schema, 2);
-  assert.equal(Object.hasOwn(configured, 'token'), false);
-  assert.equal(configured.primary.id, 'company');
-  // This card has no provider configuration to connect to directly, so the
-  // primary keeps CCSwitch's default route (with its requirements).
-  assert.equal(configured.primary.transport, 'ccswitch');
-  assert.equal(configured.primary.key, null);
-  assert.equal(configured.backup.id, 'official');
-  assert.equal(configured.backup.transport, 'official');
-  assert.equal(configured.backup.key, null);
-  const saved = await loadGatewayConfig(f.directory), layout = await verifyGatewayReady(f.directory, saved);
+  await f.put({ id: 'other', name: 'Other Relay', config: relayCard });
+  const configured = await configureGateway(f.directory, { backupName: 'OpenAI Official', ccSwitchDirectory: f.directory });
+  assert.equal(configured.schema, 3); assert.equal(Object.hasOwn(configured, 'token'), false);
+  assert.equal(Object.hasOwn(configured, 'primary'), false, 'new conversations start on CCSwitch\'s default card instead');
+  assert.deepEqual([configured.backup.id, configured.backup.transport, configured.backup.key], ['official', 'official', null]);
+  const saved = await loadGatewayConfig(f.directory);
   assert.match(saved.token, /^[a-f0-9]{64}$/);
-  assert.equal(layout.defaultProvider, 'company');
-  assert.equal(verifyLayout(saved, { ...layout, defaultProvider: 'other' }), true, 'base validation does not reroute an already selected Official session');
-  // The backup is only a recommendation: an edited or removed backup card must not block the primary.
-  const editedBackup = { ...layout, providers: layout.providers.map(p => (p.id === 'official' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) };
-  assert.equal(verifyLayout(saved, editedBackup), true);
-  assert.equal(verifyLayout(saved, { ...layout, providers: layout.providers.filter(p => p.id !== 'official') }), true);
-  const editedPrimary = { ...layout, providers: layout.providers.map(p => (p.id === 'company' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) };
-  assert.throws(() => verifyLayout(saved, editedPrimary), /configuration changed/);
-  await verifyGatewayRoute(f.directory, saved);
+  // A key-based backup is reached directly; CCSwitch's default card is never one.
+  const relay = await configureGateway(f.directory, { backupName: 'Other Relay', ccSwitchDirectory: f.directory });
+  assert.deepEqual([relay.backup.transport, relay.backup.key], ['direct', null]);
+  const again = await loadGatewayConfig(f.directory);
+  assert.equal(again.token, saved.token, 'Codex keeps the same entry URL');
+  assert.equal(again.id, saved.id, 'changing only the recommended backup keeps routes and conversations'); assert.equal(relay.configurationKept, true);
+  await assert.rejects(configureGateway(f.directory, { port: 15999, requireSameId: true }), /Stop this gateway/);
+  assert.equal((await loadGatewayConfig(f.directory)).port, saved.port, 'refused before anything is written');
+  const moved = await configureGateway(f.directory, { backupName: 'Other Relay', port: 15999 });
+  assert.equal(moved.configurationKept, false); assert.notEqual((await loadGatewayConfig(f.directory)).id, saved.id);
+  await assert.rejects(configureGateway(f.directory, { backupName: 'API2copy', ccSwitchDirectory: f.directory }), /Recommend a card/);
+  const none = await configureGateway(f.directory, { ccSwitchDirectory: f.directory });
+  assert.equal(none.backup, null);
+  assert.ok(!(await readFile(configPath(f.directory), 'utf8')).includes('synthetic-relay-token'), 'the configuration never stores a card key');
   assert.equal(await readFile(path.join(f.directory, 'live-state.json'), 'utf8'), before);
-  const thirdPartyBackup = await configureGateway(f.directory, {
-    primaryName: 'API2copy', backupName: 'Other Relay', ccSwitchDirectory: f.directory,
-  });
-  // An ordinary third-party card is a direct relay, even when it is also a Stack member.
-  assert.equal(thirdPartyBackup.backup.transport, 'direct');
-  assert.equal(thirdPartyBackup.backup.key, null);
+  // Without any CCSwitch listener the configuration has no CCSwitch upstream.
+  await f.sql('DELETE FROM proxy_config');
+  assert.equal((await configureGateway(f.directory, { ccSwitchDirectory: f.directory })).upstream, null);
 });
 
-test('primary readiness fails closed on default drift, enabled or unknown failover, without changing configuration', async t => {
+test('new conversations start on CCSwitch\'s default card, which needs CCSwitch\'s proxy', async t => {
+  const f = await fixture(t), layout = await f.inspect();
+  assert.equal(defaultCardId(layout), 'company');
+  assert.throws(() => defaultCardId({ ...layout, mode: 'direct' }), { code: 'CCSWITCH_NOT_PROXIED' });
+  assert.throws(() => defaultCardId({ ...layout, attached: false }), { code: 'CCSWITCH_NOT_PROXIED' });
+  assert.throws(() => defaultCardId({ ...layout, pending: true }), { code: 'CCSWITCH_NOT_PROXIED' });
+  assert.throws(() => defaultCardId({ ...layout, defaultProvider: null }), { code: 'NO_DEFAULT_CARD' });
+  assert.throws(() => defaultCardId({ ...layout, defaultProvider: 'deleted' }), { code: 'NO_DEFAULT_CARD' });
+});
+
+test('a card takes the direct route when its saved configuration allows it, otherwise only CCSwitch\'s routes', async t => {
   const f = await fixture(t);
-  await configureGateway(f.directory, { primaryName: 'API2copy', backupName: 'OpenAI Official', ccSwitchDirectory: f.directory });
-  const config = await loadGatewayConfig(f.directory), before = await readFile(configPath(f.directory));
-  const layout = await f.inspect();
-  for (const variant of [
-    { ...layout, defaultProvider: 'other' },
-    { ...layout, listener: { ...layout.listener, auto_failover_enabled: 1 } },
-    { ...layout, listener: { listen_address: '127.0.0.1', listen_port: 15721 } },
-  ]) {
-    await assert.rejects(verifyGatewayRoute(f.directory, config, undefined, async () => variant), /default provider changed|automatic failover/);
-    await assert.rejects(configureGateway(f.directory, { primaryName: 'API2copy', backupName: 'OpenAI Official', ccSwitchDirectory: f.directory }, async () => variant), /default provider changed|automatic failover/);
-    assert.deepEqual(await readFile(configPath(f.directory)), before);
-    await verifyGatewayRoute(f.directory, config, { transport: 'official', providerId: 'official', route: 'fallback' }, async () => variant);
-  }
-  const route = { transport: 'ccswitch', route: 'source', ccswitchMode: 'default', providerId: config.primary.id,
-    providerFingerprint: config.primary.fingerprint, sourceKey: config.primary.key };
+  await f.put({ id: 'other', name: 'Other Relay', config: relayCard });
+  await f.put({ id: 'copilot', name: 'Copilot', meta: { providerType: 'github_copilot' } });
+  const layout = await f.inspect(), cards = await readDirectCards(f.directory);
+  assert.deepEqual(routeDescriptor(layout, 'other', cards.get('other')), describeProvider(layout, 'other'));
+  assert.equal(routeDescriptor(layout, 'other', cards.get('other')).transport, 'direct');
+  // No usable direct configuration: only as CCSwitch's default card.
+  const company = routeDescriptor(layout, 'company', cards.get('company'));
+  assert.deepEqual([company.transport, company.key], ['ccswitch', null]);
+  assert.throws(() => routeDescriptor({ ...layout, defaultProvider: 'other' }, 'company', cards.get('company')),
+    error => error.code === 'DIRECT_UNUSABLE' && error.problem === 'card_provider_missing');
+  assert.throws(() => routeDescriptor({ ...layout, defaultProvider: 'other' }, 'company', undefined), error => error.problem === 'card_config_unreadable');
+  assert.throws(() => routeDescriptor({ ...layout, defaultProvider: 'company' }, 'other', { ...cards.get('other'), fingerprint: 'e'.repeat(64) }),
+    error => error.problem === 'card_changed', 'a reading of another card version never counts');
+  // A login CCSwitch manages: its default card, or an Aggregation member.
+  assert.throws(() => routeDescriptor(layout, 'copilot'), { code: 'NOT_IN_STACK' });
+  assert.deepEqual(routeDescriptor({ ...layout, defaultProvider: 'copilot' }, 'copilot').key, null);
+  const stacked = { ...layout, stack: { enabled: true, members: ['copilot'], keys: { copilot: 'copilot' } } };
+  assert.deepEqual([routeDescriptor(stacked, 'copilot').transport, routeDescriptor(stacked, 'copilot').key], ['ccswitch', 'copilot']);
+  assert.equal(routeDescriptor(layout, 'official').transport, 'official');
+});
+
+test('CCSwitch\'s default route fails closed on default drift and enabled or unknown failover; other routes do not depend on it', async t => {
+  const f = await fixture(t);
+  await configureGateway(f.directory, { backupName: 'OpenAI Official', ccSwitchDirectory: f.directory });
+  const config = await loadGatewayConfig(f.directory), layout = await f.inspect();
+  const route = { transport: 'ccswitch', route: 'source', ccswitchMode: 'default', providerId: 'company', sourceKey: null };
   await verifyGatewayRoute(f.directory, config, route);
-  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, ccswitchMode: 'stack' }), /route mode/);
-  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, providerFingerprint: 'changed' }), /identity changed/);
-  await assert.rejects(verifyGatewayRoute(f.directory, config, { ...route, providerId: 'other' }), /route mode/);
-  await verifyGatewayRoute(f.directory, config, { transport: 'ccswitch', route: 'fallback', ccswitchMode: 'stack', providerId: 'other' });
+  assert.equal(verifyRouteLayout(config, layout, { ...route, route: 'fallback' }), true, 'a conversation may switch to CCSwitch\'s default card');
+  for (const [variant, expected] of [
+    [{ ...layout, defaultProvider: 'other' }, /default card changed/],
+    [{ ...layout, listener: { ...layout.listener, auto_failover_enabled: 1 } }, /automatic failover/],
+    [{ ...layout, listener: { listen_address: '127.0.0.1', listen_port: 15721 } }, /automatic failover/],
+    [{ ...layout, mode: 'direct' }, /local proxy/],
+    [{ ...layout, listener: { ...layout.listener, listen_port: 15999 } }, /listener/],
+  ]) {
+    assert.throws(() => verifyRouteLayout(config, variant, route), expected);
+    assert.equal(verifyRouteLayout(config, variant, { transport: 'official', providerId: 'official', route: 'fallback' }), true);
+    assert.equal(verifyRouteLayout(config, variant, { transport: 'direct', providerId: 'other', route: 'fallback' }), true);
+  }
+  assert.throws(() => verifyRouteLayout(config, layout, { ...route, ccswitchMode: 'stack' }), /route mode/);
+  assert.equal(verifyRouteLayout(config, layout, { transport: 'ccswitch', route: 'fallback', ccswitchMode: 'stack', providerId: 'other', sourceKey: 'other' }), true);
+  assert.throws(() => verifyRouteLayout(config, { ...layout, stack: { enabled: false, members: [], keys: {} } },
+    { transport: 'ccswitch', route: 'fallback', ccswitchMode: 'stack', providerId: 'other', sourceKey: 'other' }), { code: 'NOT_IN_STACK' });
 });
 
 test('Official account bindings and every extra auth field are rejected even if a stale Stack membership remains', async t => {
@@ -260,12 +290,17 @@ test('provider names and saved connection changes invalidate descriptors without
   assert.equal(JSON.stringify(rotated).includes(syntheticLogin), false);
 });
 
-test('schema 1 automatic-switch configuration is rejected without rewriting or silently migrating it', async t => {
+test('configurations from before 0.5 are reported as outdated without rewriting them', async t => {
   const f = await fixture(t);
-  await atomicJSON(configPath(f.directory), { schema: 1, sourceProvider: 'company', fallbackProvider: 'official', token: syntheticLogin });
-  const before = await readFile(configPath(f.directory), 'utf8');
-  await assert.rejects(loadGatewayConfig(f.directory), /reconfigure.*per-incident approval/);
-  assert.equal(await readFile(configPath(f.directory), 'utf8'), before);
+  for (const legacy of [{ schema: 1, sourceProvider: 'company', fallbackProvider: 'official', token: syntheticLogin },
+    { schema: 2, id: '11111111-1111-4111-8111-111111111111', primary: { id: 'company' }, backup: null, token: 'a'.repeat(64), port: 15722 }]) {
+    await atomicJSON(configPath(f.directory), legacy);
+    const before = await readFile(configPath(f.directory), 'utf8');
+    await assert.rejects(loadGatewayConfig(f.directory), error => error.code === 'CONFIG_OUTDATED' && /predates 0\.5/.test(error.message));
+    assert.equal(await readFile(configPath(f.directory), 'utf8'), before);
+  }
+  await rm(configPath(f.directory));
+  await assert.rejects(loadGatewayConfig(f.directory), { code: 'NOT_CONFIGURED' });
 });
 
 test('inspection waits out CCSwitch\'s brief commit lock instead of failing the request', async t => {
@@ -282,46 +317,17 @@ test('inspection waits out CCSwitch\'s brief commit lock instead of failing the 
   await exited;
 });
 
-test('a pre-0.5 Stack route to a card that is now direct keeps working until the user switches it', () => {
+test('a saved route only matches the same unchanged card of a kind that can take it', () => {
   const fingerprint = 'a'.repeat(64);
-  const layout = { primaryId: 'company', defaultProvider: 'company', stack: { enabled: true, members: ['company', 'relay'], keys: { company: 'company', relay: 'relay' } },
+  const layout = { defaultProvider: 'company', stack: { enabled: false, members: [], keys: {} },
     providers: [{ id: 'company', name: 'Company', category: null, fingerprint: 'b'.repeat(64), nativeOfficial: 0, followsNativeLogin: 0, managedCodexAccount: 0, delegatedAuth: 0 },
       { id: 'relay', name: 'Relay', category: null, fingerprint, nativeOfficial: 0, followsNativeLogin: 0, managedCodexAccount: 0, delegatedAuth: 0 }] };
-  assert.equal(describeProvider(layout, 'relay').transport, 'direct');
-  const legacy = { id: 'relay', name: 'Relay', fingerprint, transport: 'ccswitch', key: 'relay' };
-  assertProviderCurrent(layout, legacy);
-  assert.throws(() => assertProviderCurrent(layout, { ...legacy, fingerprint: 'c'.repeat(64) }), /fresh consent/, 'an edited card still needs a new choice');
-  assert.throws(() => assertProviderCurrent(layout, { ...legacy, transport: 'official', key: null }), /fresh consent/);
-});
-
-test('a key-based primary connects directly, so CCSwitch only needs to hold its card', async t => {
-  const f = await fixture(t);
-  const relay = { auth: {}, config: 'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example.invalid/v1"\nwire_api = "responses"\nexperimental_bearer_token = "synthetic-relay-token"\n' };
-  await f.put({ id: 'company', name: 'API2copy', config: relay });
-  // No proxy mode, another default card and failover on: none of it matters to a direct primary.
-  f.live.apps.codex = { mode: 'direct', attached: false, proxy_route: 'other', stack: { enabled: false, members: [], keys: {} } };
-  await f.saveLive();
-  await f.sql("UPDATE proxy_config SET auto_failover_enabled=1 WHERE app_type='codex'");
-  const configured = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
-  assert.equal(configured.primary.transport, 'direct'); assert.equal(configured.primary.key, null);
-  assert.equal(configured.upstream, 'http://127.0.0.1:15721/v1');
-  const saved = await loadGatewayConfig(f.directory);
-  await verifyGatewayRoute(f.directory, saved);
-  assert.ok(!(await readFile(configPath(f.directory), 'utf8')).includes('synthetic-relay-token'), 'the configuration never stores a card key');
-  // Without any CCSwitch listener row, a direct primary still configures.
-  await f.sql("DELETE FROM proxy_config");
-  const noListener = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
-  assert.equal(noListener.upstream, null); assert.equal(noListener.primary.transport, 'direct');
-  // An edited card is a changed primary until it is configured again.
-  await f.put({ id: 'company', name: 'API2copy', config: { ...relay, config: relay.config.replace('synthetic-relay-token', 'rotated') } });
-  await assert.rejects(verifyGatewayReady(f.directory, await loadGatewayConfig(f.directory)), /configuration changed/);
-});
-
-test('a saved CCSwitch primary stays on CCSwitch\'s route after its card becomes reachable directly', async t => {
-  const f = await fixture(t);
-  const legacy = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
-  assert.equal(legacy.primary.transport, 'ccswitch');
-  const layout = await f.inspect();
-  assert.equal(describeProvider(layout, 'company').transport, 'direct', 'an ordinary card is described as direct');
-  await verifyGatewayRoute(f.directory, await loadGatewayConfig(f.directory));
+  const direct = { id: 'relay', name: 'Relay', fingerprint, transport: 'direct', key: null };
+  assertProviderCurrent(layout, direct);
+  // CCSwitch's default route (no selector) can carry any relay card.
+  assertProviderCurrent(layout, { ...direct, transport: 'ccswitch' });
+  assert.throws(() => assertProviderCurrent(layout, { ...direct, fingerprint: 'c'.repeat(64) }), /fresh consent/, 'an edited card needs a new choice');
+  assert.throws(() => assertProviderCurrent(layout, { ...direct, name: 'Renamed' }), /fresh consent/);
+  assert.throws(() => assertProviderCurrent(layout, { ...direct, transport: 'official' }), /fresh consent/);
+  assert.throws(() => assertProviderCurrent(layout, { ...direct, transport: 'ccswitch', key: 'relay' }), /fresh consent/, 'an Aggregation route needs a card whose login CCSwitch manages');
 });

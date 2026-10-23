@@ -445,9 +445,13 @@ export async function run(args, env = process.env, receipt = null) {
       const { requireTrustedGuard } = await import('./fork-runner.mjs');
       const client = await openAppServer(env, { nativeOpenai: true });
       try {
-        const [{ account }, settings] = await Promise.all([
-          client.request('account/read', { refreshToken: false }), sourceSettings(client, session),
+        const [{ account }, settings, { bank }] = await Promise.all([
+          client.request('account/read', { refreshToken: false }), sourceSettings(client, session), loadArtifacts(),
         ]);
+        // The target is verified by a fingerprint probe; an unlisted model could never pass it.
+        if (!bank.models.some(model => model.id === settings.model)) {
+          throw Object.assign(new Error('This exact model label is absent from the fingerprint bank, so a switch cannot be verified; nothing was started'), { code: 'MODEL_NOT_IN_BANK' });
+        }
         await requireTrustedGuard(client, settings.cwd);
         return { accountType: account?.type, modelProvider: settings.provider, model: settings.model };
       } finally { await client.close(); }
@@ -616,7 +620,11 @@ export async function main(args = process.argv.slice(2)) {
   catch (error) {
     // Hook failures must remain visible as coverage failures, while not blocking the user's work.
     if (['hook', 'background-hook'].includes(args[0])) process.stdout.write(JSON.stringify({ systemMessage: `ModelTrace Guard unavailable: ${error.message}. Sampling coverage is incomplete.` }) + '\n');
-    else { process.stderr.write(JSON.stringify({ error: error.message, code: error.code, candidates: error.candidates }) + '\n'); process.exitCode = 1; }
+    else {
+      process.stderr.write(JSON.stringify({ error: error.message, code: error.code, candidates: error.candidates,
+        ...(typeof error.problem === 'string' ? { problem: error.problem } : {}) }) + '\n');
+      process.exitCode = 1;
+    }
   }
   finally { dispatchQueuedCleanups(); }
 }

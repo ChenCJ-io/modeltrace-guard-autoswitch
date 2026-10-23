@@ -43,22 +43,22 @@ test('installation executes only marketplace add and plugin add without activati
 
 test('explicit names and executable paths remain individual argv values', async t => {
   const source = await fixture(t), calls = [];
-  const primaryName = 'API2 copy; $(do-not-execute)', backupName = 'Doro "personal" & backup';
-  const result = await installPlugin({ source, codex: '/custom path/codex', primaryName, backupName }, {
+  const backupName = 'Doro "personal" & backup; $(do-not-execute)';
+  const result = await installPlugin({ source, codex: '/custom path/codex', backupName }, {
     node: '/node path/node', env: {}, run: async (...args) => { calls.push(args); },
   });
   assert.equal(result.configured, true);
   assert.equal(calls[0][0], '/custom path/codex');
   assert.equal(calls[2][0], '/node path/node');
-  assert.deepEqual(calls[2][1], [path.join(source, 'codex-plugin/modeltrace-guard/scripts/autoswitch.mjs'), 'configure', '--primary-name', primaryName, '--backup-name', backupName]);
+  assert.deepEqual(calls[2][1], [path.join(source, 'codex-plugin/modeltrace-guard/scripts/autoswitch.mjs'), 'configure', '--backup-name', backupName]);
   assert.equal(calls[2][2].shell, false);
 });
 
-test('a primary alone is enough; the backup is only an optional recommendation', async t => {
+test('new conversations follow CCSwitch\'s default card, so there is no primary to install', async t => {
   const source = await fixture(t), calls = [];
-  const result = await installPlugin({ source, primaryName: 'API2 copy' }, { node: '/node', env: {}, run: async (...args) => { calls.push(args); } });
-  assert.equal(result.configured, true);
-  assert.deepEqual(calls[2][1], [path.join(source, 'codex-plugin/modeltrace-guard/scripts/autoswitch.mjs'), 'configure', '--primary-name', 'API2 copy']);
+  await assert.rejects(installPlugin({ source, primaryName: 'API2 copy' }, { run: async (...args) => { calls.push(args); } }), /Unknown installer option/);
+  assert.throws(() => parseInstallArgs(['--primary-name', 'API2 copy']), /CCSwitch's default card/);
+  assert.deepEqual(calls, []);
 });
 
 test('configured native executable is respected without reading authentication', async t => {
@@ -70,8 +70,7 @@ test('configured native executable is respected without reading authentication',
 test('invalid or incomplete configuration is rejected before any installation command', async t => {
   const source = await fixture(t), calls = [];
   for (const options of [
-    { source, backupName: 'Doro' },
-    { source, primaryName: 'same', backupName: 'same' }, { source, primaryName: '', backupName: 'Doro' },
+    { source, backupName: '' }, { source, backupName: 'Doro\0' },
     { source, primaryProvider: 'unrequested-id' }, { source: 'https://example.invalid/unpublished-repository' },
   ]) await assert.rejects(installPlugin(options, { run: async (...args) => { calls.push(args); } }));
   assert.deepEqual(calls, []);
@@ -80,11 +79,10 @@ test('invalid or incomplete configuration is rejected before any installation co
 test('argument parser rejects duplicate flags, unknown flags and name/id mixtures', () => {
   for (const args of [
     ['--source'], ['--source', 'one', '--source', 'two'], ['--enable', 'true'],
-    ['--backup-name', 'Doro'], ['--primary-name', 'API2 copy', '--backup-name', 'API2 copy'],
-    ['--primary-name', 'API2 copy', '--backup-name', 'Doro', '--primary-provider', 'id'],
+    ['--backup-name', 'Doro', '--backup-name', 'Other'], ['--backup-name', 'Doro', '--primary-provider', 'id'],
   ]) assert.throws(() => parseInstallArgs(args));
-  assert.deepEqual(parseInstallArgs(['--primary-name', 'API2 copy', '--backup-name', 'Doro']), { primaryName: 'API2 copy', backupName: 'Doro' });
-  assert.deepEqual(parseInstallArgs(['--primary-name', 'API2 copy']), { primaryName: 'API2 copy' }, 'The backup is optional');
+  assert.deepEqual(parseInstallArgs(['--backup-name', 'Doro']), { backupName: 'Doro' });
+  assert.deepEqual(parseInstallArgs([]), {}, 'The backup is optional');
   assert.deepEqual(parseInstallArgs(['--help']), { help: true });
 });
 
@@ -101,7 +99,7 @@ test('an installation failure prevents all subsequent install or configure steps
   const source = await fixture(t);
   for (const failingStep of [0, 1, 2]) {
     const calls = [];
-    await assert.rejects(installPlugin({ source, primaryName: 'API2 copy', backupName: 'Doro' }, { env: {}, run: async (...args) => {
+    await assert.rejects(installPlugin({ source, backupName: 'Doro' }, { env: {}, run: async (...args) => {
       calls.push(args);
       if (calls.length - 1 === failingStep) throw new Error('fixture failure');
     } }), error => error.stage === ['marketplace-add', 'plugin-add', 'configure'][failingStep]);

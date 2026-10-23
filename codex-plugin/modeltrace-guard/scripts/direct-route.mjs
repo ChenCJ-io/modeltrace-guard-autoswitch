@@ -150,8 +150,8 @@ export function relayHeaders(clientHeaders, connection) {
   return result;
 }
 
-// Responses endpoints, plus model listing for a primary that connects directly
-// (Codex's own query, such as client_version, is kept).
+// Responses endpoints, plus model listing for CCSwitch's default card when it
+// connects directly (Codex's own query, such as client_version, is kept).
 export function relayTarget(connection, endpoint, query = '') {
   if (!['responses', 'responses/compact', 'models'].includes(endpoint)) throw new Error('Unsupported relay endpoint');
   const target = new URL(`${connection.baseURL.href.replace(/\/+$/, '')}/${endpoint}`);

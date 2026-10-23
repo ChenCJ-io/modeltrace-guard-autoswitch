@@ -19,8 +19,7 @@ async function fixture(t, user = { model_provider: 'custom', openai_base_url: or
   t.after(() => rm(directory, { recursive: true, force: true }));
   const profileFile = path.join(directory, 'profile', 'config.toml');
   const env = { CODEX_HOME: path.dirname(profileFile) };
-  const config = { schema: 2, id: randomUUID(), ccSwitchDirectory: path.join(directory, 'cc-switch'),
-    primary: { id: 'company', name: 'Company', fingerprint: 'a'.repeat(64), transport: 'ccswitch', key: 'company' },
+  const config = { schema: 3, id: randomUUID(), ccSwitchDirectory: path.join(directory, 'cc-switch'),
     backup: { id: 'official', name: 'Official', fingerprint: 'b'.repeat(64), transport: 'official', key: null },
     upstream: 'http://127.0.0.1:15721/v1', port: 15722, token: randomBytes(32).toString('hex') };
   await atomicJSON(configPath(directory), config);
@@ -123,6 +122,16 @@ test('repeated install is idempotent and status never writes native configuratio
   assert.equal((await f.status()).readyForNewThreads, true);
   assert.equal(await readFile(f.filename, 'utf8'), before);
   assert.equal(f.model.writes.length, 1);
+});
+
+test('a gateway configuration from before 0.5 is reported for reconnection, not as an unexplained stale one', async t => {
+  const f = await fixture(t);
+  await f.install();
+  const { backup, ...rest } = f.config;
+  await atomicJSON(configPath(f.directory), { ...rest, schema: 2, primary: backup, backup: null });
+  const status = await f.status();
+  assert.equal(status.phase, 'config_outdated'); assert.equal(status.readyForNewThreads, false); assert.equal(status.attached, true);
+  assertPublic(status, f);
 });
 
 test('gateway updates require old owned values and retain the first originals through removal', async t => {

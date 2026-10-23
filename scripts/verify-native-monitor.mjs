@@ -13,7 +13,7 @@ import { pathToFileURL } from 'node:url';
 // cannot make hook hash checks disagree with the plugin actually under test.
 let AppServerClient, CODEX_CLIENT_INFO, codexExecutable, runAutoSwitch, gatewayStatus, loadArtifacts,
   requireTrustedGuard, requireTrustedStartupHook, nativeIntegrationStatus, loadGatewayConfig,
-  verifyGatewayReady, verifyRouteLayout, UUID, readReceipt, dataDirectory, isMismatch, readState, CLEANUP_SOURCE_KINDS;
+  verifyGatewayReady, defaultCardId, describeProvider, UUID, readReceipt, dataDirectory, isMismatch, readState, CLEANUP_SOURCE_KINDS;
 async function loadInstalledPlugin(root) {
   const resolved = await realpath(root);
   const manifest = JSON.parse(await readFile(path.join(resolved, '.codex-plugin', 'plugin.json'), 'utf8'));
@@ -24,10 +24,10 @@ async function loadInstalledPlugin(root) {
   ({ AppServerClient, CODEX_CLIENT_INFO, codexExecutable } = modules[0]);
   ({ runAutoSwitch, gatewayStatus } = modules[1]); ({ loadArtifacts } = modules[2]);
   ({ requireTrustedGuard } = modules[3]); ({ requireTrustedStartupHook } = modules[4]);
-  ({ nativeIntegrationStatus } = modules[5]); ({ loadGatewayConfig, verifyGatewayReady, verifyRouteLayout, UUID } = modules[6]);
+  ({ nativeIntegrationStatus } = modules[5]); ({ loadGatewayConfig, verifyGatewayReady, defaultCardId, describeProvider, UUID } = modules[6]);
   ({ readReceipt } = modules[7]); ({ dataDirectory, isMismatch, readState } = modules[8]);
   ({ CLEANUP_SOURCE_KINDS } = modules[9]);
-  if (typeof verifyRouteLayout !== 'function') throw failure('installed_plugin_update_required');
+  if (typeof defaultCardId !== 'function') throw failure('installed_plugin_update_required');
   return { version: token(manifest.version) };
 }
 
@@ -126,24 +126,29 @@ async function performTurn(client, threadId, text, deadline, { requireOK = false
   } finally { clearTimeout(timeout); client.listeners.delete(listener); }
 }
 
-async function assertPrimary(directory, config) {
+// The smoke thread starts on CCSwitch's default card, which must stay the same
+// card (and not personal Official, which is never monitored) during the run.
+async function assertDefaultCard(directory, config, expected = null) {
   const current = await loadGatewayConfig(directory);
-  if (current.id !== config.id || current.primary.transport !== 'ccswitch') throw failure('primary_configuration_changed');
+  if (current.id !== config.id) throw failure('configuration_changed');
   const layout = await verifyGatewayReady(directory, current);
-  verifyRouteLayout(current, layout);
+  const id = defaultCardId(layout);
+  if (expected && id !== expected) throw failure('ccswitch_default_card_changed');
+  if (describeProvider(layout, id).transport === 'official') throw failure('default_card_is_official');
+  return id;
 }
 
-async function waitPrimaryReceipt(directory, session, config, deadline) {
+async function waitStartReceipt(directory, session, config, cardId, deadline) {
   while (Date.now() < deadline) {
     const receipt = await readReceipt(directory, session);
     if (receipt) {
-      if (receipt.configId !== config.id || receipt.providerId !== config.primary.id || receipt.transport !== 'ccswitch') throw failure('unexpected_receipt_route');
+      if (receipt.configId !== config.id || receipt.providerId !== cardId) throw failure('unexpected_receipt_route');
       if (receipt.success && receipt.completed) return receipt;
-      if (receipt.finishedAt) throw failure('primary_request_failed');
+      if (receipt.finishedAt) throw failure('first_request_failed');
     }
     await delay(200);
   }
-  throw failure('primary_receipt_timeout');
+  throw failure('first_receipt_timeout');
 }
 
 async function waitCheckpoint(directory, session, deadline, signal) {
@@ -200,7 +205,7 @@ async function main() {
   const options = optionsFor(process.argv.slice(2));
   if (options.help) {
     emit({ usage: 'node scripts/verify-native-monitor.mjs --plugin-root INSTALLED_CACHE_PATH --model EXACT_BANK_LABEL [--timeout-seconds 180] [--keep-thread]',
-      liveInference: true, scope: 'New isolated native primary-route thread only; real trusted hooks; no backup verification or switching.',
+      liveInference: true, scope: 'New isolated native thread on CCSwitch\'s default card only; real trusted hooks; no switch verification or switching.',
       cleanup: 'Disable normal test monitoring and delete only the owned thread after temporary-base and descendant checks. Mismatch evidence is retained.' });
     return;
   }
@@ -209,15 +214,14 @@ async function main() {
   for (const key of ['MODELTRACE_PROBE_PROCESS', 'CODEX_THREAD_ID', 'CODEX_PARENT_THREAD_ID', 'CODEX_AGENT_ID']) delete env[key];
   const directory = dataDirectory(undefined, env), deadline = Date.now() + options.timeoutSeconds * 1000;
   const checkpointAbort = new AbortController(), startedAt = Date.now();
-  let stage = 'preflight', client, cwd, config, ownership, enabled = false, preserveIncident = false,
+  let stage = 'preflight', client, cwd, config, cardId, ownership, enabled = false, preserveIncident = false,
     threadDeleted = false, result = 'failed', reason;
   const progress = details => emit({ stage, ...details });
   const heartbeat = setInterval(() => progress({ waiting: true, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000) }), 15000);
   try {
     progress({ model: options.model, pluginVersion: installed.version, liveInference: true });
     config = await loadGatewayConfig(directory);
-    if (config.primary.transport !== 'ccswitch') throw failure('primary_must_be_ccswitch');
-    await assertPrimary(directory, config);
+    cardId = await assertDefaultCard(directory, config);
     const connection = await nativeIntegrationStatus(directory, env);
     if (!connection.readyForNewThreads) throw failure('ordinary_entry_not_ready');
     const { bank } = await loadArtifacts();
@@ -238,18 +242,17 @@ async function main() {
     progress({ session: ownership.id, name: ownership.name });
     const gateway = await gatewayStatus(directory);
     if (!gateway.running || gateway.readiness !== 'ready') throw failure('gateway_not_ready_after_startup_hook');
-    await assertPrimary(directory, config);
-    stage = 'primary_native_response'; progress({ session: ownership.id });
+    await assertDefaultCard(directory, config, cardId);
+    stage = 'first_native_response'; progress({ session: ownership.id });
     const first = await performTurn(client, ownership.id, 'Reply exactly OK. Do not use tools.', Math.min(deadline, Date.now() + 60000), { requireOK: true });
     ownership.lastTurn = first.id;
-    const receipt = await waitPrimaryReceipt(directory, ownership.id, config, Math.min(deadline, Date.now() + 10000));
+    const receipt = await waitStartReceipt(directory, ownership.id, config, cardId, Math.min(deadline, Date.now() + 10000));
     const { thread: persisted } = await client.request('thread/read', { threadId: ownership.id, includeTurns: false });
     ownership.path = persisted.path;
     progress({ receipt: receiptMetadata(receipt) });
     stage = 'enable_monitoring';
-    await assertPrimary(directory, config);
     const used = await runAutoSwitch(['use', '--session', ownership.id], { ...env, CODEX_THREAD_ID: ownership.id });
-    if (!used.monitoringEnabled || used.switchApproved || used.autoSwitch?.current?.id !== config.primary.id) throw failure('monitoring_not_enabled_on_primary');
+    if (!used.monitoringEnabled || used.switchApproved || used.autoSwitch?.current?.id !== cardId) throw failure('monitoring_not_enabled_on_start_card');
     enabled = true; progress({ monitoringEnabled: true, switchApproved: false });
     stage = 'native_work_tool_and_background_checkpoint'; progress({ session: ownership.id });
     const toolTurn = performTurn(client, ownership.id, 'Run the shell command pwd exactly once in the current directory. Do not run any other command or read any file. Then reply DONE.', deadline);
@@ -271,7 +274,7 @@ async function main() {
     else if (!checkpoint.state.lastWorkHookAt || checkpoint.state.lastWorkHookAt < checkpoint.state.enabledAt
       || !checkpoint.state.lastBackgroundHookAt || checkpoint.state.lastBackgroundHookAt < checkpoint.state.enabledAt) {
       result = 'coverage_gap'; reason = 'native_work_and_background_hooks_unconfirmed';
-    } else { result = 'passed'; reason = 'native_primary_response_and_hook_checkpoint_completed'; }
+    } else { result = 'passed'; reason = 'native_response_and_hook_checkpoint_completed'; }
   } catch (error) {
     reason = error.smokeCode || 'stage_failed';
     const state = ownership ? await readState(directory, ownership.id).catch(() => null) : null;

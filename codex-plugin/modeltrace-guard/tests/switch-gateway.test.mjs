@@ -12,8 +12,8 @@ const AUTH = 'Bearer synthetic-official-oauth';
 const DONE = 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","model":"upstream-original-model"}}\n\n';
 const defaultBody = { model: 'gpt-example', stream: true, input: [{ role: 'user', content: 'synthetic input' }] };
 const RELAY_KEY = 'synthetic-relay-card-key';
-// The primary uses CCSwitch's default route; every other card is a direct relay.
-const primaryRoute = (extra = {}) => ({ route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0, ...extra });
+// CCSwitch's default card is reached by its default route; key-based cards are direct relays.
+const defaultRoute = (extra = {}) => ({ route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0, ...extra });
 const relayRoute = (extra = {}) => ({ route: 'fallback', transport: 'direct', providerId: 'relay', providerFingerprint: 'f'.repeat(64), revision: 1, ...extra });
 const relayConnection = (base, extra = {}) => ({ baseURL: new URL(base), key: RELAY_KEY, headers: { 'x-relay-card': 'synthetic-card-header' }, query: [], ...extra });
 
@@ -41,7 +41,7 @@ async function fixture(t, handle = (_req, res) => { res.writeHead(200, { 'conten
   await new Promise((resolve) => relay.listen(0, '127.0.0.1', resolve));
   const relayUrl = `http://127.0.0.1:${relay.address().port}/v1`;
   const gateway = await startSwitchGateway({ upstream: upstreamUrl, token: TOKEN,
-    resolveRoute: async () => primaryRoute(),
+    resolveRoute: async () => defaultRoute(),
     resolveDirect: async () => relayConnection(relayUrl),
     verifyReady: async () => { readyCalls++; }, onReceipt: async (receipt) => { receipts.push(receipt); }, ...options });
   t.after(async () => {
@@ -84,7 +84,7 @@ function send(gateway, { path = '/responses', rawPath, method = 'POST', thread =
   });
 }
 
-test('primary forwarding keeps the request, carries native authorization to local CCSwitch, and preserves SSE bytes', async (t) => {
+test('default-route forwarding keeps the request, carries native authorization to local CCSwitch, and preserves SSE bytes', async (t) => {
   const sse = ': ping\r\nevent: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"中文 ✓ synthetic"}\r\n\r\n' + DONE;
   const f = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream', connection: 'x-private-hop, keep-alive', 'x-private-hop': 'omit', 'x-retained': 'yes' });
@@ -153,30 +153,31 @@ test('native default forwarding avoids Stack client-header stripping and preserv
   assert.ok(f.receipts.slice(1).every(row => row.success && row.ccswitchMode === 'default'));
 });
 
-test('default route is rechecked immediately before forwarding and cannot be applied to a backup or Official', async t => {
-  let drift = false, route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 1 };
+test('default route is rechecked immediately before forwarding and needs its card, never Official', async t => {
+  let drift = false, route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: null, revision: 1 };
   const checked = [];
   const f = await fixture(t, undefined, {
     resolveRoute: () => route,
     verifyReady: selected => { checked.push(selected); return !drift; },
   });
   assert.equal((await send(f.gateway)).status, 200);
-  assert.equal(checked[0].ccswitchMode, 'default');
+  assert.equal(checked[0].ccswitchMode, 'default'); assert.equal(checked[0].sourceKey, null);
   drift = true;
   assert.equal((await send(f.gateway)).status, 503);
   assert.equal(f.received.length, 1, 'a drifting default is never forwarded or retried with Stack');
   drift = false;
-  for (const invalid of [
-    { ...route, route: 'fallback' }, { ...route, transport: 'official' }, { ...route, providerId: null },
-    { ...route, ccswitchMode: 'unknown' },
-  ]) {
+  for (const invalid of [{ ...route, transport: 'official' }, { ...route, providerId: null }, { ...route, ccswitchMode: 'unknown' }]) {
     route = invalid;
     assert.equal((await send(f.gateway)).status, 503);
   }
   assert.equal(f.received.length, 1);
+  // A conversation may also switch to CCSwitch's default card.
+  route = { ...route, route: 'fallback', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'doro', revision: 2 };
+  assert.equal((await send(f.gateway)).status, 200);
+  assert.equal(f.received.length, 2); assert.equal(checked.at(-1).route, 'fallback');
 });
 
-test('client Stack selectors cannot redirect primary or backup requests or falsify route receipts', async t => {
+test('client Stack selectors cannot redirect default-route, relay or Official requests or falsify route receipts', async t => {
   const routes = [
     { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company', sourceKey: 'API2', revision: 0 },
     relayRoute({ providerId: 'backup' }),
@@ -194,7 +195,7 @@ test('client Stack selectors cannot redirect primary or backup requests or falsi
 });
 
 test('switching one session preserves the other session and fallback body bytes', async (t) => {
-  const routes = new Map([[A, primaryRoute()], [B, primaryRoute({ revision: 4 })]]);
+  const routes = new Map([[A, defaultRoute()], [B, defaultRoute({ revision: 4 })]]);
   const f = await fixture(t, undefined, { resolveRoute: async (thread) => routes.get(thread) });
   await send(f.gateway); await send(f.gateway, { thread: B });
   routes.set(A, relayRoute());
@@ -209,7 +210,7 @@ test('switching one session preserves the other session and fallback body bytes'
 });
 
 test('continuations retain all content within a revision and fail closed after a switch', async (t) => {
-  let route = primaryRoute();
+  let route = defaultRoute();
   const f = await fixture(t, undefined, { resolveRoute: async () => route });
   const continuation = { ...defaultBody, previous_response_id: 'resp-synthetic', input: [{ type: 'function_call_output', call_id: 'call-test', output: 'synthetic' }] };
   assert.equal((await send(f.gateway, { body: continuation })).status, 409);
@@ -627,7 +628,7 @@ test('health and shutdown control only the capability-owned instance and never p
 test('a request pins its resolved route across asynchronous readiness checks', async (t) => {
   let ready;
   const gate = new Promise((resolve) => { ready = resolve; });
-  const route = primaryRoute({ revision: 5 });
+  const route = defaultRoute({ revision: 5 });
   let checking = false;
   const f = await fixture(t, undefined, { resolveRoute: async () => route, verifyReady: async () => { checking = true; await gate; } });
   const pending = send(f.gateway);
@@ -662,7 +663,7 @@ test('incoming body timeout rejects a stalled upload without contacting upstream
   assert.equal(result, 408); assert.equal(f.received.length, 0);
 });
 
-test('primary uses the native CCSwitch default while an approved third-party card is a direct relay', async (t) => {
+test('CCSwitch\'s default route stays native while an approved third-party card is a direct relay', async (t) => {
   let route = { route: 'source', transport: 'ccswitch', ccswitchMode: 'default', providerId: 'company-config', sourceKey: 'API2-copy', revision: 0 };
   const f = await fixture(t, undefined, { resolveRoute: async () => route });
   await send(f.gateway);
@@ -947,7 +948,7 @@ test('a relay that rejects another route\'s encrypted reasoning is repaired once
   assert.deepEqual(f.received[1].body.input.at(-1), { role: 'user', content: 'synthetic task' });
 });
 
-test('model listing follows a directly connected primary to its relay, and needs CCSwitch only otherwise', async (t) => {
+test('model listing follows a directly connected default card to its relay, and needs CCSwitch only otherwise', async (t) => {
   const f = await fixture(t, (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"models":[]}'); },
     { resolveModels: async () => relayConnection(f.relayUrl) });
   const result = await send(f.gateway, { path: '/models?client_version=0.164.0', method: 'GET', thread: null, body: null });

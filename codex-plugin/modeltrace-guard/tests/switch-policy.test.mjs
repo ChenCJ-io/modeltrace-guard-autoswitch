@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFile, spawnSync } from 'node:child_process';
@@ -9,26 +9,33 @@ import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { abandon, newState, readState, sessionPath, withState } from '../scripts/state.mjs';
 import { controlContext, handleHook, isControlCommand, ROOT, run } from '../scripts/guard.mjs';
+import { handleBackgroundHook } from '../scripts/background.mjs';
+import { listSwitchCandidates } from '../scripts/switch-candidates.mjs';
+import { runAutoSwitch } from '../scripts/autoswitch.mjs';
 import { atomicJSON, approveSwitch, beginVerification, configureGateway, declineSwitch, eligibleForSwitch,
   enableAutoSwitch, finishVerification, haltBlocksProbe, loadGatewayConfig, prepareSwitchTransport, proposeSwitch,
-  queueAutoSwitch, resolveSessionRoute, saveReceipt } from '../scripts/switch-policy.mjs';
+  queueAutoSwitch, requestManualSwitch, resolveSessionRoute, resumeMonitoring, saveReceipt } from '../scripts/switch-policy.mjs';
 
 const execute = promisify(execFile);
 const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: 'expected' };
 const sourceId = 'test-source', fallbackId = 'test-official', alternateId = 'test-alternate';
+// CCSwitch's default card decides where a new conversation starts.
+const setDefault = (directory, id) => atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: { mode: 'proxy', attached: true,
+  proxy_route: id, stack: { enabled: false, members: [], keys: {} } } } });
+// Company has no usable direct configuration, so only CCSwitch's default route
+// reaches it; Alternate is a key-based relay the gateway connects to directly.
 async function fixture(t) {
   const directory = await mkdtemp(path.join(tmpdir(), 'autoswitch-policy-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  await atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: { mode: 'proxy', attached: true, proxy_route: sourceId,
-    stack: { enabled: true, members: [sourceId, alternateId], keys: { company: sourceId, alternate: alternateId } } } } });
+  await setDefault(directory, sourceId);
   await execute('sqlite3', [path.join(directory, 'cc-switch.db'), `CREATE TABLE providers(id TEXT,name TEXT,category TEXT,app_type TEXT,settings_config TEXT,meta TEXT);
     INSERT INTO providers VALUES
     ('${sourceId}','Company',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":""}','{}'),
-    ('${alternateId}','Alternate',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":""}','{}'),
+    ('${alternateId}','Alternate',NULL,'codex','{"auth":{"OPENAI_API_KEY":"synthetic-only"},"config":"openai_base_url = \\"https://alternate.example.invalid/v1\\""}','{}'),
     ('${fallbackId}','Official','official','codex','{"auth":{},"config":""}','{}');
     CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
     INSERT INTO proxy_config VALUES('codex','127.0.0.1',15721,0);`]);
-  await configureGateway(directory, { primaryName: 'Company', backupName: 'Official', ccSwitchDirectory: directory });
+  await configureGateway(directory, { backupName: 'Official', ccSwitchDirectory: directory });
   return { directory, config: await loadGatewayConfig(directory), session: randomUUID() };
 }
 function receipt(thread, route, extra = {}) {
@@ -41,10 +48,10 @@ async function enable(f) {
   return enableAutoSwitch(f.directory, f.session, readiness);
 }
 const descriptor = (id, transport, key = null) => ({ id, name: id, transport, key, fingerprint: (id === 'primary' ? 'a' : 'b').repeat(64) });
-function evidenceState(config) {
+// `primary` is the card the conversation started on (here CCSwitch's default route).
+function evidenceState(config, primary = descriptor('primary', 'ccswitch')) {
   const state = newState(randomUUID());
   state.enabled = true; state.model = state.expected = 'expected'; state.epoch = 1;
-  const primary = config?.primary || descriptor('primary', 'ccswitch', 'company');
   const backup = config?.backup || descriptor('personal', 'official');
   state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, phase: 'armed', route: 'source', revision: 1,
     attempts: 0, configId: config?.id || randomUUID(), policyId: randomUUID(), primary, backup, current: primary };
@@ -70,7 +77,7 @@ function canary(state) {
   return { expected: 'expected', prediction: 'expected', outcome: 'compatible', fork: { routing: {
     route: 'fallback', success: true, completed: true, configId: r.configId, policyId: r.policyId, revision: r.revision + 1,
     providerId: target.id, providerFingerprint: target.fingerprint, transport: target.transport, sourceKey: target.key,
-    ccswitchMode: target.transport === 'ccswitch' ? (target.id === state.autoSwitch.primary.id ? 'default' : 'stack') : null,
+    ccswitchMode: target.transport === 'ccswitch' ? (target.key ? 'stack' : 'default') : null,
     proposalId: r.id, approvalId: r.approval.id, challenge: state.pending.id,
     threadId: randomUUID(), requestId: randomUUID(), finishedAt: Date.now(),
   } } };
@@ -83,7 +90,7 @@ async function userReplies(f) {
 async function pendingIncident(f) {
   await enable(f);
   await withState(f.directory, f.session, state => {
-    const evidence = evidenceState(f.config).samples[0];
+    const evidence = evidenceState(f.config, state.autoSwitch.primary).samples[0];
     evidence.fork.routing.policyId = state.autoSwitch.policyId;
     state.samples.push(evidence);
     assert.equal(queueAutoSwitch(state, Date.now(), evidence), true);
@@ -91,12 +98,12 @@ async function pendingIncident(f) {
   return (await readState(f.directory, f.session)).switchRequest;
 }
 
-test('first request uses primary, enable never changes it, and another thread has no monitor', async t => {
+test('a new thread starts on CCSwitch\'s default card, enable never changes it, and another thread has no monitor', async t => {
   const f = await fixture(t), sibling = randomUUID();
   const first = await resolveSessionRoute(f.directory, f.config, f.session);
-  assert.equal(first.providerId, sourceId); assert.equal(first.ccswitchMode, 'default');
+  assert.equal(first.providerId, sourceId); assert.equal(first.ccswitchMode, 'default'); assert.equal(first.sourceKey, null);
   assert.equal((await readState(f.directory, f.session)).enabled, false);
-  await assert.rejects(enableAutoSwitch(f.directory, f.session, readiness), /successful primary/);
+  await assert.rejects(enableAutoSwitch(f.directory, f.session, readiness), /No recent successful request/);
   await enable(f);
   assert.equal((await resolveSessionRoute(f.directory, f.config, f.session)).providerId, sourceId);
   assert.equal((await resolveSessionRoute(f.directory, f.config, sibling)).providerId, sourceId);
@@ -106,7 +113,7 @@ test('first request uses primary, enable never changes it, and another thread ha
   assert.equal((await resolveSessionRoute(f.directory, f.config, f.session)).providerId, sourceId);
 });
 
-test('primary resolution rejects default drift and CCSwitch failover before any route is changed', async t => {
+test('a card only CCSwitch reaches rejects default drift and failover; new threads follow the new default', async t => {
   const f = await fixture(t);
   await enable(f);
   const before = await readState(f.directory, f.session);
@@ -114,15 +121,178 @@ test('primary resolution rejects default drift and CCSwitch failover before any 
   await assert.rejects(resolveSessionRoute(f.directory, f.config, f.session), /automatic failover/);
   await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID()), /automatic failover/);
   await execute('sqlite3', [path.join(f.directory, 'cc-switch.db'), "UPDATE proxy_config SET auto_failover_enabled=0 WHERE app_type='codex'"]);
-  await atomicJSON(path.join(f.directory, 'live-state.json'), { apps: { codex: { mode: 'proxy', attached: true, proxy_route: alternateId,
-    stack: { enabled: true, members: [sourceId, alternateId], keys: { company: sourceId, alternate: alternateId } } } } });
-  await assert.rejects(resolveSessionRoute(f.directory, f.config, f.session), /default provider changed/);
-  await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID()), /default provider changed/);
+  await setDefault(f.directory, alternateId);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, f.session), /default card changed/);
+  const fresh = await resolveSessionRoute(f.directory, f.config, randomUUID());
+  assert.equal(fresh.providerId, alternateId); assert.equal(fresh.transport, 'direct'); assert.equal(fresh.route, 'source');
   assert.deepEqual((await readState(f.directory, f.session)).autoSwitch, before.autoSwitch);
   const official = await resolveSessionRoute(f.directory, f.config, randomUUID(), fallbackId);
   assert.equal(official.transport, 'official'); assert.equal(official.ccswitchMode, null);
   const alternate = await resolveSessionRoute(f.directory, f.config, randomUUID(), alternateId);
   assert.equal(alternate.transport, 'direct'); assert.equal(alternate.ccswitchMode, null); assert.equal(alternate.providerId, alternateId);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID(), sourceId), /not CCSwitch's default card/);
+});
+
+test('a conversation keeps the card it started on; only new conversations follow CCSwitch\'s default card', async t => {
+  const f = await fixture(t), started = randomUUID();
+  await setDefault(f.directory, alternateId);
+  const first = await resolveSessionRoute(f.directory, f.config, started);
+  assert.equal(first.providerId, alternateId); assert.equal(first.transport, 'direct'); assert.equal(first.route, 'source');
+  await setDefault(f.directory, sourceId);
+  const again = await resolveSessionRoute(f.directory, f.config, started);
+  assert.equal(again.providerId, alternateId); assert.equal(again.transport, 'direct');
+  const fresh = await resolveSessionRoute(f.directory, f.config, randomUUID());
+  assert.equal(fresh.providerId, sourceId); assert.equal(fresh.ccswitchMode, 'default');
+  // Without CCSwitch's proxy no default card is defined, but a direct conversation goes on.
+  await atomicJSON(path.join(f.directory, 'live-state.json'), { apps: { codex: { mode: 'direct', attached: false } } });
+  assert.equal((await resolveSessionRoute(f.directory, f.config, started)).providerId, alternateId);
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, randomUUID()), /local proxy/);
+});
+
+test('switching without monitoring creates a routing-only policy; monitoring starts only when asked', async t => {
+  const f = await fixture(t);
+  const route = await resolveSessionRoute(f.directory, f.config, f.session);
+  await saveReceipt(f.directory, f.config, receipt(f.session, route));
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Alternate' }, readiness), /user's reply/);
+  assert.ok(!(await readState(f.directory, f.session)).autoSwitch, 'a refused switch leaves no policy behind');
+  await userReplies(f);
+  const request = await requestManualSwitch(f.directory, f.session, { name: 'Alternate' }, readiness);
+  assert.equal(request.target.id, alternateId); assert.equal(request.previous.enabled, false);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.autoSwitch.primary.id, sourceId); assert.equal(state.pending.kind, 'fallback_verification');
+  finishVerification(state, canary(state), state.pending, Date.now());
+  assert.equal(state.switchRequest.status, 'succeeded'); assert.equal(state.autoSwitch.current.id, alternateId);
+  assert.equal(state.autoSwitch.route, 'fallback'); assert.equal(state.enabled, false, 'switching never starts monitoring');
+  assert.equal(state.monitoringStoppedReason, 'routing_only'); assert.equal(state.pending, null); assert.equal(state.taskHalt, null);
+  await withState(f.directory, f.session, s => Object.assign(s, state));
+  await assert.rejects(enableAutoSwitch(f.directory, f.session, readiness), /already has a route policy/);
+  const resumed = await resumeMonitoring(f.directory, f.session, readiness);
+  assert.equal(resumed.current.id, alternateId); assert.equal(resumed.enabled, true);
+  const monitored = await readState(f.directory, f.session);
+  assert.equal(monitored.enabled, true); assert.equal(monitored.monitoringStoppedReason, null); assert.equal(monitored.forceProbe, true);
+});
+
+// One user-requested switch whose canary passes.
+async function switchTo(f, name) {
+  await userReplies(f);
+  await requestManualSwitch(f.directory, f.session, { name }, readiness);
+  await withState(f.directory, f.session, state => { finishVerification(state, canary(state), state.pending, Date.now()); });
+  return readState(f.directory, f.session);
+}
+
+// What the agent is told after a successful switch, and what the list promises.
+const switchNotice = async f => (await handleBackgroundHook({ session_id: f.session, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+  tool_use_id: randomUUID() }, f.directory, {})).hookSpecificOutput?.additionalContext || '';
+const afterSwitch = async (f, id) => (await listSwitchCandidates(f.directory, f.session)).candidates.find(entry => entry.id === id).monitoringAfterSwitch;
+
+test('monitoring the user never enabled stays off through Official and back; monitoring paused for Official resumes', async t => {
+  const f = await fixture(t);
+  await saveReceipt(f.directory, f.config, receipt(f.session, await resolveSessionRoute(f.directory, f.config, f.session)));
+  let state = await switchTo(f, 'Official');
+  assert.equal(state.autoSwitch.current.transport, 'official'); assert.equal(state.monitoringStoppedReason, 'routing_only');
+  assert.match(await switchNotice(f), /Fingerprint monitoring is off on the personal subscription/);
+  assert.equal(await afterSwitch(f, alternateId), 'stays_off');
+  state = await switchTo(f, 'Company');
+  assert.equal(state.autoSwitch.current.id, sourceId); assert.equal(state.autoSwitch.route, 'source');
+  assert.equal(state.enabled, false); assert.equal(state.monitoringStoppedReason, 'routing_only');
+  assert.match(await switchNotice(f), /Fingerprint monitoring stays off on this route/);
+  const g = await fixture(t);
+  await enable(g);
+  // No routine checkpoint falls due while the user asks for the switches.
+  await withState(g.directory, g.session, s => { s.forceProbe = false; s.nextTools = Number.MAX_SAFE_INTEGER; });
+  state = await switchTo(g, 'Official');
+  assert.equal(state.enabled, false); assert.equal(state.monitoringStoppedReason, 'personal_route');
+  await switchNotice(g);
+  assert.equal(await afterSwitch(g, alternateId), 'continues', 'the list promises what switching back does');
+  state = await switchTo(g, 'Alternate');
+  assert.equal(state.autoSwitch.current.transport, 'direct'); assert.equal(state.enabled, true, 'monitoring resumes on a third-party route');
+  assert.match(await switchNotice(g), /Monitoring continues on the selected third-party route/);
+});
+
+test('switching leaves standalone monitoring alone, and a refused switch leaves the thread as it was', async t => {
+  const f = await fixture(t);
+  await saveReceipt(f.directory, f.config, receipt(f.session, await resolveSessionRoute(f.directory, f.config, f.session)));
+  await userReplies(f);
+  // Official needs a ChatGPT login: refused before a routing-only policy exists.
+  const before = await readFile(sessionPath(f.directory, f.session), 'utf8');
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Official' }, { ...readiness, accountType: 'apiKey' }), /ChatGPT/);
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Company' }, readiness), /already uses/);
+  assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), before);
+  // Standalone monitoring (guard start) is not silently turned into a routing policy.
+  await withState(f.directory, f.session, s => { s.enabled = true; s.expected = 'explicit-label'; s.expectedSource = 'explicit'; });
+  const monitored = await readFile(sessionPath(f.directory, f.session), 'utf8');
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Alternate' }, readiness), /standalone monitoring/);
+  assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), monitored);
+});
+
+test('a thread monitored without a route policy is probed on the card it started on', async t => {
+  const f = await fixture(t);
+  await setDefault(f.directory, alternateId);
+  const route = await resolveSessionRoute(f.directory, f.config, f.session);
+  assert.equal(route.providerId, alternateId);
+  await setDefault(f.directory, sourceId); // new conversations now start elsewhere
+  const pending = { id: randomUUID(), epoch: 1, at: Date.now(), expiresAt: Date.now() + 60000 };
+  await withState(f.directory, f.session, s => { s.enabled = true; s.epoch = 1; s.pending = pending; });
+  const transport = await prepareSwitchTransport(f.directory, { id: randomUUID(), sourceSession: f.session, provider: 'openai' }, pending);
+  assert.ok(transport, 'the probe is bound to the gateway route of this thread');
+  const fork = randomUUID();
+  await transport.authorize(fork);
+  const probe = await resolveSessionRoute(f.directory, f.config, fork);
+  assert.equal(probe.providerId, alternateId); assert.equal(probe.transport, 'direct');
+  assert.equal(probe.revision, 0); assert.equal(probe.challenge, pending.id);
+  await withState(f.directory, f.session, s => { s.pending = null; });
+  await assert.rejects(resolveSessionRoute(f.directory, f.config, fork), /live checkpoint/);
+  await transport.close();
+});
+
+test('turning monitoring on again after a disabled incident lets later incidents ask again', async t => {
+  const f = await fixture(t), r = await pendingIncident(f);
+  await runAutoSwitch(['disable', '--session', f.session, '--data-dir', f.directory], {});
+  await userReplies(f);
+  await run(['resume', '--session', f.session, '--data-dir', f.directory, '--halt', r.haltId], {});
+  assert.equal((await readState(f.directory, f.session)).autoSwitch.phase, 'failed');
+  await resumeMonitoring(f.directory, f.session, readiness);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.enabled, true); assert.equal(state.autoSwitch.phase, 'armed');
+  const sample = evidenceState(f.config, state.autoSwitch.current).samples[0];
+  Object.assign(sample, { epoch: state.epoch });
+  Object.assign(sample.fork.routing, { policyId: state.autoSwitch.policyId, configId: state.autoSwitch.configId, revision: state.autoSwitch.revision });
+  assert.equal(eligibleForSwitch(state, sample), true);
+});
+
+test('a switch for a model the fingerprint bank lacks is refused before anything starts', async t => {
+  const f = await fixture(t);
+  await saveReceipt(f.directory, f.config, receipt(f.session, await resolveSessionRoute(f.directory, f.config, f.session)));
+  await userReplies(f);
+  const before = await readFile(sessionPath(f.directory, f.session), 'utf8');
+  // A stand-in Codex app-server reporting a model label that is not in the bank.
+  await writeFile(path.join(f.directory, 'app-server'), `const readline = require('node:readline');
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line); if (request.id === undefined) return;
+  const result = request.method === 'account/read' ? { account: { type: 'chatgpt' } }
+    : request.method === 'thread/read' ? { thread: { id: request.params.threadId, path: ${JSON.stringify(path.join(f.directory, 'rollout.jsonl'))}, ephemeral: false,
+      model: 'model-not-in-bank', modelProvider: 'openai', reasoningEffort: 'high', cwd: ${JSON.stringify(f.directory)} } }
+    : request.method === 'hooks/list' ? { data: [] } : {};
+  process.stdout.write(JSON.stringify({ id: request.id, result }) + '\\n');
+});\n`);
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'guard.mjs'), 'switch-route', '--session', f.session,
+    '--data-dir', f.directory, '--target-name', 'Alternate'], { cwd: f.directory, encoding: 'utf8', timeout: 20000,
+    env: { ...process.env, MODELTRACE_CODEX_PATH: process.execPath, CODEX_THREAD_ID: f.session } });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(JSON.parse(result.stderr.trim()).code, 'MODEL_NOT_IN_BANK');
+  assert.equal(await readFile(sessionPath(f.directory, f.session), 'utf8'), before, 'no policy, pause or probe was started');
+});
+
+test('monitoring never resumes on personal Official', async t => {
+  const f = await fixture(t);
+  await setDefault(f.directory, fallbackId);
+  const route = await resolveSessionRoute(f.directory, f.config, f.session);
+  assert.equal(route.transport, 'official');
+  await saveReceipt(f.directory, f.config, receipt(f.session, route));
+  await assert.rejects(enableAutoSwitch(f.directory, f.session, readiness), /personal Official/);
+  await enableAutoSwitch(f.directory, f.session, readiness, { monitor: false });
+  await assert.rejects(resumeMonitoring(f.directory, f.session, readiness), /personal Official/);
+  assert.equal((await readState(f.directory, f.session)).enabled, false);
 });
 
 test('only a valid current-route mismatch can request consent, including a clearly labelled weak disagreement', () => {
@@ -331,7 +501,7 @@ test('subagents share the root pause and cannot keep working while the user is a
   await enable(f);
   assert.deepEqual(await handleHook(subagent, f.directory), {}, 'monitoring without a pause does not block subagents');
   await withState(f.directory, f.session, state => {
-    const evidence = evidenceState(f.config).samples[0];
+    const evidence = evidenceState(f.config, state.autoSwitch.primary).samples[0];
     evidence.fork.routing.policyId = state.autoSwitch.policyId;
     state.samples.push(evidence);
     assert.equal(queueAutoSwitch(state, Date.now(), evidence), true);

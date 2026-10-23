@@ -94,7 +94,7 @@ export async function inspectCCSwitch(directory = path.join(homedir(), '.cc-swit
     pending: Boolean(mode.pending), stack: mode.stack || { enabled: false, members: [], keys: {} } };
 }
 
-export function resolveProvider(layout, { name, id } = {}, { asPrimary = false } = {}) {
+export function resolveProvider(layout, { name, id } = {}) {
   if (Boolean(name) === Boolean(id)) throw new Error('Specify exactly one provider name or provider ID');
   if ((name && (typeof name !== 'string' || !name.trim())) || (id && typeof id !== 'string')) throw new Error('Provider name or ID must be a nonempty string');
   const selected = id ? layout.providers.filter(p => p.id === id) : layout.providers.filter(p => p.name === name.trim());
@@ -105,18 +105,17 @@ export function resolveProvider(layout, { name, id } = {}, { asPrimary = false }
     error.candidates = matches.map(({ id, name }) => ({ id, name }));
     throw error;
   }
-  return describeProvider(layout, matches[0].id, asPrimary ? { primaryId: matches[0].id } : {});
+  return describeProvider(layout, matches[0].id);
 }
 
 // Codes let callers explain why a card cannot be selected; messages stay fixed.
-const coded = (code, message) => Object.assign(new Error(message), { code });
-// Key-based third-party cards, the primary included, are reached directly with
-// their own saved configuration (direct-route.mjs). Only cards whose login
-// CCSwitch manages (Copilot/xAI OAuth...) need CCSwitch: as the primary through
-// its default route, otherwise through an explicit Aggregation (Stack) selector.
-// A primary that cannot be reached directly is saved with the CCSwitch default
-// route instead (configureGateway); assertProviderCurrent accepts that choice.
-export function describeProvider(layout, id, { primaryId = layout.primaryId ?? layout.defaultProvider } = {}) {
+const coded = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
+// What kind of card this is. A key-based card is reached directly with its own
+// saved configuration (direct-route.mjs); a card whose login CCSwitch manages
+// (Copilot/xAI OAuth...) is only usable through CCSwitch (key: its Aggregation
+// selector, if any); Official is the current native login. Which route a
+// conversation takes for the card is routeDescriptor's choice.
+export function describeProvider(layout, id) {
   const row = layout.providers.find(p => p.id === id);
   if (!row || typeof row.name !== 'string' || !row.name.trim() || row.name.length > 200 || /[\x00-\x1f]/.test(row.name)) throw coded('INVALID_PROVIDER', 'Invalid or missing CCSwitch provider identity');
   // Older managed Official cards can lack category. They still select a Codex
@@ -130,131 +129,165 @@ export function describeProvider(layout, id, { primaryId = layout.primaryId ?? l
     // An Official card that binds an account or stores settings must not be
     // substituted by the native login or by a direct connection.
     if (row.category === 'official') throw coded('OFFICIAL_NOT_NATIVE', 'This Official card is not an unbound native login with empty auth and connection settings; its selected account must not be substituted');
-    const key = layout.stack?.enabled ? Object.entries(layout.stack.keys || {}).find(([, provider]) => provider === id)?.[0] : undefined;
-    const member = KEY.test(key || '') && layout.stack.members?.includes(id);
     if (row.delegatedAuth !== 1) descriptor.transport = 'direct';
-    else if (row.id === primaryId) descriptor.key = member ? key : null;
-    else if (member) descriptor.key = key;
-    else throw coded('NOT_IN_STACK', `Add ${JSON.stringify(row.name)} to CCSwitch Aggregation before selecting it; its login is managed by CCSwitch. No provider was switched`);
+    else {
+      const key = layout.stack?.enabled ? Object.entries(layout.stack.keys || {}).find(([, provider]) => provider === id)?.[0] : undefined;
+      if (KEY.test(key || '') && layout.stack.members?.includes(id)) descriptor.key = key;
+    }
   }
   validateProvider(descriptor);
   return descriptor;
 }
 
+/**
+ * The route a conversation takes for one card: Official; direct when the card's
+ * saved configuration can be reached directly (`card` is its direct-route.mjs
+ * reading); otherwise through CCSwitch, by its default route (key null) while
+ * the card is CCSwitch's default card, or by the card's Aggregation selector.
+ * Throws with a reason when none applies.
+ */
+export function routeDescriptor(layout, id, card) {
+  const descriptor = describeProvider(layout, id);
+  if (descriptor.transport === 'official') return descriptor;
+  const isDefault = layout.defaultProvider === id;
+  if (descriptor.transport === 'direct') {
+    if (card && !card.problem && card.fingerprint === descriptor.fingerprint) return descriptor;
+    if (isDefault) return { ...descriptor, transport: 'ccswitch', key: null };
+    throw coded('DIRECT_UNUSABLE', 'This card cannot be reached directly and is not CCSwitch\'s default card; no provider was switched',
+      { problem: card ? card.problem || 'card_changed' : 'card_config_unreadable' });
+  }
+  if (isDefault) return { ...descriptor, key: null };
+  if (descriptor.key) return descriptor;
+  throw coded('NOT_IN_STACK', `Add ${JSON.stringify(descriptor.name)} to CCSwitch Aggregation before selecting it; its login is managed by CCSwitch. No provider was switched`);
+}
+
+// CCSwitch's current default Codex card: where a new conversation starts. It is
+// defined while CCSwitch runs its local proxy (Routing or Aggregation mode); in
+// its Direct mode CCSwitch rewrites Codex's own configuration on every card
+// change, which would bypass this gateway altogether.
+export function defaultCardId(layout) {
+  if (layout.mode !== 'proxy' || !layout.attached || layout.pending) {
+    throw coded('CCSWITCH_NOT_PROXIED', 'CCSwitch must run its local proxy for Codex (Routing or Aggregation mode) so that its default card is defined');
+  }
+  if (!layout.defaultProvider || !layout.providers.some(p => p.id === layout.defaultProvider)) throw coded('NO_DEFAULT_CARD', 'CCSwitch has no default Codex card; select one in CC Switch');
+  return layout.defaultProvider;
+}
+
+// A CCSwitch route without a selector is CCSwitch's default route; with one,
+// the card's Aggregation selector.
+export const ccswitchMode = provider => (provider.transport === 'ccswitch' ? (provider.key ? 'stack' : 'default') : null);
+
 export function validateProvider(p) {
   if (!p || typeof p.id !== 'string' || !p.id || p.id.length > 256 || /[\x00-\x1f]/.test(p.id)
     || typeof p.name !== 'string' || !p.name || p.name.length > 200 || /[\x00-\x1f]/.test(p.name)
     || !/^[a-f0-9]{64}$/i.test(p.fingerprint || '') || !['ccswitch', 'official', 'direct'].includes(p.transport)
-    // A ccswitch key selects the Stack member of a CCSwitch-managed login; the
-    // primary may carry none (default route) or a saved pre-0.5 one.
+    // A ccswitch key is an Aggregation selector; null means CCSwitch's default route.
     || (p.transport === 'ccswitch' ? p.key !== null && !KEY.test(p.key || '') : p.key !== null)) throw new Error('Invalid saved provider descriptor');
   return p;
 }
 export const sameProvider = (a, b) => Boolean(a && b && ['id', 'fingerprint', 'transport', 'key'].every(k => a[k] === b[k]));
+// A saved route still names the same, unchanged card, of a kind that can take
+// that route. Whether the route is usable right now is verifyRouteLayout's job
+// (CCSwitch default card, Aggregation) and, for a direct relay, the per-request
+// card read (directRouteConnection).
 export function assertProviderCurrent(layout, saved) {
   const current = describeProvider(layout, saved.id);
-  // The primary's default route never uses a Stack key, so leaving Aggregation
-  // must not invalidate it. A delegated card's key still selects its member.
-  const primary = saved.transport === 'ccswitch' && current.transport === 'ccswitch' && saved.id === (layout.primaryId ?? layout.defaultProvider);
-  // A card saved with a CCSwitch route that is now reachable directly keeps its
-  // saved route while the card itself is unchanged: pre-0.5 configurations and
-  // Stack sessions, or a primary saved on the default route because it could
-  // not be reached directly when it was configured.
-  const savedCCSwitch = saved.transport === 'ccswitch' && current.transport === 'direct';
-  const comparable = primary ? { ...saved, key: current.key } : savedCCSwitch ? { ...saved, transport: 'direct', key: null } : saved;
-  if (!sameProvider(current, comparable)) throw new Error('Selected provider configuration changed; select it again and obtain fresh consent before switching');
-}
-// A switch to the primary card uses the configured primary descriptor, so it
-// keeps the route chosen at configuration (direct or the CCSwitch default).
-export function asConfiguredPrimary(config, layout, descriptor) {
-  if (descriptor.id !== config.primary.id) return descriptor;
-  assertProviderCurrent(layout, config.primary);
-  return config.primary;
-}
-export function verifyLayout(config, layout) {
-  // Only CCSwitch routes need its proxy (verifyRouteLayout). The backup is only
-  // a recommended target: a changed backup card must not block the primary.
-  assertProviderCurrent(layout, config.primary);
-  return true;
+  const compatible = current.fingerprint === saved.fingerprint && current.name === saved.name && (
+    saved.transport === 'official' ? current.transport === 'official'
+      : saved.transport === 'direct' ? current.transport === 'direct'
+        : saved.key === null ? current.transport !== 'official'
+          : current.transport === 'ccswitch' && current.key === saved.key);
+  if (!compatible) throw new Error('Selected provider configuration changed; select it again and obtain fresh consent before switching');
 }
 function verifyCCSwitchProxy(config, layout) {
-  if (layout.mode !== 'proxy' || !layout.attached || layout.pending) throw new Error('CCSwitch must run its local proxy for Codex with no pending config operation');
+  if (layout.mode !== 'proxy' || !layout.attached || layout.pending) throw coded('CCSWITCH_NOT_PROXIED', 'CCSwitch must run its local proxy for Codex with no pending config operation');
   if (!config.upstream || layout.listener?.listen_address !== '127.0.0.1' || config.upstream !== `http://127.0.0.1:${layout.listener.listen_port}/v1`) {
-    throw new Error('CCSwitch listener must match the configured IPv4 loopback endpoint');
+    throw coded('CCSWITCH_LISTENER_CHANGED', 'CCSwitch listener must match the configured IPv4 loopback endpoint');
   }
 }
-// Default forwarding preserves Codex's native protocol headers. Stack selectors
-// strip some of those headers inside CCSwitch and can make Codex-only providers
-// reject a genuine client. Never repair a drifting default by silently selecting
-// another card or falling back to Stack; require the saved primary and no failover.
+// Only CCSwitch routes depend on CCSwitch's state. Its default route is valid
+// while the card is still CCSwitch's default card and automatic failover is off
+// (failover would move the conversation silently); never repair drift by
+// selecting another card. An Aggregation route needs its member selector.
 export function verifyRouteLayout(config, layout, route) {
-  if (route == null) route = { transport: config.primary.transport, providerId: config.primary.id,
-    providerFingerprint: config.primary.fingerprint, sourceKey: config.primary.key,
-    ccswitchMode: config.primary.transport === 'ccswitch' ? 'default' : null, route: 'source' };
-  if (route.transport !== 'ccswitch') return true;
+  if (route == null || route.transport !== 'ccswitch') return true;
   verifyCCSwitchProxy(config, layout);
-  const isPrimary = route.providerId === config.primary.id;
-  if (route.ccswitchMode !== (isPrimary ? 'default' : 'stack')) throw new Error('CCSwitch route mode does not match the selected provider');
-  if (!isPrimary) return true;
-  if (route.route !== 'source' || route.providerFingerprint !== config.primary.fingerprint || (route.sourceKey ?? null) !== (config.primary.key ?? null)) {
-    throw new Error('Primary route identity changed; no provider was switched');
+  if (route.ccswitchMode === 'default' && route.sourceKey == null) {
+    if (layout.defaultProvider !== route.providerId) {
+      throw coded('CCSWITCH_DEFAULT_CHANGED', 'CCSwitch\'s default card changed, and this card is only usable as CCSwitch\'s default card; switch this conversation or start a new one');
+    }
+    if (layout.listener?.auto_failover_enabled !== 0) throw coded('CCSWITCH_FAILOVER', 'Disable CCSwitch automatic failover while a conversation uses CCSwitch\'s default route; failover would move it silently');
+    return true;
   }
-  if (layout.defaultProvider !== config.primary.id) throw new Error('CCSwitch default provider changed; restore the configured primary before continuing');
-  if (layout.listener?.auto_failover_enabled !== 0) throw new Error('Disable CCSwitch automatic failover before using the primary; switching requires incident consent');
+  if (route.ccswitchMode !== 'stack' || !route.sourceKey) throw new Error('CCSwitch route mode does not match the selected provider');
+  if (!layout.stack?.enabled || !layout.stack.members?.includes(route.providerId) || layout.stack.keys?.[route.sourceKey] !== route.providerId) {
+    throw coded('NOT_IN_STACK', 'This card is no longer a CCSwitch Aggregation member');
+  }
   return true;
 }
+/**
+ * Gateway configuration (schema 3). New conversations start on CCSwitch's
+ * default card, so there is no primary to choose; `backup` is an optional
+ * recommended switch target. Reconfiguring keeps the capability token, so
+ * Codex's entry URL stays valid. Changing only the recommended backup also
+ * keeps the configuration ID (routes, conversations and a running gateway stay
+ * valid); any other change starts a new configuration ID, so threads routed
+ * under the earlier one need a new conversation. `requireSameId` refuses such
+ * a change before anything is written (used while the gateway runs).
+ */
 export async function configureGateway(directory, {
-  primaryName, backupName, sourceProvider, fallbackProvider, ccSwitchDirectory = path.join(homedir(), '.cc-switch'), port = 15722,
-}, inspect = inspectCCSwitch, readCards = null) {
+  backupName, fallbackProvider, ccSwitchDirectory, port, requireSameId = false,
+} = {}, inspect = inspectCCSwitch, readCards = null) {
+  const previous = await readJSON(configPath(directory)).catch(() => null);
+  let reusable = null;
+  try { reusable = previous ? validateGatewayConfig(previous) : null; } catch {}
+  port ??= Number.isInteger(previous?.port) ? previous.port : 15722;
+  ccSwitchDirectory ??= path.isAbsolute(previous?.ccSwitchDirectory || '') ? previous.ccSwitchDirectory : path.join(homedir(), '.cc-switch');
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Gateway port must be in 1024..65535');
+  const changesSetup = () => !reusable || reusable.ccSwitchDirectory !== path.resolve(ccSwitchDirectory) || reusable.port !== port;
+  const needsStop = () => new Error('Stop this gateway before reconfiguring it: this change needs a new configuration ID');
+  if (requireSameId && changesSetup()) throw needsStop();
   const layout = await inspect(ccSwitchDirectory);
-  let primary = resolveProvider(layout, { name: primaryName, id: sourceProvider }, { asPrimary: true });
-  layout.primaryId = primary.id;
-  if (primary.transport === 'direct') {
-    // A primary that cannot be reached directly (for example it needs CCSwitch to
-    // convert its format) keeps CCSwitch's default route, with its requirements.
+  let backup = null;
+  if (backupName || fallbackProvider) {
+    const identity = resolveProvider(layout, { name: backupName, id: fallbackProvider });
     readCards ||= (await import('./direct-route.mjs')).readDirectCards;
-    const card = (await readCards(ccSwitchDirectory, { id: primary.id })).get(primary.id);
-    if (!card || card.fingerprint !== primary.fingerprint || card.problem) primary = { ...primary, transport: 'ccswitch', key: null };
+    backup = routeDescriptor(layout, identity.id, (await readCards(ccSwitchDirectory, { id: identity.id })).get(identity.id));
+    // Recommending CCSwitch's default card would just restart where new conversations begin.
+    if (backup.transport === 'ccswitch' && backup.key === null) throw new Error('Recommend a card that can be reached directly, OpenAI Official or a CCSwitch Aggregation member as the backup');
   }
-  // The backup is optional: incidents list every CCSwitch card and only mark it as recommended.
-  const backup = backupName || fallbackProvider ? resolveProvider(layout, { name: backupName, id: fallbackProvider }) : null;
-  if (backup && primary.id === backup.id) throw new Error('Primary and backup must be different configurations');
-  // CCSwitch's listener serves CCSwitch routes and, for such a primary, model
-  // listing. A setup whose primary connects directly can work without it.
   const listener = layout.listener?.listen_address === '127.0.0.1' && Number.isInteger(layout.listener.listen_port) ? layout.listener.listen_port : null;
-  const config = { schema: 2, id: randomUUID(), ccSwitchDirectory: path.resolve(ccSwitchDirectory), primary, backup,
-    port, upstream: listener ? `http://127.0.0.1:${listener}/v1` : null, token: randomBytes(32).toString('hex') };
-  validateGatewayConfig(config); verifyLayout(config, layout); verifyRouteLayout(config, layout);
+  const upstream = listener ? `http://127.0.0.1:${listener}/v1` : null;
+  const kept = !changesSetup() && reusable.upstream === upstream;
+  if (requireSameId && !kept) throw needsStop();
+  const token = /^[a-f0-9]{64}$/.test(previous?.token || '') ? previous.token : randomBytes(32).toString('hex');
+  const config = { schema: 3, id: kept ? reusable.id : randomUUID(), ccSwitchDirectory: path.resolve(ccSwitchDirectory), backup, port, upstream, token };
+  validateGatewayConfig(config);
   await atomicJSON(configPath(directory), config);
-  return publicConfig(config);
+  return { ...publicConfig(config), configurationKept: kept };
 }
 export const publicConfig = ({ token, ...config }) => config;
 export function validateGatewayConfig(c) {
-  if (c?.schema === 1) throw new Error('v0.2 configuration used automatic switching; reconfigure named primary/backup for per-incident approval');
-  if (!c || c.schema !== 2 || !UUID.test(c.id) || !/^[a-f0-9]{64}$/.test(c.token)
+  if (c?.schema === 1 || c?.schema === 2) {
+    throw coded('CONFIG_OUTDATED', 'The gateway configuration predates 0.5 (a fixed primary route). Connect again to update it; new conversations then start on CCSwitch\'s default card');
+  }
+  if (!c || c.schema !== 3 || !UUID.test(c.id) || !/^[a-f0-9]{64}$/.test(c.token)
     || !path.isAbsolute(c.ccSwitchDirectory || '') || !Number.isInteger(c.port) || c.port < 1024 || c.port > 65535) throw new Error('Invalid gateway configuration');
-  validateProvider(c.primary);
-  if (c.backup != null) {
-    validateProvider(c.backup);
-    if (c.primary.id === c.backup.id) throw new Error('Primary and backup must differ');
-  }
-  if (c.upstream === null) {
-    if (c.primary.transport === 'ccswitch') throw new Error('A primary on the CCSwitch route needs the CCSwitch loopback endpoint');
-    return c;
-  }
+  if (c.backup != null) validateProvider(c.backup);
+  if (c.upstream === null) return c;
   const url = new URL(c.upstream);
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.pathname !== '/v1' || url.search || url.hash || url.username || url.password || Number(url.port) === c.port) throw new Error('Gateway upstream must be the distinct CCSwitch loopback endpoint');
   return c;
 }
-export async function loadGatewayConfig(directory) { return validateGatewayConfig(await readJSON(configPath(directory))); }
+export async function loadGatewayConfig(directory) {
+  const config = await readJSON(configPath(directory));
+  if (config === null) throw coded('NOT_CONFIGURED', 'ModelTrace is not set up yet; connect it first');
+  return validateGatewayConfig(config);
+}
 export async function verifyGatewayReady(directory, config, inspect = inspectCCSwitch) {
   const current = await loadGatewayConfig(directory);
   if (current.id !== config.id) throw new Error('Gateway configuration changed; restart the gateway');
-  const layout = await inspect(config.ccSwitchDirectory);
-  layout.primaryId = config.primary.id;
-  verifyLayout(config, layout);
-  return layout;
+  return inspect(config.ccSwitchDirectory);
 }
 export async function verifyGatewayRoute(directory, config, route, inspect = inspectCCSwitch) {
   const layout = await verifyGatewayReady(directory, config, inspect);

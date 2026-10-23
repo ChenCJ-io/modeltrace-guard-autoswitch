@@ -132,6 +132,10 @@ async function readView(client, profileFile) {
 async function currentGateway(directory) {
   try { return await loadGatewayConfig(directory); } catch { return null; }
 }
+// A configuration from before 0.5 (a fixed primary) that connect updates in place.
+async function gatewayOutdated(directory) {
+  try { await loadGatewayConfig(directory); return false; } catch (error) { return error.code === 'CONFIG_OUTDATED'; }
+}
 
 function publicResult(record, view, config, writeStatus) {
   const base = { attached: false, readyForNewThreads: false, phase: record?.phase || 'not_installed',
@@ -275,7 +279,9 @@ export function classifyRoute(config, providerId, ownedBaseURL) {
 }
 
 // Startup notice only: describe the effective route of new threads and, for a
-// resumed thread, the provider it was created with. Failures are omitted.
+// resumed thread, the provider it was created with. Failures are omitted. The
+// login type tells whether an OpenAI route (direct, or Official through the
+// gateway) bills a ChatGPT subscription or can work at all.
 async function describeRoutes(client, view, record, threadId) {
   const owned = record.owned.openai_base_url, config = view.response.config;
   const result = { effectiveRoute: classifyRoute(config, null, owned) };
@@ -285,7 +291,7 @@ async function describeRoutes(client, view, record, threadId) {
       if (thread?.id === threadId && routeLabel(thread.modelProvider)) result.threadRoute = classifyRoute(config, thread.modelProvider, owned);
     } catch {}
   }
-  if ((result.threadRoute || result.effectiveRoute).kind === 'openai') {
+  if (['openai', 'gateway'].includes((result.threadRoute || result.effectiveRoute).kind)) {
     try {
       const { account } = await client.request('account/read', { refreshToken: false });
       result.accountType = account?.type === 'chatgpt' ? 'chatgpt' : account?.type ? 'other' : null;
@@ -299,7 +305,8 @@ export async function nativeIntegrationStatus(directory, env = process.env, { co
   if (!record || record.phase === 'removed') return publicResult(record);
   return usingClient(env, connect, async client => {
     const view = await readView(client, record.profileFile);
-    const result = publicResult(record, view, await currentGateway(directory));
+    let result = publicResult(record, view, await currentGateway(directory));
+    if (result.phase === 'stale_gateway_config' && await gatewayOutdated(directory)) result = { ...result, phase: 'config_outdated' };
     return describe ? { ...result, ...await describeRoutes(client, view, record, threadId) } : result;
   });
 }

@@ -33,7 +33,7 @@ async function until(check, timeoutMs = 3000) {
   }
 }
 
-async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = {}) {
+async function fixture(t, { defaultCard = 'fixture-api2', relayMismatch = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'autoswitch-flow-'));
   const session = randomUUID(), sibling = randomUUID();
   const { bank, analyzeGlobalOutputs } = await loadArtifacts();
@@ -59,7 +59,7 @@ async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = 
     const body = JSON.parse(raw), threadId = req.headers['thread-id'];
     // A direct relay is recognised by the card key it must carry instead of the native login.
     const route = req.url.startsWith('/backend-api/codex/') ? 'fallback' : req.headers.authorization === 'Bearer relay-fixture-key' ? 'relay' : 'source';
-    assert.equal(body.model, expected.model, 'primary and Official retain the native model ID');
+    assert.equal(body.model, expected.model, 'every route retains the native model ID');
     upstreamRequests.push({ threadId, route, model: body.model });
     if (route === 'fallback' && holdFallback) {
       fallbackStarted.resolve();
@@ -87,9 +87,9 @@ async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = 
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const upstreamPort = upstream.address().port;
+  // CCSwitch's default card is where new conversations start.
   await atomicJSON(path.join(directory, 'live-state.json'), { apps: { codex: {
-    mode: 'proxy', attached: true, proxy_route: 'fixture-api2',
-    stack: { enabled: true, members: ['fixture-api2'], keys: { api2: 'fixture-api2' } },
+    mode: 'proxy', attached: true, proxy_route: defaultCard, stack: { enabled: false, members: [], keys: {} },
   } } });
   await execute('sqlite3', [path.join(directory, 'cc-switch.db'), `
     CREATE TABLE providers(id TEXT,name TEXT,category TEXT,app_type TEXT,settings_config TEXT,meta TEXT);
@@ -100,7 +100,7 @@ async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = 
     CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
     INSERT INTO proxy_config VALUES('codex','127.0.0.1',${upstreamPort},0);
   `]);
-  await configureGateway(directory, { sourceProvider: primary, fallbackProvider: 'fixture-official',
+  await configureGateway(directory, { fallbackProvider: 'fixture-official',
     ccSwitchDirectory: directory, port: upstreamPort === 15722 ? 15723 : 15722 });
   config = await loadGatewayConfig(directory);
   gateway = await startSwitchGateway({ upstream: config.upstream, token: config.token,
@@ -226,7 +226,7 @@ async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = 
   return { directory, session, sibling, state, background, acknowledge, reply, approve, reachHalt, request, manualSwitch,
     bases, forks, nativeCalls, upstreamRequests, originalHistory, historyBefore, clientsClosed: () => clientsClosed,
     holdFallback() { holdFallback = true; }, fallbackStarted: fallbackStarted.promise,
-    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; }, mismatchRelay() { relayValue = 1; }, officialUnreachable() { officialDown = true; }, officialLateEof() { lateEof = true; nativeClose = true; }, primaryRecovered() { sourceValue = 7; } };
+    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; }, mismatchRelay() { relayValue = 1; }, officialUnreachable() { officialDown = true; }, officialLateEof() { lateEof = true; nativeClose = true; }, sourceRecovered() { sourceValue = 7; } };
 }
 
 test('first mismatch asks, acknowledgement spends no backup quota, and explicit consent verifies and switches this thread', async t => {
@@ -357,7 +357,7 @@ test('Official closing its stream after response.completed still verifies when n
   assert.deepEqual(f.originalHistory, f.historyBefore);
 });
 
-test('switching back to the primary verifies first: a still-degraded primary keeps Official, a recovered one is restored and monitored', async t => {
+test('switching back to the start card verifies first: a still-degraded card keeps Official, a recovered one is restored and monitored', async t => {
   const f = await fixture(t);
   await f.reachHalt();
   await f.acknowledge(); await f.reply(); await f.approve(); await f.background();
@@ -365,7 +365,7 @@ test('switching back to the primary verifies first: a still-degraded primary kee
   assert.equal(current.autoSwitch.current.transport, 'official'); assert.equal(current.enabled, false);
   const official = current.autoSwitch.current, stoppedAt = current.autoSwitch.monitoringStoppedAt;
 
-  // The primary still serves the other model: the canary must stop the switch.
+  // The start card still serves the other model: the canary must stop the switch.
   const degraded = await f.manualSwitch('API2');
   assert.equal(degraded.kind, 'manual'); assert.equal(degraded.status, 'verifying');
   assert.ok((await f.state()).taskHalt, 'work pauses while the target is verified');
@@ -380,18 +380,18 @@ test('switching back to the primary verifies first: a still-degraded primary kee
   assert.notEqual(current.samples.at(-1).prediction, current.expected);
   assert.match(failedNotice.hookSpecificOutput.additionalContext, /did not pass verification[\s\S]*keeps "Official"/);
   assert.equal((await waitForSwitch(f.directory, f.session, degraded.id, { timeoutMs: 0 })).agentAction, 'report_switch_failed_current_route_kept');
-  assert.equal(f.upstreamRequests.at(-1).route, 'source', 'the canary really went through the primary route');
+  assert.equal(f.upstreamRequests.at(-1).route, 'source', 'the canary really went through the start card');
   await f.request(f.session);
   assert.equal(f.upstreamRequests.at(-1).route, 'fallback', 'ordinary requests still use Official');
 
-  // After the primary recovers, the same request passes and monitoring resumes there.
-  f.primaryRecovered();
+  // After the start card recovers, the same request passes and monitoring resumes there.
+  f.sourceRecovered();
   const recovered = await f.manualSwitch('API2');
   const notice = await f.background();
   current = await f.state();
   assert.equal(current.switchRequest.id, recovered.id); assert.equal(current.switchRequest.status, 'succeeded');
   assert.equal(current.autoSwitch.current.id, current.autoSwitch.primary.id); assert.equal(current.autoSwitch.route, 'source');
-  assert.equal(current.taskHalt, null); assert.equal(current.enabled, true, 'monitoring resumes on the primary');
+  assert.equal(current.taskHalt, null); assert.equal(current.enabled, true, 'monitoring paused for Official resumes on the start card');
   assert.equal(current.autoSwitch.enabled, true); assert.equal(current.monitoringStoppedReason, null);
   assert.ok(current.nextTools > current.workTools, 'a later checkpoint is scheduled');
   assert.match(notice.hookSpecificOutput.additionalContext, /verification completed successfully/);
@@ -402,7 +402,7 @@ test('switching back to the primary verifies first: a still-degraded primary kee
 
 test('a user-requested switch needs the user message, a different route and no open incident', async t => {
   const f = await fixture(t);
-  f.primaryRecovered(); // the queued routine checkpoint stays compatible
+  f.sourceRecovered(); // the queued routine checkpoint stays compatible
   const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: (await f.state()).model };
   await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Official' }, readiness), /user's reply/, 'the agent cannot switch on its own');
   await f.reply();
@@ -410,7 +410,10 @@ test('a user-requested switch needs the user message, a different route and no o
   await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'API2' }, readiness), /already uses/);
   await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Official' }, { ...readiness, model: 'other' }), /settings changed/);
   await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Missing card' }, readiness), /not found/);
-  await assert.rejects(requestManualSwitch(f.directory, f.sibling, { name: 'Official' }, readiness), /enable it with use first/);
+  // A thread needs a gateway route of its own before it can switch.
+  await handleHook({ session_id: f.sibling, hook_event_name: 'UserPromptSubmit' }, f.directory);
+  await assert.rejects(requestManualSwitch(f.directory, f.sibling, { name: 'Official' }, readiness), /no gateway route/);
+  assert.ok(!(await readState(f.directory, f.sibling)).autoSwitch);
   // During an incident the incident flow (propose/approve/decline) owns the decision.
   const g = await fixture(t);
   await g.reachHalt();
@@ -420,7 +423,7 @@ test('a user-requested switch needs the user message, a different route and no o
 
 test('switching to Official on request verifies once and then stops personal monitoring', async t => {
   const f = await fixture(t);
-  f.primaryRecovered();
+  f.sourceRecovered();
   await f.manualSwitch('Official');
   await f.background();
   const current = await f.state();
@@ -562,12 +565,12 @@ test('a relay still serving another model fails verification and keeps the curre
   assert.equal(current.taskHalt.id, halted.taskHalt.id);
 });
 
-test('a directly connected primary is monitored and an incident can move the thread to Official', async t => {
-  // The relay card is a key-based provider, so it becomes a direct primary.
-  const f = await fixture(t, { primary: 'fixture-relay', relayMismatch: true });
-  const configured = await loadGatewayConfig(f.directory);
-  assert.equal(configured.primary.transport, 'direct');
-  assert.ok(f.upstreamRequests.length >= 1 && f.upstreamRequests.every(row => row.route === 'relay'), 'primary traffic carries the card key, not CCSwitch');
+test('a default card that connects directly is monitored and an incident can move the thread to Official', async t => {
+  // The relay card is a key-based provider: as CCSwitch's default card, new
+  // conversations start on it and the gateway connects to it directly.
+  const f = await fixture(t, { defaultCard: 'fixture-relay', relayMismatch: true });
+  assert.equal((await f.state()).autoSwitch.primary.transport, 'direct');
+  assert.ok(f.upstreamRequests.length >= 1 && f.upstreamRequests.every(row => row.route === 'relay'), 'its traffic carries the card key, not CCSwitch');
   const halted = await f.reachHalt();
   assert.equal(halted.autoSwitch.current.transport, 'direct');
   await f.acknowledge(); await f.reply();
@@ -580,7 +583,7 @@ test('a directly connected primary is monitored and an incident can move the thr
   assert.equal((await waitForSwitch(f.directory, f.session, chosen.id, { timeoutMs: 3000, pollMs: 5 })).agentAction, 'autoswitch_verified');
   assert.equal((await f.state()).autoSwitch.current.transport, 'official');
   await f.request(f.sibling);
-  assert.equal(f.upstreamRequests.at(-1).route, 'relay', 'new conversations still start on the direct primary');
+  assert.equal(f.upstreamRequests.at(-1).route, 'relay', 'new conversations still start on CCSwitch\'s default card');
 });
 
 test('with an API-key login Official is refused without spending the reply, and a relay can still be chosen', async t => {

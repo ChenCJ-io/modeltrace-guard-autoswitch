@@ -139,9 +139,8 @@ test('the saved setting is private, survives reads, and a corrupted file fails e
 
 test('the approval preflight reports the gateway process view and keeps the request pending when Official is unreachable', async t => {
   const directory = await temporary(t);
-  await atomicJSON(configPath(directory), { schema: 2, id: randomUUID(), ccSwitchDirectory: directory, port: 15722,
+  await atomicJSON(configPath(directory), { schema: 3, id: randomUUID(), ccSwitchDirectory: directory, port: 15722,
     upstream: 'http://127.0.0.1:15721/v1', token: 'c'.repeat(64),
-    primary: { id: 'primary', name: 'Primary', fingerprint: 'a'.repeat(64), transport: 'ccswitch', key: 'primary' },
     backup: { id: 'official', name: 'Official', fingerprint: 'b'.repeat(64), transport: 'official', key: null } });
   const reply = (status, official) => async (url) => {
     assert.equal(url, `http://127.0.0.1:15722/${'c'.repeat(64)}/v1/network`);

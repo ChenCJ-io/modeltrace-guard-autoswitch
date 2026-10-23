@@ -23,13 +23,16 @@ const layout = (extra = {}) => ({
   mode: 'proxy', attached: true, pending: false, ...extra,
 });
 const descriptor = (id, name, transport, key) => ({ id, name, fingerprint: digest(id), transport, key });
-const primary = descriptor('company', 'API2 copy', 'ccswitch', 'api2-copy');
+// The conversation started on (and still uses) CCSwitch's default card, reached directly.
+const start = descriptor('company', 'API2 copy', 'direct', null);
 const official = descriptor('official', 'OpenAI Official', 'official', null);
-const config = { id: '11111111-1111-4111-8111-111111111111', primary, backup: official };
+const config = { id: '11111111-1111-4111-8111-111111111111', backup: official };
+// direct-route.mjs readings of the key-based cards: usable unless a problem is given.
+const cards = (problems = {}) => new Map(['company', 'a-api2', 'doro'].map(id => [id, { fingerprint: digest(id), problem: problems[id] ?? null }]));
 const summary = entries => entries.map(e => [e.number, e.name, e.reason, e.recommended, e.monitoringAfterSwitch]);
 
 test('every CCSwitch card is listed: selectable ones numbered with the recommendation first, the rest with a reason', () => {
-  const entries = listCandidates(layout(), config, primary, new Map(), new Map([['doro', 'needs_ccswitch_conversion']]));
+  const entries = listCandidates(layout(), config, start, new Map(), cards({ doro: 'needs_ccswitch_conversion' }), null, 'company');
   assert.deepEqual(summary(entries), [
     [1, 'OpenAI Official', null, true, 'stops'],
     [2, 'API2', null, false, 'continues'],
@@ -50,21 +53,30 @@ test('every CCSwitch card is listed: selectable ones numbered with the recommend
 
 test('without any problem a key-based card is selectable without CCSwitch Aggregation', () => {
   const plain = layout({ stack: { enabled: false, members: [], keys: {} } });
-  const entries = listCandidates(plain, config, primary);
+  const entries = listCandidates(plain, config, start, new Map(), cards());
   assert.deepEqual(entries.filter(e => e.selectable).map(e => [e.number, e.name]), [[1, 'OpenAI Official'], [2, 'API2'], [3, 'Doro']]);
   assert.equal(entries.find(e => e.name === 'xAI').reason, 'needs_ccswitch_aggregation');
 });
 
-test('without a configured backup nothing is recommended and the primary comes first when it is not current', () => {
-  const entries = listCandidates(layout(), { ...config, backup: null }, official);
-  assert.deepEqual(summary(entries).slice(0, 4), [[1, 'API2 copy', null, false, 'continues'], [2, 'API2', null, false, 'continues'],
-    [3, 'Doro', null, false, 'continues'], [4, 'xAI', null, false, 'continues']]);
+test('without a configured backup nothing is recommended; the start card comes first, then CCSwitch\'s default card', () => {
+  const entries = listCandidates(layout(), { ...config, backup: null }, official, new Map(), cards(), null, 'a-api2', false);
+  assert.deepEqual(summary(entries).slice(0, 4), [[1, 'API2', null, false, 'stays_off'], [2, 'API2 copy', null, false, 'stays_off'],
+    [3, 'Doro', null, false, 'stays_off'], [4, 'xAI', null, false, 'stays_off']]);
+  assert.equal(entries[0].sessionStart, true); assert.equal(entries[1].ccswitchDefault, true);
   assert.equal(entries.find(e => e.name === 'OpenAI Official').reason, 'current_route');
 });
 
-test('returning to the primary needs it as the CCSwitch default and failover off', () => {
-  assert.equal(listCandidates(layout({ defaultProvider: 'a-api2' }), config, official).find(e => e.primary).reason, 'primary_default_changed');
-  assert.equal(listCandidates(layout({ listener: { auto_failover_enabled: 1 } }), config, official).find(e => e.primary).reason, 'ccswitch_failover_enabled');
+test('a card only CCSwitch reaches is usable while it is CCSwitch\'s default card and failover is off', () => {
+  const broken = cards({ company: 'card_provider_missing' });
+  const company = l => listCandidates(l, config, official, new Map(), broken).find(e => e.id === 'company');
+  assert.equal(company(layout()).selectable, true);
+  assert.deepEqual([company(layout()).descriptor.transport, company(layout()).descriptor.key], ['ccswitch', null]);
+  assert.equal(company(layout({ defaultProvider: 'a-api2' })).reason, 'card_provider_missing');
+  assert.equal(company(layout({ listener: { auto_failover_enabled: 1 } })).reason, 'ccswitch_failover_enabled');
+  // An unreadable or edited card reading never counts as reachable directly.
+  assert.equal(listCandidates(layout({ defaultProvider: 'a-api2' }), config, official).find(e => e.id === 'company').reason, 'card_config_unreadable');
+  const edited = new Map([['company', { fingerprint: 'e'.repeat(64), problem: null }]]);
+  assert.equal(listCandidates(layout({ defaultProvider: 'a-api2' }), config, official, new Map(), edited).find(e => e.id === 'company').reason, 'card_changed');
 });
 
 test('the latest scored sample per card is shown, ignoring coverage gaps and foreign files', async t => {
@@ -103,7 +115,7 @@ test('listing and choosing are allowed while paused; anything chained to them is
 
 test('an open incident asks the user to choose from the list, with the recommendation and keep-current option', () => {
   const state = { session: 's', taskHalt: { id: 'h' }, autoSwitch: { phase: 'awaiting_approval' },
-    switchRequest: { id: 'r', haltId: 'h', status: 'pending', source: primary, target: official } };
+    switchRequest: { id: 'r', haltId: 'h', status: 'pending', source: start, target: official } };
   const text = switchControlContext(state, '/data', ROOT);
   assert.match(text, /candidates --session 's' --data-dir '\/data' --request 'r'/);
   assert.match(text, /choose --session 's' --data-dir '\/data' --request 'r' --pick <N>/);
@@ -115,26 +127,26 @@ test('an open incident asks the user to choose from the list, with the recommend
 });
 
 test('cards that need CCSwitch are unavailable while its proxy is off; direct cards are not affected', () => {
-  const entries = listCandidates(layout({ mode: 'direct', attached: false }), config, official);
+  const entries = listCandidates(layout({ mode: 'direct', attached: false }), config, official, new Map(), cards({ company: 'card_provider_missing' }));
   const by = name => entries.find(entry => entry.name === name);
-  assert.equal(by('API2 copy').reason, 'ccswitch_proxy_off', 'this configured primary uses the CCSwitch default route');
+  assert.equal(by('API2 copy').reason, 'ccswitch_proxy_off', 'this card is only reachable by CCSwitch\'s default route');
   assert.equal(by('xAI').reason, 'ccswitch_proxy_off');
   assert.equal(by('API2').selectable, true); assert.equal(by('Doro').selectable, true);
 });
 
-test('switching back to a directly connected primary keeps its configured route and needs no CCSwitch default', () => {
-  const direct = { ...config, primary: { ...primary, transport: 'direct', key: null } };
-  const entries = listCandidates(layout({ defaultProvider: 'a-api2', listener: { auto_failover_enabled: 1 } }), direct, official);
+test('the card a conversation started on stays reachable directly after CCSwitch\'s default card changes', () => {
+  const entries = listCandidates(layout({ defaultProvider: 'a-api2', listener: { auto_failover_enabled: 1 } }), { ...config, backup: null },
+    official, new Map(), cards(), null, 'company');
   const back = entries.find(entry => entry.id === 'company');
-  assert.equal(back.selectable, true); assert.deepEqual(back.descriptor, direct.primary);
-  const edited = listCandidates(layout({ providers: layout().providers.map(p => (p.id === 'company' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) }), direct, official);
-  assert.equal(edited.find(entry => entry.id === 'company').reason, 'primary_changed');
+  assert.equal(back.selectable, true); assert.equal(back.number, 1); assert.equal(back.sessionStart, true);
+  assert.deepEqual(back.descriptor, start);
+  assert.equal(entries.find(entry => entry.id === 'a-api2').ccswitchDefault, true);
 });
 
 test('without a ChatGPT login Official is listed as unavailable, with how to fix it', () => {
-  const entries = listCandidates(layout(), config, primary, new Map(), new Map(), 'apiKey');
+  const entries = listCandidates(layout(), config, start, new Map(), cards(), 'apiKey');
   const officialEntry = entries.find(entry => entry.id === 'official');
   assert.equal(officialEntry.reason, 'official_needs_chatgpt_login'); assert.equal(officialEntry.selectable, false);
   assert.equal(entries.find(entry => entry.name === 'API2').number, 1);
-  assert.equal(listCandidates(layout(), config, primary, new Map(), new Map(), null).find(entry => entry.id === 'official').selectable, true, 'an unknown login does not hide Official; approval checks the live login');
+  assert.equal(listCandidates(layout(), config, start, new Map(), cards(), null).find(entry => entry.id === 'official').selectable, true, 'an unknown login does not hide Official; approval checks the live login');
 });
