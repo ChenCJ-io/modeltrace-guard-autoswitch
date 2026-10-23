@@ -442,7 +442,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { remote, 
       try {
         // The local query never changes the destination/path. Official requests
         // ignore that local URL completely and construct their fixed HTTPS target.
-        upstream = remote ? remote.request(endpoint, { method: req.method, headers }, received)
+        upstream = remote ? remote.request(endpoint, { method: req.method, headers, query }, received)
           : httpRequest(target, { method: req.method, headers, agent, path: `${target.pathname}${query}` }, received);
       } catch (error) { transportFailed(error); return; }
       const outgoing = upstream;
@@ -488,10 +488,11 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { remote, 
 export async function startSwitchGateway({
   upstream, token, port = 0, resolveRoute, verifyReady, onReceipt = async () => {},
   instanceId = randomUUID(), onShutdown = async () => {},
-  officialRequestImpl, officialNetwork = null, resolveDirect = null, directTransport = null,
+  officialRequestImpl, officialNetwork = null, resolveDirect = null, resolveModels = null, directTransport = null,
   maxBodyBytes = 32 * 1024 * 1024, bodyTimeoutMs = 30_000, upstreamTimeoutMs = 600_000, maxTrackedThreads = 4096,
 } = {}) {
-  const base = upstreamUrl(upstream);
+  // CCSwitch's listener; absent when the primary connects directly and CCSwitch has no proxy port.
+  const base = upstream == null ? null : upstreamUrl(upstream);
   if (typeof token !== 'string' || !/^[a-z0-9_-]{16,256}$/i.test(token)) throw new Error('A capability token of 16-256 URL-safe characters is required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid gateway port');
   if (typeof instanceId !== 'string' || !UUID.test(instanceId)) throw new Error('A UUID gateway instanceId is required');
@@ -530,6 +531,16 @@ export async function startSwitchGateway({
     }
     return { path: match[3], query: match[4] || '', initialProviderId };
   };
+  // A loopback relay must be neither this gateway nor CCSwitch's listener,
+  // which would silently serve its own default card under this card's name.
+  const bindRelay = async (connection) => {
+    const loopbackPort = connection.baseURL.protocol === 'http:' ? Number(connection.baseURL.port || 80) : null;
+    if (loopbackPort !== null && [Number(new URL(origin).port), Number(base?.port)].includes(loopbackPort)) {
+      throw failure(503, 'A relay cannot point at this gateway or at CCSwitch');
+    }
+    try { return await relays.bind(connection); }
+    catch { throw failure(503, 'Relay transport is unavailable'); }
+  };
   const emitReceipt = (receipt) => {
     // Callback failures cannot alter a finished response or cause a replay.
     const pending = Promise.resolve().then(() => onReceipt(Object.freeze(receipt))).catch(() => {});
@@ -566,6 +577,16 @@ export async function startSwitchGateway({
       }
       if (path === 'models') {
         try { if (await verifyReady() === false) throw new Error(); } catch { throw failure(503, 'CCSwitch configuration is not ready'); }
+        // Model listing follows the primary: its relay when it connects directly,
+        // otherwise CCSwitch's listener (which forwards to its default card).
+        let connection = null;
+        try { connection = typeof resolveModels === 'function' ? await resolveModels() : null; }
+        catch { throw failure(503, 'The primary relay card is unavailable or changed'); }
+        if (connection) {
+          const remote = await bindRelay(connection);
+          await proxy(req, res, null, undefined, agent, upstreamTimeoutMs, query, { remote, endpoint: 'models' }); return;
+        }
+        if (!base) throw failure(503, 'CCSwitch has no local proxy port for Codex');
         await proxy(req, res, new URL(`${base.href}/models`), undefined, agent, upstreamTimeoutMs, query); return;
       }
       const startedAt = Date.now(), threadId = req.headers['thread-id'];
@@ -613,15 +634,10 @@ export async function startSwitchGateway({
         // Re-read the card for each request; it must still be the consented one.
         try { if (typeof resolveDirect !== 'function') throw new Error(); connection = await resolveDirect(route); }
         catch { throw failure(503, 'The selected relay card is unavailable or changed; switch again'); }
-        // A loopback relay must be neither this gateway nor CCSwitch's listener,
-        // which would silently serve its own default card under this card's name.
-        if (connection.baseURL.protocol === 'http:' && [Number(new URL(origin).port), Number(base.port)].includes(Number(connection.baseURL.port || 80))) {
-          throw failure(503, 'A relay cannot point at this gateway or at CCSwitch');
-        }
-        try { remote = await relays.bind(connection); }
-        catch { throw failure(503, 'Relay transport is unavailable'); }
+        remote = await bindRelay(connection);
       }
-      const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), remote ? bytes : forwarded, agent, upstreamTimeoutMs, '',
+      if (!remote && !base) throw failure(503, 'CCSwitch has no local proxy port for Codex');
+      const outcome = await proxy(req, res, remote ? null : new URL(`${base.href}/${path}`), remote ? bytes : forwarded, agent, upstreamTimeoutMs, '',
         remote ? { remote, endpoint: path, body } : undefined);
       const success = outcome.completed && outcome.success && outcome.statusCode >= 200 && outcome.statusCode < 300;
       if (success && threads.get(normalizedThread) === context) context.established = true;

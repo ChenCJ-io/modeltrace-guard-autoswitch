@@ -946,3 +946,17 @@ test('a relay that rejects another route\'s encrypted reasoning is repaired once
   assert.ok(!JSON.stringify(f.received[1].body).includes('synthetic-other-route-state'), 'only the rejected reasoning is removed');
   assert.deepEqual(f.received[1].body.input.at(-1), { role: 'user', content: 'synthetic task' });
 });
+
+test('model listing follows a directly connected primary to its relay, and needs CCSwitch only otherwise', async (t) => {
+  const f = await fixture(t, (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"models":[]}'); },
+    { resolveModels: async () => relayConnection(f.relayUrl) });
+  const result = await send(f.gateway, { path: '/models?client_version=0.164.0', method: 'GET', thread: null, body: null });
+  assert.equal(result.status, 200); assert.equal(result.body, '{"models":[]}');
+  assert.equal(f.received[0].path, '/v1/models?client_version=0.164.0');
+  assert.equal(f.received[0].headers.authorization, `Bearer ${RELAY_KEY}`, 'the relay gets its own key, never the native login');
+  const noCCSwitch = await fixture(t, undefined, { upstream: null, resolveModels: async () => null });
+  const missing = await send(noCCSwitch.gateway, { path: '/models', method: 'GET', thread: null, body: null });
+  assert.equal(missing.status, 503); assert.match(missing.body, /no local proxy port/);
+  assert.equal((await send(noCCSwitch.gateway)).status, 503, 'a CCSwitch route without its listener is refused');
+  assert.equal((await send(noCCSwitch.gateway, { thread: B, path: '/responses' })).status, 503);
+});

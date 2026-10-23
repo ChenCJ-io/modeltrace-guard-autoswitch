@@ -69,9 +69,9 @@ node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TAR
 
 用户也可在对话中主动切换当前会话的渠道（「切回主渠道」「切到 API2 copy」）：技能执行 `guard.mjs switch-route --target-name NAME`，只改该会话的网关路由，不改 CCSwitch 默认卡；切换前同样先做一次目标验证（完整回执 + 指纹兼容），切回仍在降智的中转时验证失败、保留当前渠道并自动解除暂停。成功切到主渠道或第三方后恢复监测，切到 Official 后停止监测。需已执行 use，且没有未处理的异常。
 
-CCSwitch 4.0.15 需开启代理模式，主渠道为默认卡；普通渠道不需要加入 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收原生认证头，只转发给本机 CCSwitch 或固定官方地址，不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
+CCSwitch 4.0.15 里有渠道卡即可；能直连的主渠道和其他普通渠道都不需要 CCSwitch 的代理、默认卡或故障转移设置，也不需要加入 Stack。保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收原生认证头，只转发给本机 CCSwitch 或固定官方地址，不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
 
-主通道使用普通默认路由，模型名和原生 Codex 请求头保持不变；转发前校验默认卡仍为主通道、CCSwitch 自动故障切换关闭，检测到漂移会拒绝请求，不自动改卡。0.5 起其他按 key 计费的渠道由网关直连：该渠道成为会话路由后，每次请求从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，去掉原生登录、账号和其他凭据类请求头后发往这张卡自己的地址，拒绝重定向；卡的身份摘要变了就拒绝转发，需要重新选择。只有 Copilot、xAI 等由 CCSwitch 管登录的卡仍使用 Stack 前缀。
+0.5 起配置主渠道时，能直连的主渠道保存为直连；不能直连（例如需要 CCSwitch 转换格式）、由 CCSwitch 管登录的主渠道，以及 0.5 之前保存的配置，使用 CCSwitch 普通默认路由：模型名和原生 Codex 请求头保持不变，转发前校验 CCSwitch 代理、默认卡仍为主通道、自动故障切换关闭，检测到漂移会拒绝请求，不自动改卡。模型列表请求跟随主渠道（直连时发往主渠道自己的地址）。按 key 计费的渠道由网关直连：该渠道是会话路由时，每次请求从 CCSwitch 只读取出这张卡的 `base_url`、key（`experimental_bearer_token`，否则 `OPENAI_API_KEY`）和静态请求头，去掉原生登录、账号和其他凭据类请求头后发往这张卡自己的地址，拒绝重定向；卡的身份摘要变了就拒绝转发，需要重新选择。只有 Copilot、xAI 等由 CCSwitch 管登录的卡仍使用 Stack 前缀。
 
 安装后在 Codex CLI 的 `/hooks` 中审阅并信任 ModelTrace Guard Autoswitch。v0.4 新增同步启动 hook，定义变更后须按原生机制重新审阅；智能体不能代改信任。可用 `node scripts/guard.mjs doctor` 检查打包文件；`doctor --fork true` 另检查原生 fork、hook 与清理能力，会创建临时分支但不生成探针。存在多个运行时时可用 `MODELTRACE_CODEX_PATH` 选择正确可执行文件，不通过换账户绕过检查。
 

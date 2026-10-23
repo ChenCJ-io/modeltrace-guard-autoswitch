@@ -70,3 +70,14 @@ test('a missing primary card and no usable target are not reported as ready', as
   assert.equal(result.checks.find(check => check.id === 'routes').status, 'todo');
   assert.equal(result.ready, false);
 });
+
+test('a directly connected primary needs no CCSwitch proxy, default card or failover setting', async () => {
+  const direct = { ...config, primary: { ...primary, transport: 'direct' } };
+  const result = await checkEnvironment('/data', {}, { ...healthy, loadConfig: async () => direct,
+    inspect: async () => layout({ mode: 'direct', attached: false, defaultProvider: 'doro', listener: { listen_port: 15721, auto_failover_enabled: 1 } }) });
+  assert.equal(result.ready, true);
+  const by = id => result.checks.find(check => check.id === id);
+  assert.equal(by('ccswitch_proxy').status, 'ok'); assert.match(by('ccswitch_proxy').summary, /not needed/);
+  assert.match(by('primary').summary, /connects directly/);
+  assert.equal(by('primary_default'), undefined); assert.equal(by('failover'), undefined);
+});

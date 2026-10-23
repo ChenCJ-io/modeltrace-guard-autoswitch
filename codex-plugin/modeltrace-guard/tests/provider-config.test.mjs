@@ -104,8 +104,10 @@ test('schema 2 config preserves the company default and exposes stable primary a
   assert.equal(configured.schema, 2);
   assert.equal(Object.hasOwn(configured, 'token'), false);
   assert.equal(configured.primary.id, 'company');
+  // This card has no provider configuration to connect to directly, so the
+  // primary keeps CCSwitch's default route (with its requirements).
   assert.equal(configured.primary.transport, 'ccswitch');
-  assert.equal(configured.primary.key, 'company');
+  assert.equal(configured.primary.key, null);
   assert.equal(configured.backup.id, 'official');
   assert.equal(configured.backup.transport, 'official');
   assert.equal(configured.backup.key, null);
@@ -290,4 +292,36 @@ test('a pre-0.5 Stack route to a card that is now direct keeps working until the
   assertProviderCurrent(layout, legacy);
   assert.throws(() => assertProviderCurrent(layout, { ...legacy, fingerprint: 'c'.repeat(64) }), /fresh consent/, 'an edited card still needs a new choice');
   assert.throws(() => assertProviderCurrent(layout, { ...legacy, transport: 'official', key: null }), /fresh consent/);
+});
+
+test('a key-based primary connects directly, so CCSwitch only needs to hold its card', async t => {
+  const f = await fixture(t);
+  const relay = { auth: {}, config: 'model_provider = "relay"\n[model_providers.relay]\nbase_url = "https://relay.example.invalid/v1"\nwire_api = "responses"\nexperimental_bearer_token = "synthetic-relay-token"\n' };
+  await f.put({ id: 'company', name: 'API2copy', config: relay });
+  // No proxy mode, another default card and failover on: none of it matters to a direct primary.
+  f.live.apps.codex = { mode: 'direct', attached: false, proxy_route: 'other', stack: { enabled: false, members: [], keys: {} } };
+  await f.saveLive();
+  await f.sql("UPDATE proxy_config SET auto_failover_enabled=1 WHERE app_type='codex'");
+  const configured = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
+  assert.equal(configured.primary.transport, 'direct'); assert.equal(configured.primary.key, null);
+  assert.equal(configured.upstream, 'http://127.0.0.1:15721/v1');
+  const saved = await loadGatewayConfig(f.directory);
+  await verifyGatewayRoute(f.directory, saved);
+  assert.ok(!(await readFile(configPath(f.directory), 'utf8')).includes('synthetic-relay-token'), 'the configuration never stores a card key');
+  // Without any CCSwitch listener row, a direct primary still configures.
+  await f.sql("DELETE FROM proxy_config");
+  const noListener = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
+  assert.equal(noListener.upstream, null); assert.equal(noListener.primary.transport, 'direct');
+  // An edited card is a changed primary until it is configured again.
+  await f.put({ id: 'company', name: 'API2copy', config: { ...relay, config: relay.config.replace('synthetic-relay-token', 'rotated') } });
+  await assert.rejects(verifyGatewayReady(f.directory, await loadGatewayConfig(f.directory)), /configuration changed/);
+});
+
+test('a saved CCSwitch primary stays on CCSwitch\'s route after its card becomes reachable directly', async t => {
+  const f = await fixture(t);
+  const legacy = await configureGateway(f.directory, { primaryName: 'API2copy', ccSwitchDirectory: f.directory });
+  assert.equal(legacy.primary.transport, 'ccswitch');
+  const layout = await f.inspect();
+  assert.equal(describeProvider(layout, 'company').transport, 'direct', 'an ordinary card is described as direct');
+  await verifyGatewayRoute(f.directory, await loadGatewayConfig(f.directory));
 });

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { drainingRelay } from './stream-relay.mjs';
 import { consumeUserReply, digest, isMismatch, readState, record, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
-import { UUID, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
+import { UUID, asConfiguredPrimary, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
   readJSON, resolveProvider, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
 const live = state => Boolean(state?.enabled && !state.runtimePaused && !state.compacting && !state.runtimeEndedAt);
@@ -182,7 +182,7 @@ export function queueAutoSwitch(state, now, sample = state.samples.at(-1)) {
 
 export async function proposeSwitch(directory, session, id, selection, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
-  const target = selection?.name || selection?.id ? resolveProvider(layout, selection) : config.backup;
+  const target = selection?.name || selection?.id ? asConfiguredPrimary(config, layout, resolveProvider(layout, selection)) : config.backup;
   if (!target) throw new Error('No recommended backup is configured; list the candidates and let the user choose a target');
   return withState(directory, session, state => {
     const old = currentRequest(state, id, { allowFailed: true });
@@ -292,7 +292,7 @@ export async function chooseSwitchTarget(directory, session, id, selection, read
     }
     if (config.id !== old.configId) throw new Error('Gateway configuration changed; old consent cannot authorize this incident');
     if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before recording the user\'s choice');
-    const target = selection.pick != null ? listedTarget(old, selection.pick) : resolveProvider(layout, selection);
+    const target = selection.pick != null ? listedTarget(old, selection.pick) : asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
     // A card edited after it was listed needs a fresh list and a fresh answer.
     assertProviderCurrent(layout, target); assertProviderCurrent(layout, old.source);
     if (sameProvider(target, old.source) || target.id === old.source.id) throw new Error('Choose a different provider from the current route');
@@ -319,8 +319,8 @@ export async function chooseSwitchTarget(directory, session, id, selection, read
 }
 
 export async function resolveSwitchTarget(directory, selection) {
-  const config = await loadGatewayConfig(directory);
-  return resolveProvider(await verifyGatewayReady(directory, config), selection);
+  const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
+  return asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
 }
 
 /**
@@ -334,7 +334,7 @@ export async function resolveSwitchTarget(directory, selection) {
  */
 export async function requestManualSwitch(directory, session, selection, readiness, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
-  const target = resolveProvider(layout, selection);
+  const target = asConfiguredPrimary(config, layout, resolveProvider(layout, selection));
   return withState(directory, session, state => {
     const p = state.autoSwitch;
     if (!consentPolicy(state) || p.configId !== config.id) throw new Error('This thread has no route policy for the current gateway configuration; enable it with use first');

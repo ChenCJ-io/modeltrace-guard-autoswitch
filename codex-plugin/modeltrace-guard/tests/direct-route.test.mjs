@@ -118,7 +118,9 @@ test('relay targets keep the card path and query and accept only Responses endpo
   const connection = directConnection(card(relayToml('query_params = { "api-version" = "v" }')));
   assert.equal(relayTarget(connection, 'responses').href, 'https://relay.example.invalid/v1/responses?api-version=v');
   assert.equal(relayTarget(connection, 'responses/compact').href, 'https://relay.example.invalid/v1/responses/compact?api-version=v');
-  for (const endpoint of ['models', '../responses', 'responses?x=1']) assert.throws(() => relayTarget(connection, endpoint));
+  // Model listing for a directly connected primary keeps Codex's own query.
+  assert.equal(relayTarget(connection, 'models', '?client_version=0.164.0').href, 'https://relay.example.invalid/v1/models?client_version=0.164.0&api-version=v');
+  for (const endpoint of ['../responses', 'responses?x=1', 'models/../x', 'files']) assert.throws(() => relayTarget(connection, endpoint));
   const bare = directConnection(card(relayToml('', '', { base: 'https://relay.example.invalid' })));
   assert.equal(relayTarget(bare, 'responses').href, 'https://relay.example.invalid/responses', 'like Codex: base_url + /responses');
 });

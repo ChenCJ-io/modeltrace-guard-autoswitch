@@ -57,6 +57,9 @@ export async function checkEnvironment(directory, env = process.env, {
 
   let config = null;
   try { config = await loadConfig(directory); } catch {}
+  // CCSwitch's proxy is required only for a primary on its default route; a
+  // primary that connects directly needs CCSwitch just as the card directory.
+  const proxyRequired = config?.primary?.transport === 'ccswitch';
   const ccDir = path.resolve(config?.ccSwitchDirectory || ccSwitchDirectory || path.join(homedir(), '.cc-switch'));
   let layout = null;
   try { layout = await inspect(ccDir); }
@@ -66,8 +69,9 @@ export async function checkEnvironment(directory, env = process.env, {
       layout.providers.length ? null : 'Add your Codex providers in CC Switch'));
     const proxied = layout.mode === 'proxy' && layout.attached && !layout.pending;
     checks.push(proxied ? item('ccswitch_proxy', 'ok', 'CCSwitch runs its local proxy for Codex')
-      : item('ccswitch_proxy', 'fail', layout.pending ? 'CCSwitch has a pending configuration change' : 'CCSwitch does not run its local proxy for Codex',
-        'In CC Switch, open Codex and switch to Routing or Aggregation mode, then wait until it is applied'));
+      : !proxyRequired ? item('ccswitch_proxy', 'ok', 'CCSwitch\'s local proxy is off; not needed while the primary connects directly (only cards whose login CCSwitch manages use it)')
+        : item('ccswitch_proxy', 'fail', layout.pending ? 'CCSwitch has a pending configuration change' : 'CCSwitch does not run its local proxy for Codex, which this primary uses',
+          'In CC Switch, open Codex and switch to Routing or Aggregation mode, then wait until it is applied'));
   } else {
     checks.push(item('ccswitch_proxy', 'skip', 'Needs readable CCSwitch data'));
   }
@@ -79,7 +83,8 @@ export async function checkEnvironment(directory, env = process.env, {
     let primaryOk = true;
     try { assertProviderCurrent({ ...layout, primaryId: config.primary.id }, config.primary); }
     catch { primaryOk = false; }
-    checks.push(primaryOk ? item('primary', 'ok', `Primary route: ${config.primary.name}${config.backup ? `; recommended backup: ${config.backup.name}` : ''}`)
+    const via = config.primary.transport === 'direct' ? 'connects directly' : config.primary.transport === 'official' ? 'OpenAI official' : 'via CCSwitch\'s default route';
+    checks.push(primaryOk ? item('primary', 'ok', `Primary route: ${config.primary.name} (${via})${config.backup ? `; recommended backup: ${config.backup.name}` : ''}`)
       : item('primary', 'fail', `The primary card ${JSON.stringify(config.primary.name)} changed in CCSwitch or is missing, so the gateway refuses it`,
         'Choose the primary again (tell Codex “主渠道用 <name>”); conversations started before that need a new conversation'));
     if (config.primary.transport === 'ccswitch') {

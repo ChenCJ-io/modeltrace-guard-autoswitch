@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { describeProvider, loadGatewayConfig, verifyGatewayReady } from './provider-config.mjs';
+import { asConfiguredPrimary, describeProvider, loadGatewayConfig, verifyGatewayReady } from './provider-config.mjs';
 import { readDirectCards } from './direct-route.mjs';
 import { readState } from './state.mjs';
 import { recordCandidates } from './switch-consent.mjs';
@@ -22,7 +22,9 @@ const HINTS = {
   key_missing: 'The card has no key for its provider.',
   managed_official_account: 'This Official card selects another ChatGPT account managed by CCSwitch; the gateway can only use the current Codex login.',
   official_card_not_native: 'This Official card stores its own login or connection settings; only the unbound native Official card can be used.',
-  primary_default_changed: "CCSwitch's default card is no longer the primary; make the primary CCSwitch's default card first.",
+  primary_default_changed: "This primary uses CCSwitch's default route, and CCSwitch's default card is no longer the primary; make it CCSwitch's default card first.",
+  primary_changed: 'The primary card changed in CCSwitch; choose the primary again before switching back to it.',
+  ccswitch_proxy_off: "This card needs CCSwitch's local proxy for Codex; turn on Routing or Aggregation mode in CC Switch.",
   ccswitch_failover_enabled: 'Turn off CCSwitch automatic failover before switching back to the primary.',
   invalid_card: 'The card has no usable name or identity in CCSwitch.',
 };
@@ -39,10 +41,15 @@ export function listCandidates(layout, config, current, history = new Map(), dir
     let descriptor = null, reason = null;
     try { descriptor = describeProvider(layout, row.id); }
     catch (error) { reason = REASONS[error.code] || 'invalid_card'; }
+    // The primary keeps the route chosen when it was configured.
+    if (descriptor && row.id === config.primary.id) {
+      try { descriptor = asConfiguredPrimary(config, layout, descriptor); } catch { descriptor = null; reason = 'primary_changed'; }
+    }
     // A third-party card is reached directly; its saved configuration must be usable.
     if (!reason && descriptor.transport === 'direct' && directProblems.has(row.id)) reason = directProblems.get(row.id);
     if (current && row.id === current.id) reason = 'current_route';
-    else if (!reason && row.id === config.primary.id) {
+    else if (!reason && descriptor.transport === 'ccswitch' && !(layout.mode === 'proxy' && layout.attached && !layout.pending)) reason = 'ccswitch_proxy_off';
+    else if (!reason && row.id === config.primary.id && descriptor.transport === 'ccswitch') {
       if (layout.defaultProvider !== config.primary.id) reason = 'primary_default_changed';
       else if (layout.listener?.auto_failover_enabled !== 0) reason = 'ccswitch_failover_enabled';
     }

@@ -33,7 +33,7 @@ async function until(check, timeoutMs = 3000) {
   }
 }
 
-async function fixture(t) {
+async function fixture(t, { primary = 'fixture-api2', relayMismatch = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'autoswitch-flow-'));
   const session = randomUUID(), sibling = randomUUID();
   const { bank, analyzeGlobalOutputs } = await loadArtifacts();
@@ -48,7 +48,7 @@ async function fixture(t) {
   const originalHistory = [{ id: 'original-turn', status: 'completed', goal: 'Keep the original task unchanged' }];
   const historyBefore = structuredClone(originalHistory);
   const fallbackStarted = deferred(), releaseFallback = deferred();
-  let holdFallback = false, fallbackValue = 7, relayValue = 7, clientsClosed = 0, gateway, config, officialDown = false, lateEof = false, nativeClose = false, sourceValue = 1;
+  let holdFallback = false, fallbackValue = 7, relayValue = relayMismatch ? 1 : 7, clientsClosed = 0, gateway, config, officialDown = false, lateEof = false, nativeClose = false, sourceValue = 1;
   const closed = createServer();
   await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
   const deadPort = closed.address().port;
@@ -100,7 +100,7 @@ async function fixture(t) {
     CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,auto_failover_enabled INTEGER);
     INSERT INTO proxy_config VALUES('codex','127.0.0.1',${upstreamPort},0);
   `]);
-  await configureGateway(directory, { sourceProvider: 'fixture-api2', fallbackProvider: 'fixture-official',
+  await configureGateway(directory, { sourceProvider: primary, fallbackProvider: 'fixture-official',
     ccSwitchDirectory: directory, port: upstreamPort === 15722 ? 15723 : 15722 });
   config = await loadGatewayConfig(directory);
   gateway = await startSwitchGateway({ upstream: config.upstream, token: config.token,
@@ -560,4 +560,25 @@ test('a relay still serving another model fails verification and keeps the curre
   const current = await f.state();
   assert.equal(current.autoSwitch.phase, 'failed'); assert.equal(current.autoSwitch.current.id, 'fixture-api2');
   assert.equal(current.taskHalt.id, halted.taskHalt.id);
+});
+
+test('a directly connected primary is monitored and an incident can move the thread to Official', async t => {
+  // The relay card is a key-based provider, so it becomes a direct primary.
+  const f = await fixture(t, { primary: 'fixture-relay', relayMismatch: true });
+  const configured = await loadGatewayConfig(f.directory);
+  assert.equal(configured.primary.transport, 'direct');
+  assert.ok(f.upstreamRequests.length >= 1 && f.upstreamRequests.every(row => row.route === 'relay'), 'primary traffic carries the card key, not CCSwitch');
+  const halted = await f.reachHalt();
+  assert.equal(halted.autoSwitch.current.transport, 'direct');
+  await f.acknowledge(); await f.reply();
+  const listed = await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
+  assert.deepEqual(listed.candidates.filter(e => e.selectable).map(e => e.name), ['Official']);
+  assert.equal(listed.candidates.find(e => e.name === 'API2').reason, 'card_provider_missing', 'a card without a provider configuration cannot be reached directly');
+  const chosen = await chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { pick: 1 },
+    { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model });
+  await f.background();
+  assert.equal((await waitForSwitch(f.directory, f.session, chosen.id, { timeoutMs: 3000, pollMs: 5 })).agentAction, 'autoswitch_verified');
+  assert.equal((await f.state()).autoSwitch.current.transport, 'official');
+  await f.request(f.sibling);
+  assert.equal(f.upstreamRequests.at(-1).route, 'relay', 'new conversations still start on the direct primary');
 });

@@ -19,7 +19,8 @@ const layout = (extra = {}) => ({
     row('evil', 'bad\nname'),
   ],
   stack: { enabled: true, members: ['company', 'a-api2', 'xai'], keys: { 'api2-copy': 'company', api2: 'a-api2', xai: 'xai' } },
-  defaultProvider: 'company', listener: { listen_address: '127.0.0.1', listen_port: 15721, auto_failover_enabled: 0 }, ...extra,
+  defaultProvider: 'company', listener: { listen_address: '127.0.0.1', listen_port: 15721, auto_failover_enabled: 0 },
+  mode: 'proxy', attached: true, pending: false, ...extra,
 });
 const descriptor = (id, name, transport, key) => ({ id, name, fingerprint: digest(id), transport, key });
 const primary = descriptor('company', 'API2 copy', 'ccswitch', 'api2-copy');
@@ -111,4 +112,21 @@ test('an open incident asks the user to choose from the list, with the recommend
   assert.match(text, /decline-switch/);
   const none = switchControlContext({ ...state, switchRequest: { ...state.switchRequest, target: null } }, '/data', ROOT);
   assert.match(none, /Nothing is recommended/);
+});
+
+test('cards that need CCSwitch are unavailable while its proxy is off; direct cards are not affected', () => {
+  const entries = listCandidates(layout({ mode: 'direct', attached: false }), config, official);
+  const by = name => entries.find(entry => entry.name === name);
+  assert.equal(by('API2 copy').reason, 'ccswitch_proxy_off', 'this configured primary uses the CCSwitch default route');
+  assert.equal(by('xAI').reason, 'ccswitch_proxy_off');
+  assert.equal(by('API2').selectable, true); assert.equal(by('Doro').selectable, true);
+});
+
+test('switching back to a directly connected primary keeps its configured route and needs no CCSwitch default', () => {
+  const direct = { ...config, primary: { ...primary, transport: 'direct', key: null } };
+  const entries = listCandidates(layout({ defaultProvider: 'a-api2', listener: { auto_failover_enabled: 1 } }), direct, official);
+  const back = entries.find(entry => entry.id === 'company');
+  assert.equal(back.selectable, true); assert.deepEqual(back.descriptor, direct.primary);
+  const edited = listCandidates(layout({ providers: layout().providers.map(p => (p.id === 'company' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) }), direct, official);
+  assert.equal(edited.find(entry => entry.id === 'company').reason, 'primary_changed');
 });

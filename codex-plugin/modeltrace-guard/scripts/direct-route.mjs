@@ -150,9 +150,12 @@ export function relayHeaders(clientHeaders, connection) {
   return result;
 }
 
-export function relayTarget(connection, endpoint) {
-  if (!['responses', 'responses/compact'].includes(endpoint)) throw new Error('Unsupported relay endpoint');
+// Responses endpoints, plus model listing for a primary that connects directly
+// (Codex's own query, such as client_version, is kept).
+export function relayTarget(connection, endpoint, query = '') {
+  if (!['responses', 'responses/compact', 'models'].includes(endpoint)) throw new Error('Unsupported relay endpoint');
   const target = new URL(`${connection.baseURL.href.replace(/\/+$/, '')}/${endpoint}`);
+  if (endpoint === 'models' && query) for (const [name, value] of new URLSearchParams(query)) target.searchParams.append(name, value);
   for (const [name, value] of connection.query) target.searchParams.append(name, value);
   return target;
 }
@@ -192,10 +195,10 @@ export function createDirectTransport({ httpsRequestImpl = httpsRequest, httpReq
         label: 'Relay', retriesEncryptedReasoning: true,
         route: () => route,
         failed: () => { egress.delete(host); },
-        request(endpoint, { method = 'POST', headers = {} } = {}, callback) {
+        request(endpoint, { method = 'POST', headers = {}, query = '' } = {}, callback) {
           if (closed) throw coded('DIRECT_TRANSPORT_CLOSED', 'Relay transport is closed');
-          if (method !== 'POST') throw new Error('Unsupported relay method');
-          const target = relayTarget(connection, endpoint);
+          if (method !== (endpoint === 'models' ? 'GET' : 'POST')) throw new Error('Unsupported relay method');
+          const target = relayTarget(connection, endpoint, query);
           const options = { method, headers: relayHeaders(headers, connection), agent };
           return loopback ? httpRequestImpl(target, options, callback) : httpsRequestImpl(target, { ...options, rejectUnauthorized: true }, callback);
         },

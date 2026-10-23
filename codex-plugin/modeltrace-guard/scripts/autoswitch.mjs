@@ -116,6 +116,9 @@ async function serveGateway(directory) {
     officialNetwork: createOfficialNetwork({ directory }),
     // A direct relay route re-reads its consented card for every request.
     resolveDirect: route => directRouteConnection(config.ccSwitchDirectory, route),
+    // Model listing goes to a directly connected primary's own relay.
+    resolveModels: () => (config.primary.transport === 'direct'
+      ? directRouteConnection(config.ccSwitchDirectory, { providerId: config.primary.id, providerFingerprint: config.primary.fingerprint }) : null),
     onShutdown: () => resolveDone(),
   });
   await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port,
@@ -220,7 +223,10 @@ export async function runAutoSwitch(args, env = process.env, {
     } finally { await client.close(); }
     await startGateway(directory);
     const connection = await nativeIntegrationStatus(directory, env, { connect: openClient });
-    const reconnect = layout.defaultProvider === config.primary.id && ['installed', 'conflict', 'repair_pending'].includes(connection.phase);
+    // A CCSwitch card switch usually means the user moved away from the primary;
+    // that only matters while the primary itself uses CCSwitch's default route.
+    const reconnect = (config.primary.transport !== 'ccswitch' || layout.defaultProvider === config.primary.id)
+      && ['installed', 'conflict', 'repair_pending'].includes(connection.phase);
     return installNativeIntegration(directory, env, { connect: openClient, reconnect });
   }
   if (command === 'configure') {
