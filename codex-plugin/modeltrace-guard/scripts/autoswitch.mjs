@@ -40,10 +40,11 @@ function argumentsFor(args) {
     options[flag.slice(2)] = value;
   }
   if (command === 'configure') {
-    const names = ['primary-name', 'backup-name'], ids = ['primary-provider', 'backup-provider'];
-    const hasNames = names.some(key => Object.hasOwn(options, key)), hasIds = ids.some(key => Object.hasOwn(options, key));
-    if (hasNames === hasIds || !(hasNames ? names : ids).every(key => Object.hasOwn(options, key))) {
-      throw new Error('Provide both --primary-name/--backup-name or both --primary-provider/--backup-provider; do not mix names and IDs');
+    // The backup is an optional recommendation; incidents list every CCSwitch card.
+    const hasNames = ['primary-name', 'backup-name'].some(key => Object.hasOwn(options, key));
+    const hasIds = ['primary-provider', 'backup-provider'].some(key => Object.hasOwn(options, key));
+    if (hasNames === hasIds || !Object.hasOwn(options, hasNames ? 'primary-name' : 'primary-provider')) {
+      throw new Error('Provide --primary-name [--backup-name] or --primary-provider [--backup-provider]; do not mix names and IDs');
     }
   }
   if (command === 'launch' && options['provider-name'] && options['provider-id']) throw new Error('Choose --provider-name or --provider-id, not both');
@@ -184,11 +185,11 @@ export async function runAutoSwitch(args, env = process.env, {
     use: 'Natural-language entry: use enables monitoring only for this already-connected thread; it never launches another CLI or approves a switch.',
     connect: 'One-time setup for ordinary codex: connect this Codex home\'s future new conversations to the gateway. Existing running threads are unchanged; monitoring remains off.',
     disconnect: 'Restore only the two defaults still owned by this plugin. Existing gateway conversations and monitoring are unchanged; the gateway stays running.',
-    configure: 'configure --primary-name NAME --backup-name NAME (or --primary-provider ID --backup-provider ID) [--cc-switch-dir PATH] [--port 15722]',
+    configure: 'configure --primary-name NAME [--backup-name NAME] (or --primary-provider ID [--backup-provider ID]) [--cc-switch-dir PATH] [--port 15722]; the optional backup is only the recommended target when an incident lists every CCSwitch card',
     launch: 'launch [--resume THREAD_ID] [--provider-name NAME | --provider-id ID] (default: primary; no global config edits)',
     enable: 'enable [--session THREAD_ID] (monitor an already successful primary-route thread; never changes its route)',
     disable: 'Stop monitoring and cancel a pending switch request; keep the selected route and any halt',
-    incidents: 'Use guard.mjs propose-switch / approve-switch / decline-switch / wait-switch for an incident request',
+    incidents: 'Use guard.mjs candidates / choose / decline-switch / wait-switch for an incident request (propose-switch and approve-switch remain for a single proposed target)',
     switching: 'On an explicit user request, guard.mjs switch-route --target-name NAME verifies the target (receipt + fingerprint) and then moves only this thread; failure keeps the current route',
     scope: 'Pause on the first valid fingerprint mismatch. Each target verification and switch requires consent for that incident. Configuration, enable and acknowledgement never approve a switch.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);

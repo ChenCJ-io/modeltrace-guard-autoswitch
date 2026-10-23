@@ -16,7 +16,7 @@
 
 ```sh
 node scripts/autoswitch.mjs inspect
-node scripts/autoswitch.mjs configure --primary-name "我的主渠道" --backup-name "另一个渠道"
+node scripts/autoswitch.mjs configure --primary-name "我的主渠道" --backup-name "另一个渠道"   # 备用可省略，只是推荐项
 node scripts/autoswitch.mjs connect
 node scripts/autoswitch.mjs connection-status
 # 之后在普通 codex 新会话中，技能执行：
@@ -43,16 +43,19 @@ connect 的数据目录必须与普通启动一致，不能仅用命令行 `--da
 异常报告包含预期模型、指纹候选、时间及强弱信号；指纹不等于后端身份或降智证据。`acknowledge` 只是确认已告知，不是用户批准。目标操作如下：
 
 ```sh
-# 仅准备本次目标，不发送请求：
-node scripts/guard.mjs propose-switch --request REQUEST_ID --target-name "另一个渠道"
-# 只有用户对本次目标明确同意后：
-node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TARGET_ID
-node scripts/guard.mjs wait-switch --request REQUEST_ID
-# 用户拒绝切换、选择继续当前路由：
+# 列出 CCSwitch 中所有 Codex 渠道，把编号绑定到本次异常（不发送请求）：
+node scripts/guard.mjs candidates --request REQUEST_ID
+# 用户在报告之后回复了编号或渠道名：一步完成选定、同意并开始验证
+node scripts/guard.mjs choose --request REQUEST_ID --pick N
+node scripts/guard.mjs wait-switch --request RETURNED_REQUEST_ID
+# 用户回 0 或选择继续当前路由：
 node scripts/guard.mjs decline-switch --request REQUEST_ID
+# 只针对单个提议目标时仍可用：
+node scripts/guard.mjs propose-switch --request REQUEST_ID --target-name "另一个渠道"
+node scripts/guard.mjs approve-switch --request REQUEST_ID --target-provider TARGET_ID
 ```
 
-每次 `propose-switch` 都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 另一个渠道”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
+清单按“推荐备用、主渠道、官方、其他”编号，每项写明切换后是否继续监测和上次抽查结果；未加入 CCSwitch 聚合、绑定了其他账号等不可选的卡也会列出并说明原因。编号绑定列出时的卡身份，卡被改过会拒绝并要求重新列出。`choose` 改选与提议不同的目标、或在验证失败后重新选择时，都会创建新请求；每次 `propose-switch` 也都创建新请求；后续 approve/wait/decline 必须读取并使用返回的新 ID。“同意切到 另一个渠道”已经包含本次明确选择，解析到唯一配置后可执行批准，不反复询问。默认备用、历史授权、沉默或超时均不能代替本次同意；目标身份或配置改变需重新选择并同意。`propose-switch` 不提供目标时使用默认备用，也可用 `--target-provider ID` 消除重名歧义；默认备用已是当前配置时，须让用户另选目标，不能自动回主。
 
 批准后才运行目标路由的原生 canary，真实 `completed` 回执与兼容指纹全部通过才切换并解除本次暂停；失败保持 halt。失败收尾后，用户明确改选目标时可从当前失败请求创建新 proposal，使用新 ID 记录对新目标的本次同意；已经说清的同意不重复询问，不能继承旧批准。Official 成功后停止探针，第三方目标成功后继续监测，下一次异常再次询问。拒绝待批准的切换会保留当前路由、恢复任务与普通间隔监测。不会自动回主。
 

@@ -22,7 +22,7 @@
 - **开场告知渠道**：每次新开或恢复会话，都会先显示这个会话走哪个渠道、是否在监测；没经过插件网关时（例如 CCSwitch 改写了配置）会直接说明实际走的是哪里，个人订阅不会在你不知情时被用掉。
 - **不污染对话**：每次探针都在当前对话的冻结快照上另开一个一次性分支执行，原对话的上下文和历史不受影响；探针进程只运行本插件自己的 hook，不会触发你装的其他 hook。
 - **异常即停**：发现不一致时，主任务和它派出的子代理都会暂停，Codex 会向你说明预期模型、指纹候选和信号强弱。
-- **每次都要你同意**：安装、配置、开启监测都不算授权。每次异常都由你在下一条消息里决定：切到默认备用、换一个渠道，或保持当前渠道继续。
+- **每次都要你同意**：安装、配置、开启监测都不算授权。每次异常都会列出 CCSwitch 里所有 Codex 渠道，由你在下一条消息里回编号决定切到哪个，或保持当前渠道继续。
 - **先验证再切换**：同意后先向目标渠道发一次验证探针，确认请求真实完成且指纹相符，才在同一会话里切过去；验证失败则保持暂停，不会切到一个同样可疑的渠道。
 - **节省额度**：切到 OpenAI 官方订阅后自动停止探针；未开启监测的会话零消耗。
 - **对配置克制**：只修改当前 Codex home 的两个配置项并保存原值，随时可以一键还原；不读取、不保存任何凭据。
@@ -86,7 +86,7 @@ node "$AUTOSWITCH" network --official-proxy auto                    # 恢复自�
 
 最简单的方式是把下面这段话发给 Codex（把渠道名换成你在 CCSwitch 里的实际名称）：
 
-> 请从 https://github.com/ChenCJ-io/modeltrace-guard-autoswitch 安装这个插件。先读取 INSTALL.md，检查运行环境，完成插件安装、主备配置和普通 Codex 入口接入。主用 CCSwitch 的「我的主渠道」，备用「OpenAI Official」；配置不存在或重名时列出候选让我选择。需要登录或在 /hooks 中信任插件时引导我完成。
+> 请从 https://github.com/ChenCJ-io/modeltrace-guard-autoswitch 安装这个插件。先读取 INSTALL.md，检查运行环境，完成插件安装、主备配置和普通 Codex 入口接入。主用 CCSwitch 的「我的主渠道」，备用「OpenAI Official」（备用可不填，它只是异常时清单里的推荐项）；配置不存在或重名时列出候选让我选择。需要登录或在 /hooks 中信任插件时引导我完成。
 
 也可以手动安装：
 
@@ -109,7 +109,7 @@ node scripts/install-plugin.mjs --primary-name "我的主渠道" --backup-name "
 ```sh
 AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
 node "$AUTOSWITCH" inspect            # 列出 CCSwitch 中的候选渠道
-node "$AUTOSWITCH" configure --primary-name "我的主渠道" --backup-name "OpenAI Official"
+node "$AUTOSWITCH" configure --primary-name "我的主渠道" --backup-name "OpenAI Official"   # --backup-name 可省略
 node "$AUTOSWITCH" connect            # 启动网关并接入 Codex 默认入口
 node "$AUTOSWITCH" connection-status  # 检查接入状态
 ```
@@ -144,18 +144,23 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 ## 发现异常后会发生什么
 
 1. **暂停**：插件拦下主任务和子代理的后续工具调用。Codex 向你报告预期模型、指纹候选和信号强弱。它只是候选，不是定论。
-2. **等你回复**：在你的下一条消息里告诉 Codex 你的决定，例如：
-   - "同意切到 OpenAI Official"：切到默认备用；
-   - "切到「另一个渠道」"：换一个 CCSwitch 中的渠道；
-   - "不用切，继续"：保留当前渠道，恢复工作。
+2. **列出渠道，等你回复**：Codex 会实时读取 CCSwitch，把所有 Codex 渠道列成清单，例如：
+
+   ```text
+   1. OpenAI Official（推荐）  官方登录，切换后停止监测，消耗个人订阅；上次抽查与预期一致
+   0. 不切换，继续用 我的主渠道
+   暂不可选：渠道 B、渠道 C（未加入 CCSwitch 聚合，加好后说“刷新”）
+   ```
+
+   在你的下一条消息里回编号或渠道名即可，例如“1”“切到 渠道 B”或“0”。配置了备用时，它排在第一位并标为推荐，单说“同意”就指它。每个编号绑定的是列出时那张卡的身份，卡在这之后被改过，会重新列出再问你。
 3. **验证**：同意后，插件先向目标渠道发一次验证探针。只有拿到真实的完成回执、并且指纹相符，才在同一会话里切换并继续任务，历史保留；验证失败则保持暂停，由你重新选择。
-4. **之后**：切到官方订阅后停止探针，以免持续消耗个人额度；切到第三方渠道后继续监测，下次异常会再次询问。插件不会自动切回主渠道。
+4. **之后**：切到官方订阅后停止探针，以免持续消耗个人额度；切到第三方渠道后继续监测，下次异常会再次询问。验证失败时会重新列出清单（附上这次失败的结果），由你重新选择。插件不会自动切回主渠道。
 
 切换、拒绝或恢复，都只接受你在异常报告**之后**发出的回复，而且一条回复只能用于一次决定。Codex 不能在报告的同一轮里替你点头，你的沉默、超时或之前的笼统授权也都不算同意。
 
 ## 在对话中主动切换渠道
 
-没有异常时，你也可以直接让 Codex 切换当前会话的渠道，例如「切回主渠道」「切到 API2 copy」「切到 OpenAI Official」：
+没有异常时，你也可以直接让 Codex 切换当前会话的渠道，例如「切回主渠道」「切到 API2 copy」「切到 OpenAI Official」。只说「换个渠道」时，Codex 会先列出可选渠道再问你：
 
 - **只改当前会话**：走插件网关按会话选路，不改 CCSwitch 的默认卡，不影响其他会话，Codex 也不用重启。
 - **先验证再切**：和异常切换一样，先向目标渠道发一次探针，要求回执完整、指纹相符才切。切回主渠道时，如果它还是降智的模型，验证不通过，会话保留在当前渠道，暂停自动解除，Codex 会告诉你原因。每次切换消耗目标渠道的一次探针。
@@ -173,7 +178,7 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 | 命令 | 作用 |
 | --- | --- |
 | `inspect` | 列出 CCSwitch 中的候选渠道 |
-| `configure --primary-name A --backup-name B` | 保存主备渠道；重名时改用 `--primary-provider ID` / `--backup-provider ID` |
+| `configure --primary-name A [--backup-name B]` | 保存主渠道和可选的推荐备用；重名时改用 `--primary-provider ID` / `--backup-provider ID` |
 | `connect` / `disconnect` | 接入网关；或还原 `connect` 修改过的两项配置 |
 | `connection-status` | 检查之后新建的会话是否会经过网关 |
 | `use --session ID` / `disable --session ID` | 为会话开启 / 停止监测 |
@@ -185,6 +190,8 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 
 | 命令 | 作用 |
 | --- | --- |
+| `candidates [--request ID]` | 列出 CCSwitch 里所有 Codex 渠道：可选的编号、不可选的原因、切换后是否继续监测、上次抽查结果；带请求 ID 时把编号绑定到本次异常 |
+| `choose --request ID --pick N` | 记录你对本次异常的回答（编号或 `--target-name`），一步完成选定、同意并开始验证 |
 | `propose-switch --request ID [--target-name NAME]` | 为本次异常选择切换目标，会生成新的请求 ID |
 | `approve-switch --request ID --target-provider ID` | 记录你对本次目标的同意，并开始验证 |
 | `wait-switch --request ID` | 等待验证结果 |

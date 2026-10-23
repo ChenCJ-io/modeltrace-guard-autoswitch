@@ -12,7 +12,7 @@ import { ROOT, handleHook, loadArtifacts, run } from '../scripts/guard.mjs';
 import { handleBackgroundHook, waitForSwitch } from '../scripts/background.mjs';
 import { readState, sessionPath, withState } from '../scripts/state.mjs';
 import {
-  atomicJSON, approveSwitch, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig, requestManualSwitch,
+  atomicJSON, approveSwitch, chooseSwitchTarget, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig, requestManualSwitch,
   readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayRoute,
 } from '../scripts/switch-policy.mjs';
 import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
@@ -464,4 +464,53 @@ test('a busy Stop still blocks once for fallback verification without clearing t
   const repeated = await handleHook({ ...event, stop_hook_active: true }, directory);
   assert.equal(repeated.decision, undefined);
   assert.ok((await readState(directory, session)).taskHalt);
+});
+
+test('an incident lists every route and one listed answer selects, approves and verifies it', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  const acknowledged = await f.acknowledge();
+  assert.match(acknowledged.controlContext, / candidates /);
+  const listed = await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', halted.switchRequest.id], {});
+  assert.deepEqual(listed.candidates.map(e => [e.number, e.name, e.selectable, e.reason, e.recommended, e.monitoringAfterSwitch]),
+    [[1, 'Official', true, null, true, 'stops'], [null, 'API2', false, 'current_route', false, 'continues']]);
+  assert.deepEqual(listed.keepCurrent, { number: 0, name: 'API2' });
+  assert.equal(listed.candidates[1].lastCheck.prediction, halted.samples.at(-1).prediction, 'the current route shows its mismatching check');
+  assert.ok(!JSON.stringify(listed).includes('synthetic-fixture-only'), 'listing never reads credentials');
+  assert.deepEqual((await f.state()).switchRequest.candidates.entries.map(e => [e.number, e.id]), [[1, 'fixture-official']]);
+  const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model };
+  const choose = selection => chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, selection, readiness);
+  await assert.rejects(choose({ pick: 1 }), /user's reply/, 'the agent cannot choose within its own turn');
+  await f.reply();
+  await assert.rejects(choose({ pick: 2 }), /not listed/);
+  await assert.rejects(choose({ name: 'API2' }), /different provider/);
+  await assert.rejects(chooseSwitchTarget(f.directory, f.session, halted.switchRequest.id, { pick: 1 }, { ...readiness, model: 'other' }), /settings changed/);
+  const chosen = await choose({ pick: 1 });
+  assert.equal(chosen.id, halted.switchRequest.id, 'choosing the proposed target keeps its request');
+  assert.equal(chosen.status, 'verifying'); assert.equal(chosen.approval.recordedBy, 'agent_reported_user_choice');
+  await assert.rejects(choose({ pick: 1 }), /No matching live switch request|pending or settled failed/, 'one reply settles one decision');
+  await f.background();
+  const result = await waitForSwitch(f.directory, f.session, chosen.id, { timeoutMs: 3000, pollMs: 5 });
+  assert.equal(result.agentAction, 'autoswitch_verified');
+  const current = await f.state();
+  assert.equal(current.autoSwitch.current.id, 'fixture-official'); assert.equal(current.taskHalt, null);
+  assert.equal(current.monitoringStoppedReason, 'personal_route');
+});
+
+test('after a failed verification a fresh list and a new answer start a new request without inherited consent', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  f.mismatchFallback();
+  await f.acknowledge(); await f.reply(); await f.approve(); await f.background();
+  await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
+  const failed = (await f.state()).switchRequest;
+  assert.equal(failed.status, 'failed');
+  const listed = await run(['candidates', '--data-dir', f.directory, '--session', f.session, '--request', failed.id], {});
+  assert.notEqual(listed.candidates[0].lastCheck.outcome, 'compatible', 'the failed verification is shown for the target');
+  const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: halted.model };
+  await assert.rejects(chooseSwitchTarget(f.directory, f.session, failed.id, { pick: 1 }, readiness), /user's reply/, 'the earlier reply was already used');
+  await f.reply();
+  const again = await chooseSwitchTarget(f.directory, f.session, failed.id, { pick: 1 }, readiness);
+  assert.notEqual(again.id, failed.id);
+  assert.equal(again.status, 'verifying');
+  assert.notEqual(again.approval.id, failed.approval.id);
+  assert.deepEqual(again.candidates.entries.map(e => e.id), ['fixture-official']);
 });

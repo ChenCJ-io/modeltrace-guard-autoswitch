@@ -54,6 +54,13 @@ test('explicit names and executable paths remain individual argv values', async 
   assert.equal(calls[2][2].shell, false);
 });
 
+test('a primary alone is enough; the backup is only an optional recommendation', async t => {
+  const source = await fixture(t), calls = [];
+  const result = await installPlugin({ source, primaryName: 'API2 copy' }, { node: '/node', env: {}, run: async (...args) => { calls.push(args); } });
+  assert.equal(result.configured, true);
+  assert.deepEqual(calls[2][1], [path.join(source, 'codex-plugin/modeltrace-guard/scripts/autoswitch.mjs'), 'configure', '--primary-name', 'API2 copy']);
+});
+
 test('configured native executable is respected without reading authentication', async t => {
   const source = await fixture(t), files = [];
   await installPlugin({ source }, { env: { MODELTRACE_CODEX_PATH: '/native runtime/codex' }, run: async file => { files.push(file); } });
@@ -63,7 +70,7 @@ test('configured native executable is respected without reading authentication',
 test('invalid or incomplete configuration is rejected before any installation command', async t => {
   const source = await fixture(t), calls = [];
   for (const options of [
-    { source, primaryName: 'API2 copy' }, { source, backupName: 'Doro' },
+    { source, backupName: 'Doro' },
     { source, primaryName: 'same', backupName: 'same' }, { source, primaryName: '', backupName: 'Doro' },
     { source, primaryProvider: 'unrequested-id' }, { source: 'https://example.invalid/unpublished-repository' },
   ]) await assert.rejects(installPlugin(options, { run: async (...args) => { calls.push(args); } }));
@@ -73,9 +80,11 @@ test('invalid or incomplete configuration is rejected before any installation co
 test('argument parser rejects duplicate flags, unknown flags and name/id mixtures', () => {
   for (const args of [
     ['--source'], ['--source', 'one', '--source', 'two'], ['--enable', 'true'],
-    ['--primary-name', 'API2 copy'], ['--primary-name', 'API2 copy', '--backup-name', 'Doro', '--primary-provider', 'id'],
+    ['--backup-name', 'Doro'], ['--primary-name', 'API2 copy', '--backup-name', 'API2 copy'],
+    ['--primary-name', 'API2 copy', '--backup-name', 'Doro', '--primary-provider', 'id'],
   ]) assert.throws(() => parseInstallArgs(args));
   assert.deepEqual(parseInstallArgs(['--primary-name', 'API2 copy', '--backup-name', 'Doro']), { primaryName: 'API2 copy', backupName: 'Doro' });
+  assert.deepEqual(parseInstallArgs(['--primary-name', 'API2 copy']), { primaryName: 'API2 copy' }, 'The backup is optional');
   assert.deepEqual(parseInstallArgs(['--help']), { help: true });
 });
 

@@ -7,7 +7,7 @@ import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
-import { approveSwitch, declineSwitch, proposeSwitch, requestManualSwitch, resolveSwitchTarget, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
+import { approveSwitch, chooseSwitchTarget, declineSwitch, previewChoice, proposeSwitch, requestManualSwitch, resolveSwitchTarget, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
 export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
@@ -81,7 +81,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|switch-route|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
+  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|switch-route|candidates|choose|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
 // Splits one simple command the way the host shell would, mirroring `quote`
@@ -138,7 +138,7 @@ export function isControlCommand(event) {
     return true;
   }
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
-  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
+  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'candidates', 'choose', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
@@ -328,6 +328,17 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
   }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error));
 }
 
+// An incident answer names exactly one target: a listed number or a card.
+// 0 (keep the current route) is decline-switch, never a choice.
+export function choiceSelection(options) {
+  const given = ['pick', 'target-name', 'target-provider'].filter(key => options[key] !== undefined);
+  if (given.length !== 1) throw new Error('Choose exactly one of --pick, --target-name or --target-provider');
+  if (options.pick === undefined) return { name: options['target-name'], id: options['target-provider'] };
+  const pick = /^[1-9][0-9]{0,3}$/.test(options.pick) ? Number(options.pick) : NaN;
+  if (!Number.isSafeInteger(pick)) throw new Error('--pick must be a listed number; 0 means keep the current route, which is decline-switch');
+  return { pick };
+}
+
 function parseArguments(args) {
   const command = args.shift() || 'help';
   const options = {};
@@ -342,6 +353,7 @@ function parseArguments(args) {
     start: ['expected', 'name', ...fields], configure: ['expected', 'name', ...fields], submit: ['challenge', 'numbers'], probe: ['challenge'],
     'propose-switch': ['request', 'target-name', 'target-provider'], 'approve-switch': ['request', 'target-provider'],
     'decline-switch': ['request'], 'wait-switch': ['request'], 'switch-route': ['target-name', 'target-provider'],
+    candidates: ['request'], choose: ['request', 'pick', 'target-name', 'target-provider'],
   };
   if (!Object.hasOwn(perCommand, command)) throw new Error(`Unknown command: ${command}`);
   for (const key of Object.keys(options)) if (!['data-dir', 'session', ...perCommand[command]].includes(key)) throw new Error(`Unknown ${command} option --${key}`);
@@ -367,7 +379,8 @@ export async function run(args, env = process.env, receipt = null) {
   const { command, options, fields } = parseArguments([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return {
-    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'dashboard', 'dashboard-stop', 'label'],
+    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'candidates', 'choose', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'dashboard', 'dashboard-stop', 'label'],
+    switching: 'candidates [--request ID] lists every CCSwitch Codex card for this conversation; choose --request ID --pick N (or --target-name NAME) records the user\'s answer to an incident and starts verification; switch-route --target-provider ID switches on the user\'s own request',
     execution: 'Native async hooks run probes in the background. Normal results are silent; wait is only for an active mismatch confirmation.',
     name: 'start --name <task title> or label --name <display name>; metadata only, does not rename the Codex task or change sampling',
     session: 'Defaults to CODEX_THREAD_ID; otherwise pass --session from a trusted hook. Never invent a task id.',
@@ -420,7 +433,11 @@ export async function run(args, env = process.env, receipt = null) {
     const { waitForSwitch } = await import('./background.mjs');
     return waitForSwitch(directory, session, options.request);
   }
-  if (['propose-switch', 'approve-switch', 'decline-switch', 'switch-route'].includes(command)) {
+  if (command === 'candidates') {
+    const { listSwitchCandidates } = await import('./switch-candidates.mjs');
+    return listSwitchCandidates(directory, session, options.request ?? null);
+  }
+  if (['propose-switch', 'approve-switch', 'decline-switch', 'switch-route', 'choose'].includes(command)) {
     // Native login/model and trusted hooks, checked right before a canary starts.
     const nativeReadiness = async () => {
       const { openAppServer } = await import('./app-server-client.mjs');
@@ -454,6 +471,11 @@ export async function run(args, env = process.env, receipt = null) {
       const selection = { name: options['target-name'], id: options['target-provider'] };
       await requireReachable(await resolveSwitchTarget(directory, selection));
       await requestManualSwitch(directory, session, selection, await nativeReadiness());
+    }
+    if (command === 'choose') {
+      const selection = choiceSelection(options);
+      await requireReachable(await previewChoice(directory, session, options.request, selection));
+      await chooseSwitchTarget(directory, session, options.request, selection, await nativeReadiness());
     }
     const state = await readState(directory, session);
     return { ...summarize(state, directory), controlContext: controlContext(state, directory),

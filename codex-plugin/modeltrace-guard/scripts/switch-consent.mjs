@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { drainingRelay } from './stream-relay.mjs';
 import { consumeUserReply, digest, isMismatch, readState, record, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
 import { UUID, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
-  readJSON, resolveProvider, sameProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
+  readJSON, resolveProvider, sameProvider, validateProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
 const live = state => Boolean(state?.enabled && !state.runtimePaused && !state.compacting && !state.runtimeEndedAt);
 const consentPolicy = state => state?.autoSwitch?.protocol === 3 && state.autoSwitch.approvalMode === 'per_incident';
@@ -142,7 +142,7 @@ export async function enableAutoSwitch(directory, session, { accountType, modelP
     state.autoSwitch = { protocol: 3, approvalMode: 'per_incident', enabled: true, policyId: randomUUID(), configId: config.id,
       primary: config.primary, backup: config.backup, current: config.primary, phase: 'armed', route: 'source', revision: 1,
       enabledAt: now, attempts: 0, noticePending: false };
-    record(state, 'approval_monitor_enabled', now, { policyId: state.autoSwitch.policyId, primary: config.primary.id, backup: config.backup.id });
+    record(state, 'approval_monitor_enabled', now, { policyId: state.autoSwitch.policyId, primary: config.primary.id, backup: config.backup?.id ?? null });
     return state.autoSwitch;
   });
 }
@@ -172,7 +172,9 @@ export function queueAutoSwitch(state, now, sample = state.samples.at(-1)) {
   if (!eligibleForSwitch(state, sample)) return false;
   state.taskHalt = { id: sample.challenge, at: now, expected: sample.expected, retryCount: 0,
     predictions: [sample.prediction], alertId: sample.challenge, reason: 'switch_consent_required' };
-  const target = state.autoSwitch.backup.id === state.autoSwitch.current.id ? null : state.autoSwitch.backup;
+  // The configured backup is only the recommended target; the user may pick any listed card.
+  const backup = state.autoSwitch.backup;
+  const target = backup && backup.id !== state.autoSwitch.current.id ? backup : null;
   proposal(state, target, { challenge: sample.challenge, expected: sample.expected, prediction: sample.prediction,
     outcome: sample.outcome, language: sample.language, at: sample.at }, now);
   return true;
@@ -181,6 +183,7 @@ export function queueAutoSwitch(state, now, sample = state.samples.at(-1)) {
 export async function proposeSwitch(directory, session, id, selection, now = Date.now()) {
   const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
   const target = selection?.name || selection?.id ? resolveProvider(layout, selection) : config.backup;
+  if (!target) throw new Error('No recommended backup is configured; list the candidates and let the user choose a target');
   return withState(directory, session, state => {
     const old = currentRequest(state, id, { allowFailed: true });
     if (!live(state) || !['pending', 'failed'].includes(old.status) || state.pending || state.probeRun) throw new Error('Only a pending or settled failed proposal may change target');
@@ -242,6 +245,75 @@ export async function declineSwitch(directory, session, id, now = Date.now()) {
     state.taskHalt = null; state.autoSwitch.phase = 'armed';
     state.forceProbe = false; schedule(state, now);
     record(state, 'switch_declined_keep_current', now, { requestId: r.id, providerId: state.autoSwitch.current.id });
+    return r;
+  });
+}
+
+// Bind the numbers shown to the user to exact card identities for this request.
+// A later answer is resolved against this snapshot, never by name or position.
+export async function recordCandidates(directory, session, id, entries, now = Date.now()) {
+  return withState(directory, session, state => {
+    const r = currentRequest(state, id, { allowFailed: true });
+    if (!['pending', 'failed'].includes(r.status)) throw new Error('Candidates can only be listed for a pending or settled failed request');
+    r.candidates = { listedAt: now, entries: entries.filter(entry => entry.selectable && entry.descriptor)
+      .map(({ number, descriptor }) => ({ number, ...validateProvider(structuredClone(descriptor)) })) };
+    record(state, 'switch_candidates_listed', now, { requestId: r.id, count: r.candidates.entries.length });
+    return r.candidates;
+  });
+}
+
+function listedTarget(request, pick) {
+  const entry = request?.candidates?.entries?.find(item => item.number === pick);
+  if (!entry) throw new Error(`Choice ${pick} was not listed for this request; list the candidates again and ask the user`);
+  const { number, ...descriptor } = entry;
+  return validateProvider(structuredClone(descriptor));
+}
+
+// The target an answer refers to, resolved before taking the state lock (for
+// example to check Official reachability). chooseSwitchTarget re-resolves it.
+export async function previewChoice(directory, session, id, selection) {
+  if (selection.pick == null) return resolveSwitchTarget(directory, selection);
+  const state = await readState(directory, session);
+  return listedTarget(state?.switchRequest?.id === id ? state.switchRequest : null, selection.pick);
+}
+
+/**
+ * The user's answer to an incident: a listed number or a named card. One
+ * reply selects the target and records consent for it, then starts the same
+ * verification as approve-switch. Choosing another card than the proposed one
+ * replaces the proposal with a new request ID; nothing is inherited from it.
+ */
+export async function chooseSwitchTarget(directory, session, id, selection, readiness, now = Date.now()) {
+  const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
+  return withState(directory, session, state => {
+    const old = currentRequest(state, id, { allowFailed: true });
+    if (!live(state) || !['pending', 'failed'].includes(old.status) || state.pending || state.probeRun) {
+      throw new Error('Only a pending or settled failed request can take the user\'s choice');
+    }
+    if (config.id !== old.configId) throw new Error('Gateway configuration changed; old consent cannot authorize this incident');
+    if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before recording the user\'s choice');
+    const target = selection.pick != null ? listedTarget(old, selection.pick) : resolveProvider(layout, selection);
+    // A card edited after it was listed needs a fresh list and a fresh answer.
+    assertProviderCurrent(layout, target); assertProviderCurrent(layout, old.source);
+    if (sameProvider(target, old.source) || target.id === old.source.id) throw new Error('Choose a different provider from the current route');
+    // Returning to the primary needs its default card and disabled failover.
+    verifyRouteLayout(config, layout, routeFor(config, target, state.autoSwitch.revision + 1));
+    if (readiness?.accountType !== 'chatgpt' || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
+      throw new Error('Native login/model settings changed; approval cannot start verification');
+    }
+    consumeUserReply(state, 'Switch approval');
+    let r = old;
+    if (old.status !== 'pending' || !sameProvider(target, old.target)) {
+      record(state, 'switch_proposal_replaced', now, { requestId: old.id });
+      r = proposal(state, target, old.evidence, now);
+      if (old.candidates) r.candidates = structuredClone(old.candidates);
+    }
+    r.approval = { id: randomUUID(), requestId: r.id, haltId: r.haltId, providerId: target.id, fingerprint: target.fingerprint,
+      configId: r.configId, policyId: r.policyId, revision: r.revision, approvedAt: now, recordedBy: 'agent_reported_user_choice' };
+    r.status = 'approved';
+    if (!beginVerification(state, now)) throw new Error('Approved verification could not be queued');
+    record(state, 'switch_user_choice_recorded', now, { requestId: r.id, approvalId: r.approval.id, providerId: target.id,
+      ...(selection.pick != null ? { pick: selection.pick } : {}) });
     return r;
   });
 }
@@ -361,11 +433,13 @@ export function switchControlContext(state, directory, root) {
   const command = (verb, suffix = '') => `node ${quote(path.join(root, 'scripts', 'guard.mjs'))} ${verb}`
     + ` --session ${quote(state.session)} --data-dir ${quote(directory || '')} --request ${quote(r.id)}` + suffix;
   if (p.phase === 'awaiting_approval' && r.status === 'pending') {
-    return `ModelTrace AutoSwitch: STOP original task work and ASK THE USER whether to switch from ${JSON.stringify(r.source.name)} to ${r.target ? JSON.stringify(r.target.name) : 'a user-named CCSwitch configuration'}. Explain the fingerprint candidate is uncertain, not proof of reduced capability; target verification consumes one probe before routing changes. Report and acknowledge the alert, then ask and yield for the user's answer. Approve and decline are accepted only after the user's next message (or a request_user_input answer) that follows the acknowledgement. Do not poll, verify, approve, or switch while waiting for consent. Acknowledgement and installation are NOT switch consent.\nAfter explicit consent to the displayed target only: ${r.target ? command('approve-switch', ` --target-provider ${quote(r.target.id)}`) : 'first propose the requested named target'}.\nIf the user names another target: ${command('propose-switch', ' --target-name <exact-name>')}; approval must use the NEW request ID and target ID. If the user already explicitly said to switch to that named target, record that consent without asking redundantly.\nOnly if the user explicitly chooses to keep this provider and continue: ${command('decline-switch')}. Silence or an ambiguous answer never means consent.`;
+    const recommended = r.target ? ` Mark ${JSON.stringify(r.target.name)} as recommended; a bare yes/同意 means that entry only.`
+      : ' Nothing is recommended; a bare yes/同意 is ambiguous unless exactly one entry is selectable.';
+    return `ModelTrace AutoSwitch: STOP original task work and ASK THE USER which route this conversation should use; it currently uses ${JSON.stringify(r.source.name)}. Explain the fingerprint candidate is uncertain, not proof of reduced capability. Report and acknowledge the alert, then list the routes with ${command('candidates')} and show them in the user's language as a numbered list: each selectable entry's number, name, kind, whether monitoring stops (Official, which uses the current Codex login and its subscription) or continues after switching, and its last check if any; then the unavailable entries with their reason and how to fix it; and 0 = keep ${JSON.stringify(r.source.name)} and continue.${recommended} The chosen route is verified with one probe before the switch. Ask, then yield for the user's answer: choices are accepted only after the user's next message (or a request_user_input answer) that follows the acknowledgement. Do not poll, verify or switch while waiting. Acknowledgement and installation are NOT switch consent.\nFor a listed number: ${command('choose', ' --pick <N>')}; for a card name: ${command('choose', ' --target-name <exact-name>')}. This records consent for that one target and starts its verification; continue with the returned request ID. If the user added a card in CCSwitch and asks to refresh, list the candidates again.\nOnly if the user answers 0 or explicitly keeps the current route: ${command('decline-switch')}. Silence or an ambiguous answer never means consent.`;
   }
   if (p.phase === 'verifying' && r.status === 'verifying' && r.kind === 'manual') return `ModelTrace AutoSwitch: the user asked to switch this thread from ${JSON.stringify(r.source.name)} to ${JSON.stringify(r.target.name)}. Its fingerprint and route are being verified with one probe before routing changes. Keep original task work paused; do not replay work tools. Use the bounded read-only command: ${command('wait-switch')}. On autoswitch_verified, report the new route; on failure the thread keeps ${JSON.stringify(r.source.name)}, the pause is released, and you report the reason.`;
   if (p.phase === 'verifying' && r.status === 'verifying') return `ModelTrace AutoSwitch: the user approved ${JSON.stringify(r.target.name)} for this incident. Keep original task work paused while the approved target is verified. Do not clear the halt or replay work tools. Use the bounded read-only command: ${command('wait-switch')}. Continue only after autoswitch_verified; failure retains the halt and current route.`;
-  return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, use ${command('propose-switch', ' --target-name <exact-name>')} and approve its NEW request ID. If comparison conditions changed, request a new primary check after an explicit resume instead.`;
+  return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, list the routes again with ${command('candidates')} and record the user's answer with ${command('choose', ' --pick <N>')}; it creates a NEW request ID. If comparison conditions changed, request a new primary check after an explicit resume instead.`;
 }
 
 export async function prepareSwitchTransport(directory, snapshot, pending) {

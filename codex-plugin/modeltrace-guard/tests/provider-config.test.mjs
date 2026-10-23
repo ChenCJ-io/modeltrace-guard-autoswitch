@@ -113,6 +113,12 @@ test('schema 2 config preserves the company default and exposes stable primary a
   assert.match(saved.token, /^[a-f0-9]{64}$/);
   assert.equal(layout.defaultProvider, 'company');
   assert.equal(verifyLayout(saved, { ...layout, defaultProvider: 'other' }), true, 'base validation does not reroute an already selected Official session');
+  // The backup is only a recommendation: an edited or removed backup card must not block the primary.
+  const editedBackup = { ...layout, providers: layout.providers.map(p => (p.id === 'official' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) };
+  assert.equal(verifyLayout(saved, editedBackup), true);
+  assert.equal(verifyLayout(saved, { ...layout, providers: layout.providers.filter(p => p.id !== 'official') }), true);
+  const editedPrimary = { ...layout, providers: layout.providers.map(p => (p.id === 'company' ? { ...p, fingerprint: 'e'.repeat(64) } : p)) };
+  assert.throws(() => verifyLayout(saved, editedPrimary), /configuration changed/);
   await verifyGatewayRoute(f.directory, saved);
   assert.equal(await readFile(path.join(f.directory, 'live-state.json'), 'utf8'), before);
   const thirdPartyBackup = await configureGateway(f.directory, {

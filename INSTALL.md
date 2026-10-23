@@ -41,9 +41,9 @@ node "/path/to/modeltrace-guard-autoswitch/scripts/install-plugin.mjs" \
 
 助手使用当前进程环境，包括当前 `CODEX_HOME`；默认使用 `MODELTRACE_CODEX_PATH`，未设置时使用 PATH 中的 `codex`。它只影响此次调用对应的 Codex 配置，不承诺所有 CLI 配置或所有会话都已安装、接入或监测。
 
-执行顺序是：校验本地 marketplace 与插件身份/版本，`codex plugin marketplace add LOCAL_PATH`，`codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch`，再按需调用 `autoswitch.mjs configure --primary-name ... --backup-name ...`。执行使用 `execFile` 参数数组，不拼 shell。步骤失败即停止，不回滚已完成安装；例如配置重名失败时，插件可能已安装成功。
+执行顺序是：校验本地 marketplace 与插件身份/版本，`codex plugin marketplace add LOCAL_PATH`，`codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch`，再按需调用 `autoswitch.mjs configure --primary-name ... [--backup-name ...]`。执行使用 `execFile` 参数数组，不拼 shell。步骤失败即停止，不回滚已完成安装；例如配置重名失败时，插件可能已安装成功。
 
-助手不读取认证文件、不改 hook 信任、不启动网关或推理，不调用 `connect`、`use`、`enable`、`approve-switch`。主备名称需成对提供；未提供时不替用户选择。若名称有歧义，安装后用 `inspect` 选择 ID，再明确执行：
+助手不读取认证文件、不改 hook 信任、不启动网关或推理，不调用 `connect`、`use`、`enable`、`approve-switch`。备用名称可省略，它只是异常时清单里的推荐项；提供备用时必须同时提供主渠道。未提供时不替用户选择。若名称有歧义，安装后用 `inspect` 选择 ID，再明确执行：
 
 ```sh
 node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs inspect
@@ -77,7 +77,7 @@ CCSwitch 退出、重启或用户切卡可能重写入口，setup 不保证永�
 
 用户在当前会话要求使用插件时，技能执行 `use`：已接网关的主渠道 thread 才启用监测，个人初始路线保持不检测；成功切入个人后也不再排周期探针。重复 use 不重开已停策略、不清 halt、不授权切换。`disconnect` 仅安全恢复仍归插件拥有的两键原值，不改现有会话、监测或网关运行状态。
 
-首次异常时报告候选及其不确定性，等待该次选择。`acknowledge` 是已告知，不是同意。用户说“同意切到 另一个渠道”后，解析该目标，用 `guard.mjs propose-switch --request ID --target-name "另一个渠道"` 准备，再对该目标 ID 执行 `guard.mjs approve-switch`；每次 proposal 都产生新请求 ID，approve/wait/decline 必须使用新返回的 ID，不重复请求同一份明确同意。未获得本次同意、目标身份或配置发生变化时，不发送目标验证请求。完整命令与失败边界见 [README](README.md)。
+首次异常时报告候选及其不确定性，等待该次选择。`acknowledge` 是已告知，不是同意。报告并 acknowledge 后，用 `guard.mjs candidates --request ID` 列出 CCSwitch 中所有 Codex 渠道并请用户回编号；用户回复编号或渠道名后执行 `guard.mjs choose --request ID --pick N`（或 `--target-name`），一步完成选定、同意并开始验证。改选与提议不同的目标会产生新请求 ID，wait/decline 必须使用新返回的 ID，不重复请求同一份明确同意。未获得本次同意、目标身份或配置发生变化时，不发送目标验证请求。完整命令与失败边界见 [README](README.md)。
 
 ## 本地验证
 

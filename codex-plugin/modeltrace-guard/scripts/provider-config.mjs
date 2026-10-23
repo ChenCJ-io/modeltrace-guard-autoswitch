@@ -100,22 +100,24 @@ export function resolveProvider(layout, { name, id } = {}) {
   return describeProvider(layout, matches[0].id);
 }
 
+// Codes let callers explain why a card cannot be selected; messages stay fixed.
+const coded = (code, message) => Object.assign(new Error(message), { code });
 export function describeProvider(layout, id) {
   const row = layout.providers.find(p => p.id === id);
-  if (!row || typeof row.name !== 'string' || !row.name.trim() || row.name.length > 200 || /[\x00-\x1f]/.test(row.name)) throw new Error('Invalid or missing CCSwitch provider identity');
+  if (!row || typeof row.name !== 'string' || !row.name.trim() || row.name.length > 200 || /[\x00-\x1f]/.test(row.name)) throw coded('INVALID_PROVIDER', 'Invalid or missing CCSwitch provider identity');
   // Older managed Official cards can lack category. They still select a Codex
   // account, and cannot be substituted by native login or a stale Stack entry.
-  if (row.managedCodexAccount === 1) throw new Error('This Official card selects a managed Codex account; native passthrough must not substitute the current CLI account');
+  if (row.managedCodexAccount === 1) throw coded('MANAGED_ACCOUNT', 'This Official card selects a managed Codex account; native passthrough must not substitute the current CLI account');
   const descriptor = { id: row.id, name: row.name, fingerprint: row.fingerprint, transport: 'ccswitch', key: null };
   if (row.nativeOfficial === 1) {
-    if (row.followsNativeLogin !== 1) throw new Error('This Official card binds another account or stores a login snapshot; native passthrough must not substitute the current CLI account');
+    if (row.followsNativeLogin !== 1) throw coded('OFFICIAL_NOT_NATIVE', 'This Official card binds another account or stores a login snapshot; native passthrough must not substitute the current CLI account');
     descriptor.transport = 'official';
   } else {
     // Official account cards are not Stack targets in CCSwitch. A stale member
     // entry must not turn a rejected account binding into another transport.
-    if (row.category === 'official') throw new Error('This Official card is not an unbound native login with empty auth and connection settings; its selected account must not be substituted');
+    if (row.category === 'official') throw coded('OFFICIAL_NOT_NATIVE', 'This Official card is not an unbound native login with empty auth and connection settings; its selected account must not be substituted');
     descriptor.key = Object.entries(layout.stack.keys || {}).find(([, provider]) => provider === id)?.[0];
-    if (!KEY.test(descriptor.key || '') || !layout.stack.members?.includes(id)) throw new Error(`Add ${JSON.stringify(row.name)} to CCSwitch Aggregation before selecting it; no provider was switched`);
+    if (!KEY.test(descriptor.key || '') || !layout.stack.members?.includes(id)) throw coded('NOT_IN_STACK', `Add ${JSON.stringify(row.name)} to CCSwitch Aggregation before selecting it; no provider was switched`);
   }
   validateProvider(descriptor);
   return descriptor;
@@ -135,8 +137,9 @@ export function assertProviderCurrent(layout, saved) {
 export function verifyLayout(config, layout) {
   if (layout.mode !== 'proxy' || !layout.attached || !layout.stack.enabled || layout.pending) throw new Error('CCSwitch must be attached in Aggregation mode with no pending config operation');
   if (layout.listener?.listen_address !== '127.0.0.1' || config.upstream !== `http://127.0.0.1:${layout.listener.listen_port}/v1`) throw new Error('CCSwitch listener must match the configured IPv4 loopback endpoint');
+  // The backup is only a recommended target. A changed backup card must not
+  // block the primary; a later choice re-resolves and re-binds its identity.
   assertProviderCurrent(layout, config.primary);
-  assertProviderCurrent(layout, config.backup);
   return true;
 }
 // Default forwarding preserves Codex's native protocol headers. Stack selectors
@@ -164,8 +167,9 @@ export async function configureGateway(directory, {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Gateway port must be in 1024..65535');
   const layout = await inspect(ccSwitchDirectory);
   const primary = resolveProvider(layout, { name: primaryName, id: sourceProvider });
-  const backup = resolveProvider(layout, { name: backupName, id: fallbackProvider });
-  if (primary.id === backup.id) throw new Error('Primary and backup must be different configurations');
+  // The backup is optional: incidents list every CCSwitch card and only mark it as recommended.
+  const backup = backupName || fallbackProvider ? resolveProvider(layout, { name: backupName, id: fallbackProvider }) : null;
+  if (backup && primary.id === backup.id) throw new Error('Primary and backup must be different configurations');
   const config = { schema: 2, id: randomUUID(), ccSwitchDirectory: path.resolve(ccSwitchDirectory), primary, backup,
     port, upstream: `http://127.0.0.1:${layout.listener?.listen_port}/v1`, token: randomBytes(32).toString('hex') };
   validateGatewayConfig(config); verifyLayout(config, layout); verifyRouteLayout(config, layout);
@@ -177,8 +181,11 @@ export function validateGatewayConfig(c) {
   if (c?.schema === 1) throw new Error('v0.2 configuration used automatic switching; reconfigure named primary/backup for per-incident approval');
   if (!c || c.schema !== 2 || !UUID.test(c.id) || !/^[a-f0-9]{64}$/.test(c.token)
     || !path.isAbsolute(c.ccSwitchDirectory || '') || !Number.isInteger(c.port) || c.port < 1024 || c.port > 65535) throw new Error('Invalid gateway configuration');
-  validateProvider(c.primary); validateProvider(c.backup);
-  if (c.primary.id === c.backup.id) throw new Error('Primary and backup must differ');
+  validateProvider(c.primary);
+  if (c.backup != null) {
+    validateProvider(c.backup);
+    if (c.primary.id === c.backup.id) throw new Error('Primary and backup must differ');
+  }
   const url = new URL(c.upstream);
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.pathname !== '/v1' || url.search || url.hash || url.username || url.password || Number(url.port) === c.port) throw new Error('Gateway upstream must be the distinct CCSwitch loopback endpoint');
   return c;

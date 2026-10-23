@@ -189,10 +189,10 @@ test('a changed primary reports gateway readiness instead of telling connected u
 test('configuration accepts complete names or IDs and rejects mixed or incomplete selectors before mutation', async t => {
   const f = await fixture(t);
   for (const args of [
-    ['--primary-name', 'API2 copy'],
+    ['--backup-name', 'Doro'],
+    ['--backup-provider', 'other'],
     ['--primary-name', 'API2 copy', '--backup-provider', 'official'],
     ['--primary-name', 'API2 copy', '--backup-name', 'Doro', '--primary-provider', 'company'],
-    ['--primary-provider', 'company'],
     ['--primary-name', '', '--backup-name', 'Doro'],
   ]) {
     await assert.rejects(f.invoke('configure', ...args), /both|mix|Invalid/);
@@ -202,6 +202,12 @@ test('configuration accepts complete names or IDs and rejects mixed or incomplet
   assert.equal(byId.primary.id, 'company'); assert.equal(byId.backup.id, 'other');
   const byCase = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-name', 'api2 COPY', '--backup-name', 'doro', '--port', String(f.config.port));
   assert.equal(byCase.primary.id, 'company'); assert.equal(byCase.backup.id, 'other');
+  // The backup is optional: incidents list every card and only mark it as recommended.
+  const primaryOnly = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-name', 'API2 copy', '--port', String(f.config.port));
+  assert.equal(primaryOnly.primary.id, 'company'); assert.equal(primaryOnly.backup, null);
+  assert.equal((await loadGatewayConfig(f.directory)).backup, null);
+  const idOnly = await f.invoke('configure', '--cc-switch-dir', f.directory, '--primary-provider', 'company', '--port', String(f.config.port));
+  assert.equal(idOnly.backup, null);
 });
 
 test('ambiguous names retain structured candidate IDs in CLI errors without exposing the capability', async t => {

@@ -37,8 +37,8 @@ function validateOptions(options) {
     if (typeof options[key] !== 'string' || !options[key].trim() || options[key].includes('\0')) throw new Error(`Invalid installer value: ${key}`);
   }
   const primary = Object.hasOwn(options, 'primaryName'), backup = Object.hasOwn(options, 'backupName');
-  if (primary !== backup) throw new Error('Provide both --primary-name and --backup-name, or neither');
-  if (primary && options.primaryName === options.backupName) throw new Error('Primary and backup names must differ');
+  if (backup && !primary) throw new Error('--backup-name needs --primary-name; the backup is only an optional recommendation');
+  if (backup && options.primaryName === options.backupName) throw new Error('Primary and backup names must differ');
   if (options.source && /^[a-z][a-z\d+.-]*:\/\//i.test(options.source)) throw new Error('Use a local checkout; read INSTALL.md before obtaining a repository URL');
 }
 
@@ -71,7 +71,8 @@ export async function installPlugin(options = {}, { run = execute, env = process
     { stage: 'marketplace-add', file: codex, args: ['plugin', 'marketplace', 'add', source] },
     { stage: 'plugin-add', file: codex, args: ['plugin', 'add', `${pluginName}@${marketplaceName}`] },
   ];
-  if (configure) commands.push({ stage: 'configure', file: node, args: [configureScript, 'configure', '--primary-name', options.primaryName, '--backup-name', options.backupName] });
+  if (configure) commands.push({ stage: 'configure', file: node, args: [configureScript, 'configure', '--primary-name', options.primaryName,
+    ...(Object.hasOwn(options, 'backupName') ? ['--backup-name', options.backupName] : [])] });
   for (const command of commands) {
     try {
       await run(command.file, command.args, { cwd: source, env, shell: false, encoding: 'utf8', windowsHide: true, maxBuffer: 1024 * 1024, timeout: 120000 });
@@ -85,7 +86,7 @@ export async function installPlugin(options = {}, { run = execute, env = process
     monitoringStarted: false, switchApproved: false, hookTrustChanged: false };
 }
 
-const usage = 'node scripts/install-plugin.mjs [--source LOCAL_CHECKOUT] [--codex CODEX_EXECUTABLE] [--primary-name NAME --backup-name NAME]\nInstalls the local plugin; optional names only configure preferences. No monitoring, route switch, credential access or hook trust changes.\n';
+const usage = 'node scripts/install-plugin.mjs [--source LOCAL_CHECKOUT] [--codex CODEX_EXECUTABLE] [--primary-name NAME [--backup-name NAME]]\nInstalls the local plugin; optional names only configure preferences (the backup is just the recommended target). No monitoring, route switch, credential access or hook trust changes.\n';
 
 if (process.argv[1] && realpathSync(process.argv[1]) === entrypoint) {
   try {
