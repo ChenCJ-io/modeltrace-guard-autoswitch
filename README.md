@@ -69,10 +69,10 @@
 2. 操作系统的系统 HTTPS 代理：macOS 读 `scutil --proxy`，Windows 读「Internet 设置」；Linux 没有统一的系统代理，只看环境变量
 3. 直连
 
-出网方式大约每 15 秒、以及每次连接失败后重新判断一次。开关 VPN、换代理端口都不用重启网关。需要固定某个代理时：
+出网方式大约每 15 秒、以及每次连接失败后重新判断一次。开关 VPN、换代理端口都不用重启网关。需要固定某个代理时，对 Codex 说“官方渠道走代理 127.0.0.1:7890”即可；对应的手动命令如下（路径说明见[命令参考](#命令参考)）：
 
 ```sh
-AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
+AUTOSWITCH=~/.codex/plugins/cache/modeltrace-autoswitch/modeltrace-guard-autoswitch/0.5.0/scripts/autoswitch.mjs
 node "$AUTOSWITCH" network                                          # 查看网关实际的出网方式，并做一次不带凭证的连通性检查
 node "$AUTOSWITCH" network --official-proxy http://127.0.0.1:7890   # 固定代理，立即生效
 node "$AUTOSWITCH" network --official-proxy direct                  # 强制直连
@@ -118,17 +118,28 @@ node scripts/install-plugin.mjs --primary-name "我的主渠道"
 
 ### 3. 接入网关（一次性）
 
-让 Codex 帮你执行 setup 即可。等效的手动命令如下：
+对 Codex 说：
+
+> 主渠道用「我的主渠道」，接入 ModelTrace。
+
+不用自己敲命令：Codex 会列出 CCSwitch 里的渠道让你确认、保存主渠道、启动本机网关，并把 Codex 的默认入口接到网关上。想顺便指定推荐备用，就说“主渠道用「A」，备用「B」”。
+
+接入只修改当前 `CODEX_HOME` 中的 `model_provider` 和 `openai_base_url` 两项，并保存原值；它只影响之后新建的会话，不会动认证信息、其他 Codex home 和 CCSwitch 的设置，也不会改已经打开的对话。想还原时说“断开 ModelTrace 接入”。
+
+<details>
+<summary>手动执行（排查问题时用）</summary>
+
+插件装在 `~/.codex/plugins/cache/modeltrace-autoswitch/modeltrace-guard-autoswitch/<版本>/`（源码安装时是仓库里的 `codex-plugin/modeltrace-guard/`）：
 
 ```sh
-AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
+AUTOSWITCH=~/.codex/plugins/cache/modeltrace-autoswitch/modeltrace-guard-autoswitch/0.5.0/scripts/autoswitch.mjs
 node "$AUTOSWITCH" inspect            # 列出 CCSwitch 中的候选渠道
-node "$AUTOSWITCH" configure --primary-name "我的主渠道" --backup-name "OpenAI Official"   # --backup-name 可省略
+node "$AUTOSWITCH" configure --primary-name "我的主渠道"   # 可加 --backup-name 指定推荐备用
 node "$AUTOSWITCH" connect            # 启动网关并接入 Codex 默认入口
 node "$AUTOSWITCH" connection-status  # 检查接入状态
 ```
 
-`connect` 只修改当前 `CODEX_HOME` 中的 `model_provider` 和 `openai_base_url` 两项，并保存原值；它只影响之后新建的会话，不会动认证信息、其他 Codex home、CCSwitch 的默认卡，也不会改已经打开的对话。
+</details>
 
 ### 4. 在对话中开启监测
 
@@ -187,6 +198,8 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 ## 命令参考
 
 日常使用中，这些命令都由插件技能代为执行，你只需要用自然语言和 Codex 交流。下面列出来，方便排查问题和手动管理。
+
+下面的路径以源码目录为准；从 GitHub 安装的插件在 `~/.codex/plugins/cache/modeltrace-autoswitch/modeltrace-guard-autoswitch/<版本>/` 下，把 `codex-plugin/modeltrace-guard/` 换成这个目录即可。
 
 **接入与管理**（`node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs <命令>`）
 
