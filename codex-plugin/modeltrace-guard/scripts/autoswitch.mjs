@@ -28,7 +28,7 @@ const entrypoint = fileURLToPath(import.meta.url);
 function argumentsFor(args) {
   const command = args.shift() || 'help', options = {};
   const allowed = {
-    help: [], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
+    help: [], check: ['cc-switch-dir'], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
     connect: [], disconnect: [], 'connection-status': [], network: ['official-proxy'],
     'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], use: ['session'], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
   };
@@ -183,7 +183,8 @@ export async function runAutoSwitch(args, env = process.env, {
 } = {}) {
   const { command, options } = argumentsFor([...args]);
   const directory = dataDirectory(options['data-dir'], env);
-  if (command === 'help') return { commands: ['inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'network', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+  if (command === 'help') return { commands: ['check', 'inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'network', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+    check: 'check [--cc-switch-dir PATH] (read-only setup checklist: Node, sqlite3, Codex login and hooks, CCSwitch, primary, gateway, connection and switch targets, each with its fix)',
     network: 'network [--official-proxy auto|direct|http(s)://HOST:PORT] (show or set how the gateway reaches OpenAI Official; auto = gateway HTTPS_PROXY, then the OS system proxy, then direct; applies without a restart or configuration change)',
     use: 'Natural-language entry: use enables monitoring only for this already-connected thread; it never launches another CLI or approves a switch.',
     connect: 'One-time setup for ordinary codex: connect this Codex home\'s future new conversations to the gateway. Existing running threads are unchanged; monitoring remains off.',
@@ -196,6 +197,10 @@ export async function runAutoSwitch(args, env = process.env, {
     switching: 'On an explicit user request, guard.mjs switch-route --target-name NAME verifies the target (receipt + fingerprint) and then moves only this thread; failure keeps the current route',
     scope: 'Pause on the first valid fingerprint mismatch. Each target verification and switch requires consent for that incident. Configuration, enable and acknowledgement never approve a switch.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);
+  if (command === 'check') {
+    const { checkEnvironment } = await import('./environment-check.mjs');
+    return checkEnvironment(directory, env, { ccSwitchDirectory: options['cc-switch-dir'], gatewayStatus, openClient });
+  }
   if (command === 'connection-status') return nativeIntegrationStatus(directory, env, { connect: openClient });
   if (command === 'disconnect') return removeNativeIntegration(directory, env, { connect: openClient });
   if (command === 'connect') {

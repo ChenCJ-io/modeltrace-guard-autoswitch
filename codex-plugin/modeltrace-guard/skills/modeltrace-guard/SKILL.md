@@ -1,6 +1,6 @@
 ---
 name: modeltrace-guard
-description: Set up ModelTrace Guard Autoswitch for ordinary codex and use it in the current conversation. Use when the user says “使用 modeltrace-guard-autoswitch”, “开启指纹监测”, “enable fingerprint monitoring”, asks which route this conversation uses, or asks to switch routes (“切换渠道”). Connect future conversations once, enable monitoring per thread, and ask for consent to each target before verification or switching. Installation and setup do not enable monitoring for every conversation or authorize switches.
+description: Set up ModelTrace Guard Autoswitch for ordinary codex and use it in the current conversation. Use when the user says “使用 modeltrace-guard-autoswitch”, “开启指纹监测”, “enable fingerprint monitoring”, asks which route this conversation uses, asks to switch routes (“切换渠道”), or asks to check the ModelTrace setup (“检查 ModelTrace 环境”). Connect future conversations once, enable monitoring per thread, and ask for consent to each target before verification or switching. Installation and setup do not enable monitoring for every conversation or authorize switches.
 ---
 
 # ModelTrace Guard Autoswitch
@@ -26,6 +26,8 @@ After `connect`, inspect `connection-status`. Only when `use` returns `new_conve
 `gateway_request_failed` means this thread already reached the gateway but its request failed. Read the bounded `lastRequest.statusCode`, `responseEvent` and `failureHint`; diagnose that same route instead of asking for another conversation. `gateway_request_unconfirmed` means a route was selected without a confirmed response, not an old unconnected thread. `gateway_configuration_changed` means its saved evidence belongs to another configuration. `gateway_not_ready` means the installed entry has an unavailable service, old implementation or unusable primary; repair readiness before suggesting another conversation. None enables monitoring or authorizes switching. An HTTP 403 saying “only allows Codex official clients” does not establish that the account lacks Codex access: CCSwitch Stack forwarding (used only for CCSwitch-managed logins) may strip native client headers, while the primary and direct relays keep them. Compare paths before attributing fault. Never spoof client identity to work around a rejection.
 
 ## One-time setup and configuration
+
+When the user asks to check the setup (“检查 ModelTrace 环境”), when installation, `connect` or `use` fails, or before guiding a new user through setup, run `node <autoswitch> check`. It is read-only. Present each item in the user's language with its status (ok, todo, fail, skip) and, for todo/fail, its fix, in the listed order; `next` is the first thing to do. Do not change CCSwitch settings, sign in, or trust hooks for the user; run setup commands only within an explicit setup request. `ready: true` means the environment is complete, not consent to anything.
 
 For installation before this skill is available, use the user-supplied repository URL or local directory and read that checkout's root `INSTALL.md`. Do not invent a published fork URL or use the upstream repository as this fork. The installation helper installs a local marketplace/plugin and optionally saves explicitly named preferences; it never calls `connect`, starts monitoring, reads authentication files or changes hook trust. Installation alone does not authorize changing native defaults.
 

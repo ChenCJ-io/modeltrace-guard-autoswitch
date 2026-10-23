@@ -59,6 +59,8 @@
 
 另外，CCSwitch 的默认卡需要是你选定的主渠道，并且要**关闭自动故障转移**。插件每次转发前都会检查这两项，不一致就拒绝转发，而不是悄悄换路。
 
+不确定哪项没满足时，装好插件后对 Codex 说“检查 ModelTrace 环境”（或运行 `autoswitch.mjs check`）。它会逐项列出通过、待完成或未通过，并给出每项的修法，只读、不改任何东西。
+
 ### 访问 OpenAI Official 的网络（代理）
 
 备用渠道是 OpenAI Official 时，请求由本机网关（Node 进程）直接发往 `chatgpt.com`。Codex 本身会走系统代理，Node 不会；而网关常由 hook 或工具调用拉起，环境里不一定带 `HTTPS_PROXY`。所以网关按下面的顺序自己决定出网方式（`auto`，默认，无需配置）：
@@ -102,6 +104,8 @@ node scripts/install-plugin.mjs --primary-name "我的主渠道" --backup-name "
 ### 2. 信任 hooks
 
 在 Codex 里打开 `/hooks`，审阅并信任本插件的 hooks。插件升级后如果 hook 定义有变化，需要重新信任一次。
+
+之后可以先对 Codex 说“检查 ModelTrace 环境”，看看还差哪几步。
 
 ### 3. 接入网关（一次性）
 
@@ -179,6 +183,7 @@ ModelTrace：本会话走「我的主渠道」（主渠道，第三方中转）�
 
 | 命令 | 作用 |
 | --- | --- |
+| `check` | 只读检查整套环境（Node、sqlite3、Codex 登录与 hooks、CCSwitch、主渠道、网关、接入状态、可切换渠道），每项附修法 |
 | `inspect` | 列出 CCSwitch 中的候选渠道 |
 | `configure --primary-name A [--backup-name B]` | 保存主渠道和可选的推荐备用；重名时改用 `--primary-provider ID` / `--backup-provider ID` |
 | `connect` / `disconnect` | 接入网关；或还原 `connect` 修改过的两项配置 |

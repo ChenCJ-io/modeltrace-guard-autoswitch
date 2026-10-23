@@ -53,6 +53,16 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs configure \
 
 `configure` 的名称模式和 ID 模式互斥。名称先完全匹配，未命中时允许唯一的不区分大小写匹配；重名时须选 ID，不做其他相似名称推断。需要非默认 CCSwitch 目录或端口时，在带完整主备名称或 ID 的 `configure` 命令中附加 `--cc-switch-dir PATH --port N`。配置须在网关停止时更新，新配置 ID 不会自动迁移已有路由会话。
 
+## 安装后先检查环境
+
+安装完成后运行只读检查，把结果逐项告诉用户（未通过和待完成的项附上修法）：
+
+```sh
+node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs check
+```
+
+它按顺序检查 Node、sqlite3、Codex 登录、hooks 信任、CCSwitch 代理模式、主渠道（默认卡、故障转移）、网关、普通入口接入和可切换渠道，不改动、不启动、不信任任何东西。CCSwitch 设置、登录和 `/hooks` 信任由用户自己完成；`ready: true` 只表示环境就绪，不是任何切换的同意。
+
 ## 信任、接入和监测是后续步骤
 
 安装完成后，在兼容 Codex CLI 的 `/hooks` 中由用户审阅并信任插件。v0.4 增加同步 `SessionStart` 启动 hook，旧版信任不保证覆盖新定义；不要替用户执行信任修改。加载新插件后，由技能处理后续 setup 或“使用 modeltrace-guard-autoswitch”请求，不再让用户手输专用启动器。
