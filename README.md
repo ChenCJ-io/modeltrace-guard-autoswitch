@@ -267,6 +267,7 @@ ModelTrace：本会话走 CCSwitch 默认卡「我的渠道」（第三方中转
 请把监测结果当作**线索，而不是证据**。
 
 - 指纹比对是闭集判断：只能在指纹库内的模型之间选出"最像"的一个，库外的模型会被归到最接近的候选上。
+- `gpt-6.1-sol` 与 `gpt-6-astra` 的指纹相近，插件把两者当作同一组，二者之间的互换检测不到（见 [验收记录](docs/GPT-6.1-SOL-REFERENCE.md)）。
 - 误报率尚未在相同上下文、多语言的条件下独立校准；结果一致也不代表全程可靠。
 - 每次探针都会按整段上下文向当前渠道发一次请求，会消耗额度。
 - 探针用到的冻结快照在删除前，会以「ModelTrace 临时探针快照」的名字出现在 Codex 的会话列表里，请不要继续这个会话；清理失败时插件会按退避间隔自动重试。
@@ -288,14 +289,20 @@ codex plugin marketplace remove modeltrace-autoswitch
 
 ## 开发
 
+### 已收录的 gpt-6.1-sol 指纹
+
+内置指纹库已经包含 `gpt-6.1-sol`，用的是我们按下一节流程自采的 36 条官方参考（`max`、Standard、Codex CLI 0.163.0），使用插件不需要自己采集。其他推理强度、长上下文和更多语言的准确率仍需分别验证。完整采集与验证记录见 [验收记录](docs/GPT-6.1-SOL-REFERENCE.md)。
+
+**已知区分限制：** 这批数据中 `gpt-6.1-sol` 与 `gpt-6-astra` 的数字分布容易混淆。新增模型的单次分组交叉验证仅正确 19/36，实际监测提示词的独立官方样本正确 4/6，另 2 条被归为 `gpt-6-astra`。指纹已收录，但这对模型的单次结果不足以可靠识别替换。因此插件把这两个模型登记为**已知混淆组**（`codex-plugin/modeltrace-guard/assets/confusable-groups.json`）：预期是其中一个、第一候选是另一个，且组内合计权重 ≥ 0.5 时按兼容计，不暂停、不发起切换；切换到 Official 的目标验证也按同一口径通过。代价是这两个模型之间的真实替换检测不到（本来就分不清）；组外模型（例如被判成 `gpt-5.6-luna`）的判定不变。混淆组绑定指纹库哈希，重建指纹库后自动失效，直到重新验证。
+
 ### 为新模型采集参考指纹
 
-仅在用户明确要求并授权额度消耗时运行。`collect-native-reference.mjs` 使用当前 Codex home 的原生登录和 CCSwitch 中无账号绑定的 `OpenAI Official`，独立创建一次性会话。它保留全局默认卡，通过网关选择官方固定 HTTPS 路径；不会读取认证文件，也不使用手写推理请求。
+本节只在以后为新模型补充指纹时使用，命令里的 `NEW_MODEL_ID` 换成新模型的 ID。仅在用户明确要求并授权额度消耗时运行。`collect-native-reference.mjs` 使用当前 Codex home 的原生登录和 CCSwitch 中无账号绑定的 `OpenAI Official`，独立创建一次性会话。它保留全局默认卡，通过网关选择官方固定 HTTPS 路径；不会读取认证文件，也不使用手写推理请求。
 
 ```sh
 node scripts/collect-native-reference.mjs \
   --plugin-root /absolute/installed/plugin/cache \
-  --model gpt-6.1-sol --reasoning-effort max \
+  --model NEW_MODEL_ID --reasoning-effort max \
   --output /absolute/new/collection-directory \
   --limit 36 --max-credits 65
 ```
@@ -308,15 +315,11 @@ node scripts/collect-native-reference.mjs \
 
 ```sh
 node scripts/evaluate-native-reference.mjs \
-  --bank data/unified_bank.json --model gpt-6.1-sol \
+  --bank data/unified_bank.json --model NEW_MODEL_ID \
   --samples /absolute/heldout-directory/samples.jsonl
 ```
 
 该评估检查官方回执、训练/留出分离和重复输出，仅报告候选及相似度；少量独立样本不能证明长期或同上下文的误报率。
-
-`gpt-6.1-sol` 的本次参考设置是 `max`、Standard、Codex CLI 0.163.0。其他推理强度、长上下文和更多语言的准确率仍需分别验证。
-
-**已知区分限制：** 这批数据中 `gpt-6.1-sol` 与 `gpt-6-astra` 的数字分布容易混淆。新增模型的单次分组交叉验证仅正确 19/36，实际监测提示词的独立官方样本正确 4/6，另 2 条被归为 `gpt-6-astra`。指纹已收录，但这对模型的单次结果不足以可靠识别替换。因此插件把这两个模型登记为**已知混淆组**（`codex-plugin/modeltrace-guard/assets/confusable-groups.json`）：预期是其中一个、第一候选是另一个，且组内合计权重 ≥ 0.5 时按兼容计，不暂停、不发起切换；切换到 Official 的目标验证也按同一口径通过。代价是这两个模型之间的真实替换检测不到（本来就分不清）；组外模型（例如被判成 `gpt-5.6-luna`）的判定不变。混淆组绑定指纹库哈希，重建指纹库后自动失效，直到重新验证。完整采集与验证记录见 [验收记录](docs/GPT-6.1-SOL-REFERENCE.md)。
 
 ```sh
 npm test                               # 运行全部测试
