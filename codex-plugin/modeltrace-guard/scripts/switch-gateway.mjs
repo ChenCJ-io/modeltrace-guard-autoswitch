@@ -4,10 +4,10 @@ import { Transform, pipeline } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 import * as zlib from 'node:zlib';
-import { createOfficialTransport, encryptedReasoningRetryBody } from './official-transport.mjs';
+import { createOfficialTransport, encryptedReasoningRetryBody, redactProxyURL, transportErrorCode } from './official-transport.mjs';
 
 // A healthy old daemon is not evidence that newly installed forwarding code is running.
-export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.2';
+export const GATEWAY_IMPLEMENTATION_VERSION = '0.4.3';
 
 // Codex sends zstd request bodies and the Official route needs native proxyEnv.
 // Without both, every ordinary request would fail after Codex is pointed here,
@@ -118,77 +118,235 @@ async function jsonBody(req, limit, timeoutMs) {
   return { body, bytes };
 }
 
-// Observe only bounded protocol metadata. Large event data is discarded after
-// its prefix; it never becomes a receipt, log, cache, or accumulated transcript.
+// Validate a streamed JSON value while retaining only protocol metadata. Token
+// text, nesting and object keys are bounded; oversized unrelated strings are
+// checked and discarded. A truncated prefix is never completion evidence.
+function jsonProtocolObserver() {
+  const stack = [];
+  const metadata = { type: undefined, status: undefined, responseStatus: undefined, error: false };
+  // Relevant field names and values fit well within these limits, including
+  // fully escaped keys. Other strings are validated without retaining them.
+  const TOKEN_LIMIT = 256, DEPTH_LIMIT = 128;
+  let invalid = false, rootStarted = false, rootDone = false, token = null;
+  const tracked = (parent, key) => {
+    if (parent?.role === 'root' && ['type', 'status', 'error'].includes(key)) return key;
+    if (parent?.role === 'response' && key === 'status') return 'responseStatus';
+    return null;
+  };
+  const capture = (parent, key, kind, value) => {
+    const field = tracked(parent, key);
+    if (!field) return;
+    if (field === 'error') metadata.error ||= kind !== 'null' && !(kind === 'boolean' && value === false);
+    else if (kind === 'string' && typeof value === 'string') metadata[field] = value;
+    else invalid = true;
+  };
+  const complete = () => {
+    const parent = stack.at(-1);
+    if (parent) { parent.state = 'commaOrEnd'; parent.key = null; }
+    else rootDone = true;
+  };
+  const finishToken = () => {
+    const current = token; token = null;
+    if (current.kind === 'string') {
+      let value;
+      if (!current.overflow) { try { value = JSON.parse(current.raw); } catch { invalid = true; return; } }
+      if (current.key) {
+        const parent = stack.at(-1);
+        parent.key = value ?? null; parent.state = 'colon';
+        const field = tracked(parent, parent.key);
+        if (field || (parent.role === 'root' && parent.key === 'response')) {
+          if (parent.seen.has(parent.key)) invalid = true;
+          parent.seen.add(parent.key);
+        }
+      } else { capture(current.parent, current.property, 'string', value); complete(); }
+    } else {
+      const raw = current.raw;
+      if (current.kind === 'number' && /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(raw)) capture(current.parent, current.property, 'number');
+      else if (['true', 'false', 'null'].includes(raw)) capture(current.parent, current.property, raw === 'null' ? 'null' : 'boolean', raw === 'true');
+      else { invalid = true; return; }
+      complete();
+    }
+  };
+  const startValue = (character) => {
+    const parent = stack.at(-1), property = parent?.key;
+    if (!parent) {
+      if (rootStarted || character !== '{') { invalid = true; return; }
+      rootStarted = true;
+    }
+    if (character === '{' || character === '[') {
+      capture(parent, property, 'container');
+      if (stack.length >= DEPTH_LIMIT) { invalid = true; return; }
+      const role = !parent ? 'root' : parent.role === 'root' && property === 'response' && character === '{' ? 'response' : null;
+      stack.push({ kind: character, role, state: character === '{' ? 'keyOrEnd' : 'valueOrEnd', key: null, seen: new Set() });
+    } else if (character === '"') {
+      token = { kind: 'string', raw: '"', overflow: false, escape: false, unicode: 0, key: false, parent, property };
+    } else if (/[-0-9tfn]/.test(character)) {
+      token = { kind: /[-0-9]/.test(character) ? 'number' : 'literal', raw: character, parent, property };
+    } else invalid = true;
+  };
+  return {
+    write(text) {
+      for (let index = 0; index < text.length && !invalid; index++) {
+        const character = text[index];
+        if (token?.kind === 'string') {
+          if (token.raw.length < TOKEN_LIMIT) token.raw += character; else token.overflow = true;
+          if (token.unicode) {
+            if (!/[0-9a-f]/i.test(character)) invalid = true;
+            token.unicode--; continue;
+          }
+          if (token.escape) {
+            token.escape = false;
+            if (character === 'u') token.unicode = 4;
+            else if (!'"\\/bfnrt'.includes(character)) invalid = true;
+          } else if (character === '\\') token.escape = true;
+          else if (character === '"') finishToken();
+          else if (character.charCodeAt(0) < 32) invalid = true;
+          continue;
+        }
+        if (token) {
+          if (' \t\r\n,]}'.includes(character)) { finishToken(); index--; }
+          else if (token.raw.length >= TOKEN_LIMIT) invalid = true;
+          else token.raw += character;
+          continue;
+        }
+        if (' \t\r\n'.includes(character)) continue;
+        if (rootDone) { invalid = true; continue; }
+        const parent = stack.at(-1);
+        if (!parent) { startValue(character); continue; }
+        const close = (expected) => {
+          if (character !== expected) { invalid = true; return; }
+          stack.pop(); complete();
+        };
+        if (parent.state === 'keyOrEnd' || parent.state === 'key') {
+          if (character === '}' && parent.state === 'keyOrEnd') close('}');
+          else if (character === '"') token = { kind: 'string', raw: '"', overflow: false, escape: false, unicode: 0, key: true };
+          else invalid = true;
+        } else if (parent.state === 'colon') {
+          if (character === ':') parent.state = 'value'; else invalid = true;
+        } else if (parent.state === 'commaOrEnd') {
+          if (character === ',') parent.state = parent.kind === '{' ? 'key' : 'value';
+          else close(parent.kind === '{' ? '}' : ']');
+        } else if (parent.state === 'valueOrEnd' && character === ']') close(']');
+        else startValue(character);
+      }
+    },
+    result() {
+      if (token && token.kind !== 'string') finishToken();
+      return !invalid && !token && rootDone && !stack.length ? metadata : null;
+    },
+  };
+}
+
+// Observe only bounded protocol metadata; response data never becomes a
+// receipt, log, cache, or accumulated transcript.
 // An unterminated SSE frame and [DONE] alone are not completion evidence.
 function terminalObserver(contentType, encoding) {
-  const sse = /^text\/event-stream(?:\s*;|$)/i.test(contentType || '');
-  const json = /^application\/json(?:\s*;|$)/i.test(contentType || '');
+  let mode = /^text\/event-stream(?:\s*;|$)/i.test(contentType || '') ? 'sse'
+    : /^application\/json(?:\s*;|$)/i.test(contentType || '') ? 'json' : contentType?.trim() ? null : 'sniff';
   const supported = !encoding || String(encoding).toLowerCase() === 'identity';
   const decoder = new StringDecoder('utf8');
-  let terminal = null, invalid = false, line = '', lineOverflow = false, data = '', dataSeen = false, overflow = false, eventName = '';
+  let prefix = '', firstText = true;
+  const bodyParser = jsonProtocolObserver();
+  let frameParser = jsonProtocolObserver();
+  let terminal = null, invalid = false, line = '', lineOverflow = false, dataSeen = false, eventName = '';
+  let streamedData = false, pendingCR = '', marker = '', markerOverflow = false;
   const note = (type) => {
     if (FAILURE_EVENTS.has(terminal)) return;
     if (TERMINAL_EVENTS.has(type)) terminal = type;
   };
+  const record = (metadata, namedEvent = '', json = false) => {
+    const type = metadata.type;
+    if (namedEvent && type && namedEvent !== type) invalid = true;
+    const observed = TERMINAL_EVENTS.has(namedEvent) ? namedEvent : type;
+    if (observed === 'response.completed' && [metadata.status, metadata.responseStatus].some(status => status !== undefined && status !== 'completed')) invalid = true;
+    if (metadata.error) { invalid = true; note('error'); }
+    else if (TERMINAL_EVENTS.has(observed)) note(observed);
+    else if (json && type === undefined && ['completed', 'failed', 'incomplete'].includes(metadata.status)) note(`response.${metadata.status}`);
+  };
   const dispatch = () => {
     if (dataSeen) {
-      let payload;
-      if (!overflow) { try { payload = JSON.parse(data); } catch { /* Includes the non-terminal [DONE] marker. */ } }
-      // Standard Responses streams put type first. Named SSE events also work
-      // when response.completed contains a full output larger than our bound.
-      const prefixType = overflow ? /^\s*\{\s*"type"\s*:\s*"([^"\\]{1,64})"/.exec(data)?.[1] : undefined;
-      const type = payload?.type || prefixType;
-      if (TERMINAL_EVENTS.has(eventName) && type && eventName !== type) invalid = true;
-      const observed = TERMINAL_EVENTS.has(eventName) ? eventName : type;
-      if (observed === 'response.completed' && payload?.response?.status && payload.response.status !== 'completed') invalid = true;
-      if (TERMINAL_EVENTS.has(observed) && (overflow || payload)) note(observed);
+      const metadata = frameParser.result();
+      if (metadata) record(metadata, eventName);
+      else if (markerOverflow || marker.trim() !== '[DONE]') invalid = true;
     }
-    data = ''; dataSeen = false; overflow = false; eventName = '';
+    frameParser = jsonProtocolObserver(); marker = ''; markerOverflow = false; dataSeen = false; eventName = '';
+  };
+  const feedData = (part) => {
+    frameParser.write(part);
+    markerOverflow ||= part.length > 32 - marker.length;
+    if (marker.length < 32) marker += part.slice(0, 32 - marker.length);
+  };
+  const beginData = () => {
+    if (dataSeen) feedData('\n');
+    dataSeen = true;
+  };
+  const streamData = (part) => {
+    const value = pendingCR + part;
+    pendingCR = value.endsWith('\r') ? '\r' : '';
+    feedData(pendingCR ? value.slice(0, -1) : value);
   };
   const acceptLine = () => {
     const value = line.endsWith('\r') ? line.slice(0, -1) : line;
     if (!value && !lineOverflow) dispatch();
     else if (value.startsWith('event:') && !lineOverflow) eventName = value.slice(6).replace(/^ /, '').slice(0, 128);
-    else if (value.startsWith('data:')) {
-      const part = value.slice(5).replace(/^ /, '');
-      if (dataSeen && data.length < OBSERVER_LIMIT) data += '\n';
-      const available = OBSERVER_LIMIT - data.length;
-      data += part.slice(0, available);
-      overflow ||= lineOverflow || part.length > available;
-      dataSeen = true;
+    else if (!lineOverflow && (value.startsWith('data:') || value === 'data')) { beginData(); feedData(value.slice(5).replace(/^ /, '')); }
+    line = ''; lineOverflow = false; streamedData = false; pendingCR = '';
+  };
+  const observe = (text) => {
+    if (mode === 'json') bodyParser.write(text);
+    else if (mode === 'sse') {
+      let start = 0;
+      while (start < text.length) {
+        const newline = text.indexOf('\n', start), end = newline < 0 ? text.length : newline;
+        if (lineOverflow) {
+          if (streamedData) streamData(text.slice(start, end));
+        } else {
+          const available = OBSERVER_LIMIT - line.length;
+          line += text.slice(start, Math.min(end, start + available));
+          if (end - start > available) {
+            lineOverflow = true;
+            if (line.startsWith('data:')) {
+              beginData(); streamedData = true; streamData(line.slice(5).replace(/^ /, ''));
+              streamData(text.slice(start + available, end));
+            }
+          }
+        }
+        if (newline < 0) break;
+        acceptLine(); start = newline + 1;
+      }
     }
-    line = ''; lineOverflow = false;
   };
   return {
     write(chunk) {
       if (!supported) return;
-      const text = decoder.write(chunk);
-      if (json) {
-        const available = OBSERVER_LIMIT - data.length;
-        data += text.slice(0, available); overflow ||= text.length > available;
-      } else if (sse) {
-        let start = 0;
-        while (start < text.length) {
-          const newline = text.indexOf('\n', start), end = newline < 0 ? text.length : newline;
-          const available = OBSERVER_LIMIT - line.length;
-          line += text.slice(start, Math.min(end, start + available)); lineOverflow ||= end - start > available;
-          if (newline < 0) break;
-          acceptLine(); start = newline + 1;
-        }
+      let text = decoder.write(chunk);
+      if (!text) return;
+      if (firstText) { firstText = false; text = text.replace(/^\ufeff/, ''); }
+      if (mode === 'sniff') {
+        // Some official responses omit Content-Type. Infer only from a bounded
+        // leading protocol prefix; never reinterpret an explicit unrelated type.
+        const available = OBSERVER_LIMIT - prefix.length;
+        prefix += text.slice(0, available);
+        const leading = prefix.replace(/^[ \t\r\n]*/, '');
+        if (leading.startsWith('{')) mode = 'json';
+        else if (leading.startsWith(':') || /^(?:event|data|id|retry):/.test(leading)) mode = 'sse';
+        else if (prefix.length === OBSERVER_LIMIT || (leading && !['event:', 'data:', 'id:', 'retry:'].some(value => value.startsWith(leading)))) mode = null;
+        if (mode === 'sniff') return;
+        observe(prefix); prefix = '';
+        observe(text.slice(available));
+      } else {
+        observe(text);
       }
     },
     end() {
-      if (json && supported && !overflow) {
-        let payload;
-        try { payload = JSON.parse(data + decoder.end()); } catch { /* No success without a complete JSON response. */ }
-        if (payload?.error) note('error');
-        else if (['completed', 'failed', 'incomplete'].includes(payload?.status)) note(`response.${payload.status}`);
-        else if (TERMINAL_EVENTS.has(payload?.type)) note(payload.type);
+      if (mode === 'json' && supported) {
+        bodyParser.write(decoder.end());
+        const metadata = bodyParser.result();
+        if (metadata) record(metadata, '', true);
       }
       // Compaction and models JSON lack response.completed. They are proxied
       // normally but cannot accidentally satisfy a generation canary.
-      data = ''; line = '';
+      line = ''; prefix = '';
     },
     outcome() { return { responseEvent: terminal, success: terminal === 'response.completed' && !invalid }; },
   };
@@ -196,12 +354,14 @@ function terminalObserver(contentType, encoding) {
 
 function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official, endpoint, body } = {}) {
   return new Promise((resolve) => {
-    let upstream, incoming, observer, ended = false, settled = false, blockedRedirect = false, statusCode = 502;
+    let upstream, incoming, observer, ended = false, settled = false, blockedRedirect = false, statusCode = 502, transportError = null;
+    const route = official?.route?.();
     const finish = (completed) => {
       if (settled) return;
       settled = true;
       res.off('close', disconnected); req.off('aborted', disconnected);
-      resolve({ statusCode, completed, ...(observer?.outcome() || { responseEvent: null, success: false }) });
+      resolve({ statusCode, completed, ...(observer?.outcome() || { responseEvent: null, success: false }),
+        ...(transportError ? { transportError } : {}), ...(route ? { networkSource: route.source } : {}) });
     };
     const disconnected = () => {
       if (res.writableFinished) return;
@@ -210,14 +370,19 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
     };
     res.once('close', disconnected); req.once('aborted', disconnected);
     if (res.destroyed || req.aborted) { disconnected(); return; }
-    const transportFailed = () => {
+    const transportFailed = (error) => {
       if (settled || blockedRedirect) return;
+      transportError ||= transportErrorCode(error);
+      // Re-resolve egress on the next request: the proxy may have changed.
+      official?.failed?.();
       if (res.headersSent) { res.destroy(); finish(false); }
       else {
         if (statusCode !== 504) statusCode = 502;
         res.once('finish', () => finish(false));
         const service = official ? 'Official transport' : 'CCSwitch';
-        jsonError(req, res, statusCode, statusCode === 504 ? `${service} request timed out` : `${service} is unavailable`);
+        // Error code and redacted egress only; the client (Codex) surfaces this text.
+        const detail = official ? ` (${transportError}; network ${route?.source || 'unknown'}: ${route?.proxy ? redactProxyURL(route.proxy) : 'direct'})` : ` (${transportError})`;
+        jsonError(req, res, statusCode, (statusCode === 504 ? `${service} request timed out` : `${service} is unavailable`) + detail);
       }
     };
     const forward = (response, prefix = []) => {
@@ -255,7 +420,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
         // headers. Large, compressed, partial, and ordinary errors are not retried.
         const prefix = []; let size = 0;
         const cleanup = () => { response.off('data', data); response.off('end', end); response.off('error', failed); response.off('aborted', failed); };
-        const failed = () => { cleanup(); transportFailed(); };
+        const failed = (error) => { cleanup(); transportFailed(error); };
         const data = (chunk) => {
           prefix.push(chunk); size += chunk.length;
           if (size > OBSERVER_LIMIT) { response.pause(); cleanup(); forward(response, prefix); }
@@ -276,12 +441,13 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
         // ignore that local URL completely and construct their fixed HTTPS target.
         upstream = official ? official.request(endpoint, { method: req.method, headers }, received)
           : httpRequest(target, { method: req.method, headers, agent, path: `${target.pathname}${query}` }, received);
-      } catch { transportFailed(); return; }
+      } catch (error) { transportFailed(error); return; }
       const outgoing = upstream;
-      outgoing.once('error', () => { if (upstream === outgoing) transportFailed(); });
+      outgoing.once('error', (error) => { if (upstream === outgoing) transportFailed(error); });
       outgoing.setTimeout(timeoutMs, () => {
         if (upstream !== outgoing) return;
         if (!res.headersSent) statusCode = 504;
+        transportError ||= 'ETIMEDOUT';
         outgoing.destroy(); incoming?.destroy();
       });
       outgoing.end(payload);
@@ -317,7 +483,7 @@ function proxy(req, res, target, bytes, agent, timeoutMs, query = '', { official
 export async function startSwitchGateway({
   upstream, token, port = 0, resolveRoute, verifyReady, onReceipt = async () => {},
   instanceId = randomUUID(), onShutdown = async () => {},
-  officialRequestImpl,
+  officialRequestImpl, officialNetwork = null,
   maxBodyBytes = 32 * 1024 * 1024, bodyTimeoutMs = 30_000, upstreamTimeoutMs = 600_000, maxTrackedThreads = 4096,
 } = {}) {
   const base = upstreamUrl(upstream);
@@ -330,10 +496,24 @@ export async function startSwitchGateway({
   const capability = Buffer.from(token), threads = new Map(), sockets = new Set(), receipts = new Set(), handlers = new Set();
   const agent = new Agent({ keepAlive: true });
   let closing = false, origin, closed, shutdownRequested = false, officialTransport;
+  const openOfficial = () => createOfficialTransport({ requestImpl: officialRequestImpl, network: officialNetwork });
+  const officialNetworkStatus = async () => {
+    let transport;
+    try {
+      transport = officialTransport ||= openOfficial();
+      const route = await transport.prepare({ force: true });
+      return { mode: route.mode, source: route.source, proxy: route.proxy ? redactProxyURL(route.proxy) : 'direct',
+        ...(route.bypassed ? { bypassed: true } : {}), ...(route.warning ? { warning: route.warning } : {}),
+        ...await transport.reachability() };
+    } catch (error) {
+      // Unsupported runtime/environment messages name variables, never their values.
+      return { reachable: false, error: error.code || 'OFFICIAL_TRANSPORT_UNAVAILABLE', message: error.status ? error.message : 'Official transport is unavailable' };
+    }
+  };
   const endpoint = (req) => {
     if (Object.hasOwn(req.headers, 'origin') || req.headers['sec-fetch-site'] === 'cross-site') throw failure(403, 'Browser-origin requests are not allowed');
     if (req.headers.host !== new URL(origin).host) throw failure(403, 'Invalid gateway host');
-    const match = /^\/([^/?#]+)(?:\/provider\/([^/?#]+))?\/v1\/(responses(?:\/compact)?|models|health|shutdown)(\?[^#]*)?$/.exec(req.url || '');
+    const match = /^\/([^/?#]+)(?:\/provider\/([^/?#]+))?\/v1\/(responses(?:\/compact)?|models|health|network|shutdown)(\?[^#]*)?$/.exec(req.url || '');
     const supplied = Buffer.from(match?.[1] || '');
     if (!match || supplied.length !== capability.length || !timingSafeEqual(supplied, capability)) throw failure(404, 'Unknown gateway endpoint');
     if (match[4] && match[3] !== 'models') throw failure(404, 'Unknown gateway endpoint');
@@ -357,7 +537,15 @@ export async function startSwitchGateway({
     try {
       if (closing) throw failure(503, 'Gateway is closing');
       const { path, query, initialProviderId } = endpoint(req);
-      if (req.method !== (['models', 'health'].includes(path) ? 'GET' : 'POST')) throw failure(405, 'Method is not allowed');
+      if (req.method !== (['models', 'health', 'network'].includes(path) ? 'GET' : 'POST')) throw failure(405, 'Method is not allowed');
+      if (path === 'network') {
+        // Evaluated in this process: its environment, not the CLI's, decides egress.
+        req.resume();
+        const official = await officialNetworkStatus();
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, instanceId, implementationVersion: GATEWAY_IMPLEMENTATION_VERSION, official }));
+        return;
+      }
       if (path === 'health' || path === 'shutdown') {
         // Owned-instance lifecycle only; never mutate CCSwitch or kill a PID.
         req.resume();
@@ -408,7 +596,7 @@ export async function startSwitchGateway({
         ? Buffer.from(JSON.stringify({ ...body, model: `ccs-${route.sourceKey}/${body.model}` })) : bytes;
       // Unsupported official environments never prevent the default company
       // gateway from starting. Selection still belongs entirely to the resolver.
-      if (route.transport === 'official') officialTransport ||= createOfficialTransport({ requestImpl: officialRequestImpl });
+      if (route.transport === 'official') { officialTransport ||= openOfficial(); await officialTransport.prepare(); }
       const outcome = await proxy(req, res, new URL(`${base.href}/${path}`), forwarded, agent, upstreamTimeoutMs, '',
         route.transport === 'official' ? { official: officialTransport, endpoint: path, body } : undefined);
       const success = outcome.completed && outcome.success && outcome.statusCode >= 200 && outcome.statusCode < 300;

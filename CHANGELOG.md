@@ -1,5 +1,21 @@
 # 更新日志
 
+## 0.4.3
+
+- 增加 `gpt-6.1-sol` 原生官方参考指纹；覆盖 12 种环境，保存模型、推理强度、CLI 版本和完整路由回执。统一库由 18 个模型扩至 19 个。
+- 记录已知限制：新模型与 `gpt-6-astra` 容易相互混淆，6 条独立官方验证中单条正确 4/6。参考已收录，但不足以可靠区分这对模型；不据此宣称渠道替换。
+- 新增显式调用的原生参考采集入口，支持分段续采、用量记录、请求前预算预留和独立留出数据；普通监测不自动采集或扩展指纹库。
+- 官方响应缺少 `Content-Type` 时，网关从有界前缀识别 SSE/JSON 完成事件，保留字节与完整 HTTP 结束校验，避免正常回答被误判为无成功回执。
+- 修复：切到 OpenAI Official 在依赖系统代理的机器上必定失败。网关常由 hook 或工具调用拉起，进程里没有 `HTTPS_PROXY`，而 Node 不读系统代理，于是直连 `chatgpt.com` 被重置，每次验证都返回 502。现在默认 `auto` 依次使用网关进程的 `HTTPS_PROXY`、系统 HTTPS 代理（macOS `scutil --proxy`、Windows Internet 设置）、直连，约每 15 秒及每次连接失败后重新判断，开关 VPN 或换端口不用重启网关。
+- 新增 `autoswitch.mjs network [--official-proxy auto|direct|URL]`：查看网关进程实际的出网方式，并做一次不带凭证、不推理的连通性检查；固定代理立即生效，不需停网关、不生成新配置 ID、不影响路由与同意。代理凭证以 0600 保存，所有输出打码；SOCKS 和 PAC 明确提示不支持。
+- 新增在对话中主动切换渠道：用户说「切回主渠道」「切到 API2 copy」时执行 `guard.mjs switch-route --target-name NAME`，只改当前会话的网关路由，不改 CCSwitch 默认卡、不影响其他会话、无需重启 Codex。切换前沿用异常切换的目标验证（完整回执 + 指纹兼容），切回仍在降智的中转会被拦下：保留当前渠道、自动解除暂停、监测恢复原状。成功切到主渠道或第三方后恢复监测，切到 Official 后停止监测。要求用户确实发过这条请求（Codex 不能自行发起），会话已执行 use、且没有未处理的异常。CCSwitch 本身没有 MCP 或切换 API，切全局默认卡会影响所有会话并破坏主通道校验，因此不走这条路。
+- **判定口径变化**：`gpt-6.1-sol` 与 `gpt-6-astra` 登记为已知混淆组（`assets/confusable-groups.json`）。第一候选落在预期模型的组内、且组内合计权重 ≥ 0.5 时判为 `compatible`，样本标注 `confusableGroup`，不暂停、不发起切换，也满足目标验证的指纹条件。此前真官方 `gpt-6.1-sol` 被判成 Astra（0.4998，预期仅 0.025），导致切到 Official 的验证失败；按交叉验证结果，这种失败约占一半。组外候选的判定不变（例如 API2 出现 `gpt-5.6-luna` 0.986 仍算强差异信号）；这对模型之间的真实替换不再能检测到。分组绑定指纹库哈希，重建库后自动失效。
+- 修复：Official 目标验证拿到了完整回答，仍因"网关回执未完成"失败（HTTP 200、已见 `response.completed`、`completed: false`）。原生 Codex 读到 `response.completed` 就停止读取，探针随后立即关闭 app-server；Official（尤其经代理）的流结束标记晚到，网关于是判定下游提前断开。验证探针现在和参考采集一样经本地中继把网关响应读到 EOF，回执等待从 2 秒放宽到 10 秒。网关"完整响应才算完成"的判定口径不变。
+- 批准切到 Official 前先检查连通性。连不上时返回 `OFFICIAL_UNREACHABLE`，不记录批准、不消耗用户这次回复，请求保持待确认。
+- 修复：从命令行执行 `guard.mjs wait-switch` / `wait` 必定以 exit 13 退出。入口模块的顶层 await 与 `background.mjs` 的循环导入互相等待；hook 路径不受影响。
+- 失败诊断不再只有 `probe_failed`：网关 502/504 携带套接字错误码和打码后的出网方式，回执记录 `transportError` / `networkSource`；探针失败保留 Codex 最终报错的有界文本、HTTP 状态，以及临时 fork 被清理前网关的最后一次回执；`status` 对这类失败给出 `official_network_unreachable` 提示。
+- 网关实现版本升至 0.4.3。更新安装后仅重启插件网关，保留现有配置与路由；hook 定义没有修改。
+
 ## 0.4.2
 
 ### 安全与正确性

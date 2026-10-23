@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { rootCertificates } from 'node:tls';
 import { createServer } from 'node:http';
 import { Agent as HttpsAgent } from 'node:https';
+import { EventEmitter } from 'node:events';
 import { createOfficialTransport, encryptedReasoningRetryBody } from '../scripts/official-transport.mjs';
 
 function fakeTransport(options = {}) {
@@ -68,6 +69,77 @@ test('the real HTTPS Agent honors HTTPS_PROXY using only a synthetic CONNECT pro
     const req = transport.request('responses', { headers: { authorization: 'Bearer synthetic-native-token' } }, (res) => { res.resume(); res.once('end', resolve); });
     req.once('error', resolve); req.setTimeout(1000, () => req.destroy(new Error('Synthetic proxy timeout'))); req.end('{}');
   });
+  assert.equal(connects.length, 1); assert.equal(connects[0].target, 'chatgpt.com:443');
+  assert.equal(connects[0].headers.authorization, undefined);
+});
+
+test('a network resolver selects egress per request and keeps superseded agents for in-flight streams', async () => {
+  let route = { mode: 'auto', source: 'system', proxy: 'http://127.0.0.1:7897', proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:7897' } };
+  let invalidated = 0;
+  const f = fakeTransport({ network: { resolve: async () => route, invalidate() { invalidated++; } } });
+  assert.equal(f.agents.length, 0, 'no agent exists before the route is resolved');
+  assert.throws(() => f.transport.request('responses', { headers: {} }), /not been prepared/);
+  assert.equal((await f.transport.prepare()).source, 'system');
+  f.transport.request('responses', { headers: {} });
+  assert.deepEqual(f.agents[0].settings.proxyEnv, { HTTPS_PROXY: 'http://127.0.0.1:7897' });
+  assert.equal(f.calls[0].settings.agent, f.agents[0]);
+  route = { mode: 'auto', source: 'direct', proxy: null, proxyEnv: {} };
+  await f.transport.prepare();
+  f.transport.request('responses', { headers: {} });
+  assert.equal(f.calls[1].settings.agent, f.agents[1]); assert.deepEqual(f.agents[1].settings.proxyEnv, {});
+  assert.equal(f.agents[0].destroyed, 0, 'a superseded route is not torn down under a streaming response');
+  await f.transport.prepare();
+  assert.equal(f.agents.length, 2, 'an unchanged route reuses its keep-alive agent');
+  assert.equal(f.transport.route().source, 'direct');
+  f.transport.failed(); assert.equal(invalidated, 1);
+  f.transport.close(); assert.deepEqual(f.agents.map(agent => agent.destroyed), [1, 1]);
+  await assert.rejects(() => f.transport.prepare(), /closed/);
+});
+
+test('an unusable saved network setting fails explicitly instead of going direct', async () => {
+  const f = fakeTransport({ network: { resolve: async () => { throw Object.assign(new Error('Official proxy must be auto, direct, or an http(s)://host:port URL'), { code: 'INVALID_OFFICIAL_PROXY' }); } } });
+  await assert.rejects(() => f.transport.prepare(), error => error.status === 503 && error.code === 'OFFICIAL_NETWORK_UNAVAILABLE' && /http\(s\)/.test(error.message));
+  assert.throws(() => f.transport.request('responses', { headers: {} }), /not been prepared/);
+});
+
+test('reachability is a header-free GET reporting the HTTP status or only the socket error code', async () => {
+  const seen = [];
+  const transportWith = (behavior) => createOfficialTransport({ env: {}, nodeVersion: '25.6.1', agentFactory: () => ({ destroy() {} }),
+    requestImpl: (url, settings, callback) => {
+      seen.push({ url: url.href, settings });
+      const req = new EventEmitter();
+      req.setTimeout = () => req; req.destroy = () => {};
+      req.end = () => setImmediate(() => behavior === 'ok' ? callback({ statusCode: 405, resume() {} })
+        : req.emit('error', Object.assign(new Error('reset by http://synthetic-user:synthetic-password@proxy.invalid'), { code: 'ECONNRESET' })));
+      return req;
+    } });
+  const ok = await transportWith('ok').reachability();
+  assert.equal(ok.reachable, true); assert.equal(ok.statusCode, 405);
+  assert.equal(seen[0].url, 'https://chatgpt.com/backend-api/codex/responses');
+  assert.equal(seen[0].settings.method, 'GET'); assert.deepEqual(seen[0].settings.headers, {}); assert.equal(seen[0].settings.rejectUnauthorized, true);
+  const down = await transportWith('reset').reachability();
+  assert.equal(down.reachable, false); assert.equal(down.error, 'ECONNRESET');
+  assert.doesNotMatch(JSON.stringify(down), /synthetic-password/);
+  const unprepared = fakeTransport({ network: { resolve: async () => ({}) } });
+  assert.deepEqual((({ reachable, error }) => ({ reachable, error }))(await unprepared.transport.reachability()), { reachable: false, error: 'ROUTE_NOT_PREPARED' });
+});
+
+test('the real HTTPS Agent tunnels a resolved system proxy route even without proxy environment variables', async (t) => {
+  const connects = [];
+  const proxy = createServer();
+  proxy.on('connect', (req, socket) => {
+    connects.push({ target: req.url, headers: req.headers });
+    socket.end('HTTP/1.1 502 Synthetic Proxy Rejection\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+  });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => proxy.close(resolve)));
+  const url = `http://127.0.0.1:${proxy.address().port}`;
+  const transport = createOfficialTransport({ env: {}, network: { resolve: async () => ({ mode: 'auto', source: 'system', proxy: url, proxyEnv: { HTTPS_PROXY: url } }) },
+    agentFactory: (settings) => new HttpsAgent({ ...settings, lookup: (_hostname, _options, callback) => callback(new Error('Unexpected direct DNS lookup')) }) });
+  t.after(() => transport.close());
+  await transport.prepare();
+  const result = await transport.reachability({ timeoutMs: 2000 });
+  assert.equal(result.reachable, false);
   assert.equal(connects.length, 1); assert.equal(connects[0].target, 'chatgpt.com:443');
   assert.equal(connects[0].headers.authorization, undefined);
 });

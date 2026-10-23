@@ -117,6 +117,43 @@ test('schema 2 gateway starts once, hides its capability, preserves company defa
   assert.equal((await invoke('gateway-stop')).stopped, false);
 });
 
+test('an Official proxy saved while the gateway runs applies without a restart, configuration change or credential exposure', async t => {
+  const f = await fixture(t);
+  const connects = [];
+  const proxy = createHttpServer();
+  // Synthetic CONNECT proxy: proves the tunnel target without any real network.
+  proxy.on('connect', (req, socket) => {
+    connects.push(req.url);
+    socket.end('HTTP/1.1 502 Synthetic Proxy Rejection\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { proxy.closeAllConnections?.(); proxy.close(resolve); }));
+  const started = await f.invoke('gateway-start');
+  await assert.rejects(f.invoke('network', '--official-proxy', 'socks5://127.0.0.1:1080'), error => error.code === 'INVALID_OFFICIAL_PROXY');
+  const port = proxy.address().port;
+  const result = await f.invoke('network', '--official-proxy', `http://synthetic-user:synthetic-password@127.0.0.1:${port}`);
+  assert.deepEqual(result.setting, { officialProxy: `http://***@127.0.0.1:${port}`, saved: true });
+  assert.equal(result.gateway.running, true);
+  assert.equal(result.gateway.mode, 'explicit'); assert.equal(result.gateway.source, 'setting');
+  assert.equal(result.gateway.proxy, `http://***@127.0.0.1:${port}`);
+  assert.equal(result.gateway.reachable, false); assert.match(result.gateway.error, /^[A-Z][A-Z0-9_]+$/);
+  assert.deepEqual(connects, ['chatgpt.com:443'], 'the running daemon used the new proxy immediately');
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-password|synthetic-user/);
+  assert.ok(!JSON.stringify(result).includes(f.config.token));
+  const after = await f.invoke('gateway-status');
+  assert.equal(after.instanceId, started.instanceId); assert.equal(after.configId, f.config.id);
+  assert.equal((await loadGatewayConfig(f.directory)).id, f.config.id, 'egress is not route identity');
+});
+
+test('network works before setup and labels the view as this process, not the gateway', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'autoswitch-network-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const result = await runAutoSwitch(['network', '--data-dir', directory, '--official-proxy', 'http://127.0.0.1:7897'], { CODEX_HOME: directory });
+  assert.deepEqual(result.setting, { officialProxy: 'http://127.0.0.1:7897', saved: true });
+  assert.deepEqual(result.gateway, { running: false, reachable: null, reason: 'not_configured' });
+  assert.deepEqual(result.thisProcess, { mode: 'explicit', source: 'setting', proxy: 'http://127.0.0.1:7897' });
+});
+
 test('an old running gateway cannot be reported ready after installing a newer implementation', async t => {
   const f = await fixture(t), instanceId = randomUUID();
   const server = createHttpServer((req, res) => {
@@ -274,6 +311,9 @@ test('disable stops monitoring but retains the chosen route and halt; only exact
   assert.equal(allowed(`node '${entry}' status --session ${session}`), true);
   assert.equal(allowed(`node '${entry}' gateway-stop`), true);
   for (const suffix of [' launch', ' configure', ' status --unexpected x', ' status; echo bypass', ' status --session x --session y']) assert.equal(allowed(`node '${entry}'${suffix}`), false);
+  const guardEntry = path.join(ROOT, 'scripts', 'guard.mjs');
+  assert.equal(allowed(`node '${guardEntry}' switch-route --session ${session} --target-name 'API2 copy'`), true);
+  for (const suffix of [' switch-route --request x', ' switch-route --target-name x; echo bypass']) assert.equal(allowed(`node '${guardEntry}'${suffix}`), false);
 });
 
 test('new fork storage is isolated per Codex home and ignores the upstream storage override', () => {

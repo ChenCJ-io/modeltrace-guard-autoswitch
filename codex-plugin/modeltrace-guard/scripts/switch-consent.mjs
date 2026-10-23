@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { consumeUserReply, digest, isMismatch, readState, record, schedule, segment, stopMonitoring, withState } from './state.mjs';
+import { drainingRelay } from './stream-relay.mjs';
+import { consumeUserReply, digest, isMismatch, readState, record, sameConfusableGroup, schedule, segment, stopMonitoring, withState } from './state.mjs';
 import { UUID, assertProviderCurrent, atomicJSON, describeProvider, gatewayURL, loadGatewayConfig,
   readJSON, resolveProvider, sameProvider, verifyGatewayReady, verifyRouteLayout } from './provider-config.mjs';
 
@@ -43,7 +44,8 @@ export const readReceipt = (directory, thread) => readJSON(receiptPath(directory
 export async function saveReceipt(directory, config, receipt) {
   if (!UUID.test(receipt.threadId)) return;
   const allowed = ['threadId', 'requestId', 'route', 'revision', 'statusCode', 'startedAt', 'finishedAt', 'completed', 'success',
-    'responseEvent', 'providerId', 'providerFingerprint', 'transport', 'sourceKey', 'ccswitchMode', 'proposalId', 'approvalId', 'challenge'];
+    'responseEvent', 'providerId', 'providerFingerprint', 'transport', 'sourceKey', 'ccswitchMode', 'proposalId', 'approvalId', 'challenge',
+    'transportError', 'networkSource'];
   const safe = Object.fromEntries(allowed.filter(k => Object.hasOwn(receipt, k)).map(k => [k, receipt[k]]));
   if (receipt.challenge && receipt.success === true && receipt.completed === true) {
     await atomicJSON(probeReceiptPath(directory, receipt.threadId, receipt.challenge), { ...safe, configId: config.id });
@@ -224,7 +226,7 @@ export function beginVerification(state, now) {
   r.status = 'verifying'; p.phase = 'verifying'; p.attempts++; p.verificationStartedAt = now;
   state.pending = { id: randomUUID(), kind: 'fallback_verification', proposalId: r.id, approvalId: r.approval.id,
     epoch: state.epoch, model: state.model, expected: state.expected, count: 300,
-    language: r.evidence.language || state.config.languages[0], at: now,
+    language: r.evidence?.language || state.config.languages[0], at: now,
     expiresAt: now + state.config.pendingSeconds * 1000, workTools: state.workTools };
   state.issued++; state.turnIssued++;
   record(state, 'switch_verification_started', now, { challenge: state.pending.id, requestId: r.id, approvalId: r.approval.id });
@@ -244,9 +246,78 @@ export async function declineSwitch(directory, session, id, now = Date.now()) {
   });
 }
 
+export async function resolveSwitchTarget(directory, selection) {
+  const config = await loadGatewayConfig(directory);
+  return resolveProvider(await verifyGatewayReady(directory, config), selection);
+}
+
+/**
+ * A route change the user asked for in the conversation ("切到 API2 copy").
+ * Their own message is the consent for this one target; consumeUserReply makes
+ * sure such a message exists, so the agent cannot start a switch by itself.
+ * The same canary as an incident (completed route receipt + compatible
+ * fingerprint) runs before routing changes, so switching back to a relay that
+ * still serves another model fails instead of silently landing on it. Failure
+ * keeps the current route, releases the pause and restores monitoring.
+ */
+export async function requestManualSwitch(directory, session, selection, readiness, now = Date.now()) {
+  const config = await loadGatewayConfig(directory), layout = await verifyGatewayReady(directory, config);
+  const target = resolveProvider(layout, selection);
+  return withState(directory, session, state => {
+    const p = state.autoSwitch;
+    if (!consentPolicy(state) || p.configId !== config.id) throw new Error('This thread has no route policy for the current gateway configuration; enable it with use first');
+    if (state.taskHalt || unresolved(state.switchRequest)) throw new Error('An incident or switch request is still open; settle it with propose-switch, approve-switch, decline-switch or an explicit resume first');
+    if (state.pending || state.probeRun || state.compacting || state.runtimeEndedAt || state.runtimePaused || state.confirmation?.status === 'active') {
+      throw new Error('A monitoring checkpoint is in progress; retry the switch after it completes');
+    }
+    if (state.alerts.some(a => !a.acknowledgedAt)) throw new Error('Report and acknowledge pending alerts before switching');
+    if (sameProvider(target, p.current)) throw new Error(`This thread already uses ${JSON.stringify(target.name)}`);
+    if (readiness?.accountType !== 'chatgpt' || readiness.modelProvider !== 'openai' || readiness.model !== state.model) {
+      throw new Error('Native login/model settings changed; the switch cannot start verification');
+    }
+    assertProviderCurrent(layout, p.current); assertProviderCurrent(layout, target);
+    // Returning to the primary needs its default card and disabled failover.
+    verifyRouteLayout(config, layout, routeFor(config, target, p.revision + 1));
+    consumeUserReply(state, 'A route switch');
+    const previous = { phase: p.phase, enabled: state.enabled, autoSwitchEnabled: p.enabled,
+      monitoringStoppedReason: state.monitoringStoppedReason ?? null, monitoringStoppedAt: p.monitoringStoppedAt ?? null };
+    // The single canary needs live monitoring; a later Official success stops it
+    // again, and failure restores exactly this previous state.
+    state.enabled = true; state.monitoringStoppedReason = null;
+    p.enabled = true; p.monitoringStoppedAt = null;
+    const haltId = randomUUID();
+    state.taskHalt = { id: haltId, at: now, expected: state.expected, retryCount: 0, predictions: [], reason: 'manual_switch_verification' };
+    const request = { id: randomUUID(), kind: 'manual', haltId, status: 'approved', createdAt: now,
+      configId: p.configId, policyId: p.policyId, epoch: state.epoch, revision: p.revision,
+      source: structuredClone(p.current), target: structuredClone(target), evidence: null, previous, approval: null };
+    request.approval = { id: randomUUID(), requestId: request.id, haltId, providerId: target.id, fingerprint: target.fingerprint,
+      configId: p.configId, policyId: p.policyId, revision: p.revision, approvedAt: now, recordedBy: 'user_requested_switch' };
+    state.switchRequest = request;
+    Object.assign(p, { phase: 'awaiting_approval', haltId });
+    record(state, 'manual_switch_requested', now, { requestId: request.id, from: request.source.id, providerId: target.id });
+    if (!beginVerification(state, now)) throw new Error('The switch verification could not be queued');
+    return request;
+  });
+}
+
+function failManualSwitch(state, now, reason) {
+  const p = state.autoSwitch, r = state.switchRequest, previous = r.previous || {};
+  Object.assign(r, { status: 'failed', finishedAt: now, reason });
+  Object.assign(p, { phase: previous.phase || 'armed', failedAt: now, reason, noticePending: true, haltId: null,
+    enabled: previous.autoSwitchEnabled ?? p.enabled, monitoringStoppedAt: previous.monitoringStoppedAt ?? null });
+  if (state.taskHalt?.id === r.haltId) state.taskHalt = null;
+  if (state.pending?.kind === 'fallback_verification' && state.pending.proposalId === r.id) state.pending = null;
+  if (previous.enabled === false) {
+    state.enabled = false; state.forceProbe = false; state.nextTools = null; state.nextAt = null;
+    state.monitoringStoppedReason = previous.monitoringStoppedReason;
+  }
+  record(state, 'manual_switch_failed', now, { reason, requestId: r.id, providerId: r.target.id, keptProvider: p.current.id });
+}
+
 export function failAutoSwitch(state, now, reason) {
   const p = state.autoSwitch;
   if (!['awaiting_approval', 'verifying', 'switch_pending'].includes(p?.phase)) return;
+  if (state.switchRequest?.kind === 'manual' && unresolved(state.switchRequest)) return failManualSwitch(state, now, reason);
   Object.assign(p, { phase: 'failed', failedAt: now, reason });
   if (unresolved(state.switchRequest)) Object.assign(state.switchRequest, { status: 'failed', finishedAt: now, reason });
   record(state, 'autoswitch_failed', now, { reason, haltId: p.haltId, requestId: state.switchRequest?.id });
@@ -270,7 +341,7 @@ export function finishVerification(state, sample, checkpoint, now) {
     && receipt.policyId === p.policyId && receipt.revision === p.revision + 1
     && receipt.proposalId === r.id && receipt.approvalId === r.approval.id && receipt.challenge === checkpoint.id
     && providerMatchesReceipt(r.target, receipt, p.primary) && sample.expected === state.taskHalt.expected
-    && sample.prediction === sample.expected && sample.outcome === 'compatible';
+    && sample.outcome === 'compatible' && (sample.prediction === sample.expected || sameConfusableGroup(sample));
   if (!success) { failAutoSwitch(state, now, 'approved_target_verification_failed'); return true; }
   r.status = 'succeeded'; r.finishedAt = now;
   p.current = structuredClone(r.target); p.route = p.current.id === p.primary.id ? 'source' : 'fallback';
@@ -292,6 +363,7 @@ export function switchControlContext(state, directory, root) {
   if (p.phase === 'awaiting_approval' && r.status === 'pending') {
     return `ModelTrace AutoSwitch: STOP original task work and ASK THE USER whether to switch from ${JSON.stringify(r.source.name)} to ${r.target ? JSON.stringify(r.target.name) : 'a user-named CCSwitch configuration'}. Explain the fingerprint candidate is uncertain, not proof of reduced capability; target verification consumes one probe before routing changes. Report and acknowledge the alert, then ask and yield for the user's answer. Approve and decline are accepted only after the user's next message (or a request_user_input answer) that follows the acknowledgement. Do not poll, verify, approve, or switch while waiting for consent. Acknowledgement and installation are NOT switch consent.\nAfter explicit consent to the displayed target only: ${r.target ? command('approve-switch', ` --target-provider ${quote(r.target.id)}`) : 'first propose the requested named target'}.\nIf the user names another target: ${command('propose-switch', ' --target-name <exact-name>')}; approval must use the NEW request ID and target ID. If the user already explicitly said to switch to that named target, record that consent without asking redundantly.\nOnly if the user explicitly chooses to keep this provider and continue: ${command('decline-switch')}. Silence or an ambiguous answer never means consent.`;
   }
+  if (p.phase === 'verifying' && r.status === 'verifying' && r.kind === 'manual') return `ModelTrace AutoSwitch: the user asked to switch this thread from ${JSON.stringify(r.source.name)} to ${JSON.stringify(r.target.name)}. Its fingerprint and route are being verified with one probe before routing changes. Keep original task work paused; do not replay work tools. Use the bounded read-only command: ${command('wait-switch')}. On autoswitch_verified, report the new route; on failure the thread keeps ${JSON.stringify(r.source.name)}, the pause is released, and you report the reason.`;
   if (p.phase === 'verifying' && r.status === 'verifying') return `ModelTrace AutoSwitch: the user approved ${JSON.stringify(r.target.name)} for this incident. Keep original task work paused while the approved target is verified. Do not clear the halt or replay work tools. Use the bounded read-only command: ${command('wait-switch')}. Continue only after autoswitch_verified; failure retains the halt and current route.`;
   return `ModelTrace AutoSwitch: switch request ${JSON.stringify(r.id)} is ${JSON.stringify(r.status)} (${JSON.stringify(r.reason || p.reason || '')}). The original route and halt remain. Tell the user; do not reuse old consent, clear the halt automatically or continue original work. For an explicit user request to try another target, use ${command('propose-switch', ' --target-name <exact-name>')} and approve its NEW request ID. If comparison conditions changed, request a new primary check after an explicit resume instead.`;
 }
@@ -312,15 +384,22 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
     challenge: pending.id, epoch: state.epoch, provider, revision, expiresAt: pending.expiresAt,
     proposalId: request?.id || null, approvalId: request?.approval?.id || null };
   let forkId;
+  // The fork talks to a local relay that keeps reading the gateway response to
+  // EOF. Native Codex stops reading at response.completed and the probe closes
+  // its app-server right after the turn; without the relay, a trailing upstream
+  // end-of-stream (seen with Official through a proxy) leaves the gateway
+  // receipt incomplete although the answer arrived.
+  const relay = await drainingRelay(new URL(gatewayURL(config)));
   return {
-    mode: 'autoswitch_gateway', url: gatewayURL(config),
+    mode: 'autoswitch_gateway', url: relay.url,
     async authorize(id) {
       if (!UUID.test(id) || id === snapshot.sourceSession || id === snapshot.id) throw new Error('Only disposable probe forks may be bound');
       forkId = id; await atomicJSON(bindingPath(directory, id), binding);
       await resolveSessionRoute(directory, config, id);
     },
     async receipt() {
-      const deadline = Math.min(pending.expiresAt, Date.now() + 2000);
+      // The relay is still draining; allow the trailing stream end to arrive.
+      const deadline = Math.min(pending.expiresAt, Date.now() + 10000);
       let receipt;
       const matches = receipt => receipt && receipt.configId === config.id && receipt.threadId === forkId && receipt.revision === revision
         && providerMatchesReceipt(provider, receipt, p.primary) && receipt.challenge === pending.id
@@ -337,7 +416,21 @@ export async function prepareSwitchTransport(directory, snapshot, pending) {
       await resolveSessionRoute(directory, config, forkId);
       return { ...receipt, policyId: p.policyId };
     },
+    // Read before close() deletes the per-fork files, so a failed probe keeps
+    // the gateway's status/transport evidence instead of only "probe_failed".
+    // Receipts are published just after the response, so allow a short wait.
+    async lastAttempt() {
+      if (!forkId) return null;
+      const deadline = Date.now() + 1000;
+      let receipt;
+      while (!(receipt = await readJSON(receiptPath(directory, forkId))) && Date.now() < deadline) await delay(25);
+      if (!receipt || receipt.threadId !== forkId || receipt.configId !== config.id) return null;
+      return { statusCode: Number.isInteger(receipt.statusCode) ? receipt.statusCode : null, completed: receipt.completed === true,
+        success: receipt.success === true, responseEvent: receipt.responseEvent ?? null, transport: receipt.transport ?? null,
+        transportError: receipt.transportError ?? null, networkSource: receipt.networkSource ?? null };
+    },
     async close() {
+      await relay.close();
       // A disposable fork never routes again; keep no per-fork files behind.
       if (forkId) for (const filename of [bindingPath(directory, forkId), receiptPath(directory, forkId), probeReceiptPath(directory, forkId, pending.id)]) {
         await unlink(filename).catch(e => { if (e.code !== 'ENOENT') throw e; });

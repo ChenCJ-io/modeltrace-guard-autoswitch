@@ -88,12 +88,12 @@ function renderTrace(state) {
 function renderHistory(state) {
   const filter = $('filter').value;
   const records = archivePage ? archivePage.rows.map((r) => archiveKind === 'samples' ? { ...r, type: 'sample' } : archiveKind === 'alerts' ? { ...r, type: r.level, model: `${r.expected} → ${r.prediction}` } : r) : [...state.samples.map((s) => ({ ...s, type: 'sample' })), ...state.events.filter((e) => !['probe_scored', 'model_mismatch_alert'].includes(e.type))].sort((a, b) => b.at - a.at);
-  const filtered = records.filter((r) => filter === 'all' || (filter === 'gap' ? r.type === 'probe_missed' : r.type === 'sample' && r.expectedWeight !== null && r.expected && r.expected !== r.prediction));
+  const filtered = records.filter((r) => filter === 'all' || (filter === 'gap' ? r.type === 'probe_missed' : r.type === 'sample' && r.expectedWeight !== null && r.expected && r.expected !== r.prediction && !r.confusableGroup));
   const rows = filtered.slice(0, 100).map((record) => {
     const row = element('tr');
     const at = element('td', 'table-time'); const button = element('button', 'row-detail', date(record.at)); button.type = 'button'; button.addEventListener('click', () => showDetail(record)); at.append(button);
     const outcome = element('td'); outcome.append(record.type === 'sample' ? pill(displayOutcome(record)) : element('span', `pill ${record.type === 'probe_missed' || record.type === 'budget_paused' ? 'warning' : 'neutral'}`, eventNames[record.type] || record.type));
-    const model = element('td', 'table-model'); model.textContent = record.type === 'sample' ? `${record.expected || '当时未获取'} → ${record.prediction || '未知'}` : record.name || record.model || reasons[record.reason] || record.reason || '—';
+    const model = element('td', 'table-model'); model.textContent = record.type === 'sample' ? `${record.expected || '当时未获取'} → ${record.prediction || '未知'}${record.confusableGroup ? '（已知混淆组，按兼容计）' : ''}` : record.name || record.model || reasons[record.reason] || record.reason || '—';
     row.append(at, outcome, model, element('td', '', languageNames[record.language] || record.language || '—'), element('td', '', `#${record.epoch}`)); return row;
   });
   if (!rows.length) { const row = element('tr'); const cell = element('td', 'empty-inline', '没有符合筛选条件的记录'); cell.colSpan = 5; row.append(cell); rows.push(row); }

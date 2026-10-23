@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "note": "Models the bundled bank cannot reliably separate. A sample whose top candidate is in the expected model's group, with combined group weight at or above minimumGroupWeight, counts as compatible instead of a mismatch. Groups apply only to the exact bank they were validated against; a rebuilt bank disables them until re-validated.",
+  "bankSha256": "277ecaa567944cac11aeaeceaefd30cb528899169723235dd043b82a9d50ed38",
+  "groups": [
+    {
+      "id": "gpt-6.1-sol~gpt-6-astra",
+      "models": ["gpt-6.1-sol", "gpt-6-astra"],
+      "minimumGroupWeight": 0.5,
+      "evidence": "docs/GPT-6.1-SOL-REFERENCE.md: single-sample grouped cross-validation 19/36 correct for each, 17 attributed to the other; held-out official samples 4/6 (zh-3 difference_signal, en-2 inconclusive, both gpt-6-astra).",
+      "addedAt": "2026-10-21"
+    }
+  ]
+}

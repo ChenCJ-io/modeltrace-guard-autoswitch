@@ -1,6 +1,6 @@
 {
   "name": "modeltrace-guard-autoswitch",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Use ModelTrace monitoring in ordinary codex conversations after one-time gateway setup. Verify and switch routes only after consent to the specific incident target.",
   "author": {
     "name": "xqy2006"

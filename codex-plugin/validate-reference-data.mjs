@@ -20,6 +20,7 @@ const rowsByFamily = Object.fromEntries(await Promise.all(['gpt', 'claude'].map(
 const boundedModels = [
   { id: 'gpt-6-sol', family: 'gpt', provider: 'codex', reasoningEffort: 'low', cliVersion: '0.155.1' },
   { id: 'gpt-6-luna', family: 'gpt', provider: 'codex', reasoningEffort: 'low', cliVersion: '0.155.1' },
+  { id: 'gpt-6.1-sol', family: 'gpt', provider: 'codex', reasoningEffort: 'max', cliVersion: 'codex-cli 0.163.0', officialReceipt: true },
   { id: 'claude-opus-5-5', family: 'claude', provider: 'oaipro', responseModel: 'claude-opus-5-5', cleanRawNumbers: true },
   { id: 'claude-haiku-5-5', family: 'claude', provider: 'oaipro', responseModel: 'claude-haiku-5-5', cleanRawNumbers: true },
 ];
@@ -59,6 +60,16 @@ for (const spec of boundedModels) {
     if (spec.reasoningEffort) assert.equal(row.reasoning_effort, spec.reasoningEffort, `${row.row_id} reasoning effort changed`);
     if (spec.cliVersion) assert.equal(row.cli_version, spec.cliVersion, `${row.row_id} CLI version changed`);
     if (spec.responseModel) assert.equal(row.response_model, spec.responseModel, `${row.row_id} response model changed`);
+    if (spec.officialReceipt) {
+      assert.equal(row.route_verified, true, `${row.row_id} lacks verified native routing`);
+      assert.equal(row.training_approved, true, `${row.row_id} was not approved for training`);
+      assert.equal(row.split, 'train', `${row.row_id} is held-out data`);
+      assert.equal(row.route_evidence?.transport, 'official');
+      assert.equal(row.route_evidence?.success, true);
+      assert.equal(row.route_evidence?.completed, true);
+      assert.equal(row.route_evidence?.responseEvent, 'response.completed');
+      assert.ok(row.usage?.inputTokens > 0 && row.usage?.outputTokens > 0);
+    }
     const numbers = parseNumbers(row.text);
     assert.equal(numbers.length, row.parsed_count, `${row.row_id} parsed_count is stale`);
     if (spec.cleanRawNumbers) {

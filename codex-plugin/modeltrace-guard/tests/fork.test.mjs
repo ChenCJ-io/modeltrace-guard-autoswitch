@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ROOT, run, handleHook, loadArtifacts, submitForkResult, summarize } from '../scripts/guard.mjs';
 import { readState, withState, processAlive } from '../scripts/state.mjs';
-import { runForkProbe, forkParameters, verifyFork, generateProbe, requireTrustedGuard } from '../scripts/fork-runner.mjs';
+import { runForkProbe, forkParameters, verifyFork, generateProbe, requireTrustedGuard, upstreamError } from '../scripts/fork-runner.mjs';
 import { BACKGROUND_EVENTS, BACKGROUND_TIMEOUT_SECONDS, handleBackgroundHook, waitForConfirmation } from '../scripts/background.mjs';
 import { cleanSnapshot, cleanupFailure, cleanupPending, CLEANUP_MAX_ATTEMPTS, CLEANUP_SOURCE_KINDS } from '../scripts/fork-cleanup.mjs';
 import { disabledHooksOverride } from '../scripts/app-server-client.mjs';
@@ -460,6 +460,28 @@ test('missing final text reports an output diagnostic without exposing commentar
     return true;
   });
   assert.equal(client.listeners.size, 0);
+});
+
+test('a final Codex error keeps its bounded status and gateway text instead of a bare probe_failed', async () => {
+  const client = { listeners: new Set(), request: async (method) => {
+    if (method !== 'turn/start') return {};
+    for (const listener of client.listeners) {
+      listener({ method: 'error', params: { threadId: 'fork', turnId: 'probe', willRetry: true, error: { message: 'retrying' } } });
+      listener({ method: 'error', params: { threadId: 'fork', turnId: 'probe', willRetry: false, error: {
+        message: 'unexpected status 502 Bad Gateway:\n{"error":{"message":"Official transport is unavailable (ECONNRESET; network direct: direct)"}}' + 'x'.repeat(900),
+        codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 502 } } } } });
+    }
+    return { turn: { id: 'probe' } };
+  } };
+  await assert.rejects(() => generateProbe(client, 'fork', { expiresAt: Date.now() + 5000, language: 'en', count: 300 }), (error) => {
+    assert.match(error.message, /inference failed/);
+    assert.equal(error.upstream.kind, 'responseTooManyFailedAttempts'); assert.equal(error.upstream.httpStatusCode, 502);
+    assert.match(error.upstream.message, /^unexpected status 502 Bad Gateway: \{.*ECONNRESET; network direct/);
+    assert.equal(error.upstream.message.length, 500); assert.doesNotMatch(error.upstream.message, /\n/);
+    return true;
+  });
+  assert.deepEqual(upstreamError({ message: 'limit', codexErrorInfo: 'usageLimitExceeded' }), { message: 'limit', kind: 'usageLimitExceeded', httpStatusCode: null });
+  assert.equal(upstreamError(null), null);
 });
 
 test('token usage inherited from a previous turn is never reported as the probe cache hit', async () => {

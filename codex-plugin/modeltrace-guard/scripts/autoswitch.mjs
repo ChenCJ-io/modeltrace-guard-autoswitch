@@ -14,6 +14,7 @@ import { requireTrustedGuard } from './fork-runner.mjs';
 import { loadArtifacts } from './guard.mjs';
 import { GATEWAY_IMPLEMENTATION_VERSION, gatewayRuntimeProblem, startSwitchGateway } from './switch-gateway.mjs';
 import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from './native-integration.mjs';
+import { createOfficialNetwork, officialNetworkStatus, writeNetworkSetting } from './network-route.mjs';
 import {
   UUID, atomicJSON, assertProviderCurrent, configureGateway, gatewayURL, inspectCCSwitch,
   loadGatewayConfig, publicConfig, readJSON, resolveProvider, runtimePath, verifyGatewayReady, verifyGatewayRoute,
@@ -27,7 +28,7 @@ function argumentsFor(args) {
   const command = args.shift() || 'help', options = {};
   const allowed = {
     help: [], inspect: ['cc-switch-dir'], configure: ['primary-name', 'backup-name', 'primary-provider', 'backup-provider', 'cc-switch-dir', 'port'],
-    connect: [], disconnect: [], 'connection-status': [],
+    connect: [], disconnect: [], 'connection-status': [], network: ['official-proxy'],
     'gateway-start': [], 'gateway-stop': [], 'gateway-status': [], serve: [], use: ['session'], enable: ['session'], disable: ['session'], status: ['session'], launch: ['resume', 'provider-name', 'provider-id'],
   };
   if (!Object.hasOwn(allowed, command)) throw new Error('Unknown command');
@@ -108,6 +109,9 @@ async function serveGateway(directory) {
     verifyReady: route => verifyGatewayRoute(directory, config, route),
     resolveRoute: (thread, initialProviderId) => resolveSessionRoute(directory, config, thread, initialProviderId),
     onReceipt: receipt => saveReceipt(directory, config, receipt),
+    // The spawning hook/tool call may lack the user's proxy variables; resolve
+    // the saved setting and OS system proxy here, re-read without a restart.
+    officialNetwork: createOfficialNetwork({ directory }),
     onShutdown: () => resolveDone(),
   });
   await atomicJSON(runtimePath(directory), { instanceId, configId: config.id, pid: process.pid, port: config.port,
@@ -126,6 +130,8 @@ async function serveGateway(directory) {
 function requestFailure(receipt) {
   if (receipt.success === true && receipt.completed === true) return null;
   const status = receipt.statusCode;
+  if (receipt.transport === 'official' && receipt.transportError) return { reason: 'official_network_unreachable',
+    hint: `The gateway could not connect to OpenAI Official (${receipt.transportError}, network ${receipt.networkSource || 'unknown'}). This is a local network/proxy problem, not the account or a fingerprint. Run autoswitch.mjs network to see the gateway's egress; set one with network --official-proxy only on the user's request.` };
   if (status === 401) return { reason: 'upstream_authentication_failed',
     hint: 'The selected route returned HTTP 401. Check the current native authentication and CCSwitch card configuration; do not copy credentials between profiles.' };
   if (status === 403) return { reason: 'upstream_forbidden',
@@ -156,6 +162,8 @@ function publicReceipt(receipt, state, config) {
     completed: receipt.completed === true, success: receipt.success === true,
     statusCode: Number.isInteger(receipt.statusCode) && receipt.statusCode >= 100 && receipt.statusCode <= 599 ? receipt.statusCode : null,
     responseEvent: ['response.completed', 'response.failed', 'response.incomplete', 'response.error', 'error'].includes(receipt.responseEvent) ? receipt.responseEvent : null,
+    transportError: typeof receipt.transportError === 'string' ? receipt.transportError : null,
+    networkSource: typeof receipt.networkSource === 'string' ? receipt.networkSource : null,
     finishedAt: receipt.finishedAt, configurationMatches: config ? receipt.configId === config.id : null,
     failureReason: failure?.reason || null, failureHint: failure?.hint || null,
     scope: 'most_recent_gateway_request_only' };
@@ -171,7 +179,8 @@ export async function runAutoSwitch(args, env = process.env, {
 } = {}) {
   const { command, options } = argumentsFor([...args]);
   const directory = dataDirectory(options['data-dir'], env);
-  if (command === 'help') return { commands: ['inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+  if (command === 'help') return { commands: ['inspect', 'configure', 'connect', 'disconnect', 'connection-status', 'network', 'use', 'gateway-start', 'gateway-stop', 'gateway-status', 'launch', 'enable', 'disable', 'status'],
+    network: 'network [--official-proxy auto|direct|http(s)://HOST:PORT] (show or set how the gateway reaches OpenAI Official; auto = gateway HTTPS_PROXY, then the OS system proxy, then direct; applies without a restart or configuration change)',
     use: 'Natural-language entry: use enables monitoring only for this already-connected thread; it never launches another CLI or approves a switch.',
     connect: 'One-time setup for ordinary codex: connect this Codex home\'s future new conversations to the gateway. Existing running threads are unchanged; monitoring remains off.',
     disconnect: 'Restore only the two defaults still owned by this plugin. Existing gateway conversations and monitoring are unchanged; the gateway stays running.',
@@ -180,6 +189,7 @@ export async function runAutoSwitch(args, env = process.env, {
     enable: 'enable [--session THREAD_ID] (monitor an already successful primary-route thread; never changes its route)',
     disable: 'Stop monitoring and cancel a pending switch request; keep the selected route and any halt',
     incidents: 'Use guard.mjs propose-switch / approve-switch / decline-switch / wait-switch for an incident request',
+    switching: 'On an explicit user request, guard.mjs switch-route --target-name NAME verifies the target (receipt + fingerprint) and then moves only this thread; failure keeps the current route',
     scope: 'Pause on the first valid fingerprint mismatch. Each target verification and switch requires consent for that incident. Configuration, enable and acknowledgement never approve a switch.', dataDirectory: directory };
   if (command === 'inspect') return inspectCCSwitch(options['cc-switch-dir']);
   if (command === 'connection-status') return nativeIntegrationStatus(directory, env, { connect: openClient });
@@ -210,6 +220,11 @@ export async function runAutoSwitch(args, env = process.env, {
     return configureGateway(directory, { primaryName: options['primary-name'], backupName: options['backup-name'],
       sourceProvider: options['primary-provider'], fallbackProvider: options['backup-provider'],
       ccSwitchDirectory: options['cc-switch-dir'], port: options.port === undefined ? 15722 : Number(options.port) });
+  }
+  if (command === 'network') {
+    // Egress is not route identity: no stopped gateway, new config ID or route migration.
+    if (options['official-proxy'] !== undefined) await writeNetworkSetting(directory, options['official-proxy']);
+    return officialNetworkStatus(directory, { env });
   }
   if (command === 'serve') { await serveGateway(directory); return { stopped: true }; }
   if (command === 'gateway-start') return startGateway(directory);

@@ -2,7 +2,7 @@
 
 本仓库是 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace) 的独立 fork。基线为 upstream `main` 的提交 [`6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2`](https://github.com/xqy2006/ModelTrace/commit/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2)。上游作者为 **xqy2006**，fork 由 **ChenCJ-io** 维护；不代表上游发布或官方 Codex、CCSwitch 项目。
 
-根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.2`，发布仓库为 [ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。
+根 [LICENSE](../LICENSE) 与插件 LICENSE 保留 MIT 许可证及 `Copyright (c) 2026 xqy2006`。manifest 保留上游 author，package contributors 另列 fork 维护者。当前版本 `0.4.3`，发布仓库为 [ChenCJ-io/modeltrace-guard-autoswitch](https://github.com/ChenCJ-io/modeltrace-guard-autoswitch)。
 
 ## 保留内容
 
@@ -11,6 +11,8 @@
 - 普通独立 `guard.mjs start` 的上游监测与复测流程；它不授权路由切换。
 - 离线打包与评分一致性检查，来源和校验和见插件 `assets/provenance.json`；不自动重新采集指纹。
 - 对误报、同上下文和多语言未独立校准、异步通知边界及 hook 信任的限制。
+
+0.4.3 在保留原有 18 模型参考的基础上，由本 fork 增采 `gpt-6.1-sol`：使用当前 home 原生 ChatGPT 登录，经 CCSwitch 的无账号绑定 `OpenAI Official` 描述符选路到固定官方 HTTPS 端点，保留 36 条参考的完整请求成功回执与用量。该新增数据不冒充上游发布；设置为 max、Standard、Codex CLI 0.163.0。独立验证与训练样本分离，范围及实测结果见采集验收记录。
 
 原 Web 工具仍可用 `python -m pip install -r requirements.txt`、`python start.py` 启动，与会话网关分别运行。基线文档见 [上游 README](https://github.com/xqy2006/ModelTrace/blob/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2/README.md) 与 [上游插件说明](https://github.com/xqy2006/ModelTrace/blob/6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2/codex-plugin/modeltrace-guard/README.md)。
 

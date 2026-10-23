@@ -77,6 +77,18 @@ export async function forkDoctor(session, directory, env = process.env) {
   } finally { try { await client.close(); } finally { await removeSnapshot(directory, snapshot); } }
 }
 
+// Bounded metadata from a Codex `error` notification (TurnError). Its message
+// carries the HTTP status and gateway/upstream error text; inference failed, so
+// it holds no probe answer. Control characters are removed and length capped.
+export function upstreamError(error) {
+  if (!error || typeof error !== 'object') return null;
+  const info = error.codexErrorInfo;
+  const [kind, detail] = typeof info === 'string' ? [info, null] : info && typeof info === 'object' ? Object.entries(info)[0] || [] : [];
+  return { message: typeof error.message === 'string' ? error.message.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 500) : null,
+    kind: typeof kind === 'string' ? kind.slice(0, 64) : null,
+    httpStatusCode: Number.isInteger(detail?.httpStatusCode) ? detail.httpStatusCode : null };
+}
+
 // Exported for protocol fixtures: notifications may arrive before turn/start's
 // response. Keep the listener installed first; never leak raw text to stdout.
 export async function generateProbe(client, forkId, pending, isCancelled = async () => false) {
@@ -86,7 +98,7 @@ export async function generateProbe(client, forkId, pending, isCancelled = async
   const completed = new Promise((yes, no) => { resolve = yes; reject = no; });
   // Avoid an unhandled rejection if transport events beat the turn/start reply.
   completed.catch(() => {});
-  const fail = (message) => { if (!settled) { settled = true; reject(new Error(message)); } };
+  const fail = (message, upstream) => { if (!settled) { settled = true; reject(Object.assign(new Error(message), upstream ? { upstream } : {})); } };
   const onMessage = (message) => {
     const p = message.params;
     if (p?.threadId !== forkId) return;
@@ -107,7 +119,7 @@ export async function generateProbe(client, forkId, pending, isCancelled = async
       if (p.turn?.status !== 'completed') return fail('Codex probe turn did not complete');
       if (!settled) { settled = true; resolve(finalText ?? (otherText.length === 1 ? otherText[0] : null)); }
     }
-    if (message.method === 'error' && !p.willRetry) fail('Codex probe inference failed; no sample accepted');
+    if (message.method === 'error' && !p.willRetry) fail('Codex probe inference failed; no sample accepted', upstreamError(p.error));
   };
   client.listeners.add(onMessage);
   client.exited?.then(() => fail('Codex probe transport exited before completion'));
@@ -207,7 +219,9 @@ export async function runForkProbe(directory, session, challenge, env = process.
     const result = await dependencies.submit(directory, session, challenge, text, receipt, stateOptions);
     return result;
   } catch (error) {
-    const diagnostic = { stage, ...(error instanceof ProbeOutputError ? error.diagnostic : { code: 'probe_failed' }) };
+    const gateway = await cacheTransport?.lastAttempt?.().catch(() => null);
+    const diagnostic = { stage, ...(error instanceof ProbeOutputError ? error.diagnostic : { code: 'probe_failed' }),
+      ...(error.upstream ? { upstream: error.upstream } : {}), ...(gateway ? { gateway } : {}) };
     const cancelled = await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge || state.epoch !== pending.epoch) return true;
       abandon(state, Date.now(), 'fork_probe_failed');

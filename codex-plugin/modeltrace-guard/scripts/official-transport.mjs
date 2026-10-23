@@ -1,8 +1,21 @@
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
 
-const OFFICIAL_BASE = 'https://chatgpt.com/backend-api/codex/';
+export const OFFICIAL_HOST = 'chatgpt.com';
+const OFFICIAL_BASE = `https://${OFFICIAL_HOST}/backend-api/codex/`;
 const unsupported = (message) => Object.assign(new Error(message), { status: 503, code: 'OFFICIAL_TRANSPORT_UNSUPPORTED_ENV' });
+// Socket/TLS/proxy error codes only (ECONNRESET, ERR_PROXY_TUNNEL, ...): never a
+// message, which can echo a proxy URL with credentials.
+export const transportErrorCode = (error) => typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(error.code) ? error.code : 'TRANSPORT_ERROR';
+// Proxy credentials never reach a response body, receipt or status output.
+export function redactProxyURL(value) {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) { url.username = '***'; url.password = ''; }
+    return url.href.replace(/\/$/, '');
+  } catch { return '<invalid>'; }
+}
+const MAX_ROUTE_AGENTS = 8;
 const PRIVATE_HEADERS = new Set(['host', 'connection', 'proxy-authorization', 'proxy-authenticate', 'origin', 'referer', 'referrer',
   'forwarded', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-uri', 'x-original-url', 'x-rewrite-url']);
 
@@ -31,16 +44,49 @@ function officialEnvironment(env, nodeVersion) {
   }
 }
 
-/** Fixed official destination; test injection never becomes a CLI URL override. */
+/**
+ * Fixed official destination; test injection never becomes a CLI URL override.
+ * Without `network`, the process environment is the only proxy source. With a
+ * `network` resolver (network-route.mjs), callers `prepare()` before each
+ * request so the egress route follows the saved setting / system proxy.
+ */
 export function createOfficialTransport({ requestImpl = httpsRequest, env = process.env, nodeVersion = process.versions.node,
-  agentFactory = (options) => new Agent(options) } = {}) {
+  agentFactory = (options) => new Agent(options), network = null } = {}) {
   officialEnvironment(env, nodeVersion);
   if (typeof requestImpl !== 'function' || typeof agentFactory !== 'function') throw new Error('Invalid official transport dependencies');
-  const agent = agentFactory({ keepAlive: true, proxyEnv: env, rejectUnauthorized: true });
+  if (network && typeof network.resolve !== 'function') throw new Error('Invalid official network resolver');
+  // One keep-alive agent per egress route. Agents of a superseded route are not
+  // destroyed while their in-flight requests may still be streaming.
+  const agents = new Map();
+  const agentFor = (key, proxyEnv) => {
+    if (!agents.has(key)) {
+      agents.set(key, agentFactory({ keepAlive: true, proxyEnv, rejectUnauthorized: true }));
+      if (agents.size > MAX_ROUTE_AGENTS) { const [oldest] = agents.keys(); agents.get(oldest).destroy(); agents.delete(oldest); }
+    }
+    return agents.get(key);
+  };
   let closed = false;
+  let current = network ? null : { agent: agentFor('environment', env), route: { mode: 'environment', source: 'environment', proxy: null } };
   return {
+    async prepare({ force = false } = {}) {
+      if (closed) throw unsupported('Official transport is closed');
+      if (!network) return current.route;
+      let route;
+      try { route = await network.resolve({ force }); }
+      catch (error) {
+        throw Object.assign(new Error(`Official network setting is unusable: ${error.code === 'INVALID_OFFICIAL_PROXY' ? error.message : 'resolution failed'}`),
+          { status: 503, code: 'OFFICIAL_NETWORK_UNAVAILABLE' });
+      }
+      if (closed) throw unsupported('Official transport is closed');
+      current = { agent: agentFor(JSON.stringify([route.source, route.proxy]), route.proxyEnv), route };
+      return route;
+    },
+    route() { return current?.route || null; },
+    // A failed connection re-resolves the route on the next request.
+    failed() { network?.invalidate?.(); },
     request(endpoint, { method = 'POST', headers = {} } = {}, callback) {
       if (closed) throw unsupported('Official transport is closed');
+      if (!current) throw unsupported('Official network route has not been prepared');
       if (!['responses', 'responses/compact'].includes(endpoint) || method !== 'POST') throw new Error('Unsupported official endpoint');
       const safeHeaders = {};
       const omitted = new Set(PRIVATE_HEADERS);
@@ -49,9 +95,32 @@ export function createOfficialTransport({ requestImpl = httpsRequest, env = proc
       // https.request does not follow redirects. The capability path is never
       // passed here, and caller host/path/agent/TLS options are intentionally ignored.
       const target = new URL(endpoint, OFFICIAL_BASE);
-      return requestImpl(target, { method, headers: safeHeaders, agent, rejectUnauthorized: true }, callback);
+      return requestImpl(target, { method, headers: safeHeaders, agent: current.agent, rejectUnauthorized: true }, callback);
     },
-    close() { if (!closed) { closed = true; agent.destroy(); } },
+    // Credential-free GET without any header: any HTTP status proves that TLS to
+    // the fixed origin works over the current route. No inference is performed.
+    reachability({ timeoutMs = 8000 } = {}) {
+      const started = Date.now();
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (result) => { if (!done) { done = true; resolve({ ...result, elapsedMs: Date.now() - started }); } };
+        if (closed || !current) { finish({ reachable: false, error: closed ? 'TRANSPORT_CLOSED' : 'ROUTE_NOT_PREPARED' }); return; }
+        let req;
+        try {
+          req = requestImpl(new URL('responses', OFFICIAL_BASE), { method: 'GET', headers: {}, agent: current.agent, rejectUnauthorized: true },
+            (res) => { finish({ reachable: true, statusCode: res.statusCode }); res.resume(); });
+        } catch (error) { finish({ reachable: false, error: transportErrorCode(error) }); return; }
+        req.once('error', (error) => finish({ reachable: false, error: transportErrorCode(error) }));
+        req.setTimeout(timeoutMs, () => { finish({ reachable: false, error: 'ETIMEDOUT' }); req.destroy(); });
+        req.end();
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const agent of agents.values()) agent.destroy();
+      agents.clear();
+    },
   };
 }
 

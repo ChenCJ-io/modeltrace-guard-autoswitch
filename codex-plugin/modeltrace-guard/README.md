@@ -1,6 +1,10 @@
 # ModelTrace Guard Autoswitch
 
-独立 fork `0.4.2`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+独立 fork `0.4.3`，上游作者 xqy2006，fork 维护者 ChenCJ-io，保留 MIT。完整安装入口为仓库根 [INSTALL.md](../../INSTALL.md)，主要使用流程见 [README](../../README.md)。
+
+内置指纹库包含 `gpt-6.1-sol` 的 36 条官方原生参考（max、Standard、Codex CLI 0.163.0）。新参考采集须由用户另行明确请求；普通监测不运行采集入口，也不自动扩展指纹库。
+
+该模型是实验参考：与 `gpt-6-astra` 容易混淆，独立官方样本单条正确 4/6，另 2 条被归为 Astra。单条分组交叉验证中新模型仅正确 19/36，候选不能证明渠道替换。两者登记为已知混淆组（`assets/confusable-groups.json`，绑定当前指纹库哈希）：第一候选落在预期模型的组内且组内合计权重 ≥ 0.5 时按兼容计，不暂停、不发起切换，目标验证同样适用；组外候选的判定不变。参考已加入库，不代表归因准确率已校准；详见源码仓库 `docs/GPT-6.1-SOL-REFERENCE.md`。
 
 完成一次性接入后，照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。技能执行 `autoswitch.mjs use`，只为当前已接入的主渠道 thread 开启监测；个人会话默认不检测，无需专用启动器。
 
@@ -57,6 +61,10 @@ node scripts/guard.mjs decline-switch --request REQUEST_ID
 ## 运行环境和边界
 
 需要支持原生快照 fork、临时任务删除、同步工具拦截和异步 hooks 的 Codex App Server。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，以满足 zstd 与官方 HTTPS 的原生 `proxyEnv` 要求。普通独立监测仍可使用 Node.js 18+。配置检查依赖提供 `sha3()` 的 `sqlite3` CLI，通过只读 SQL 获取身份和配置摘要，不导出密钥。
+
+网关访问 Official 的出网方式与主备配置分开管理。默认 `auto` 依次使用网关进程的 `HTTPS_PROXY`、系统 HTTPS 代理（macOS `scutil`、Windows Internet 设置）、直连，约每 15 秒及每次连接失败后重新判断；`autoswitch.mjs network` 查看网关实际出网并做无凭证连通性检查，`network --official-proxy auto|direct|http(s)://HOST:PORT` 立即生效，不需停网关、不改配置 ID、不迁移路由。只支持 HTTP(S) 代理。切到 Official 前 `approve-switch` 会先做连通性检查，失败返回 `OFFICIAL_UNREACHABLE`，不记录批准。
+
+用户也可在对话中主动切换当前会话的渠道（「切回主渠道」「切到 API2 copy」）：技能执行 `guard.mjs switch-route --target-name NAME`，只改该会话的网关路由，不改 CCSwitch 默认卡；切换前同样先做一次目标验证（完整回执 + 指纹兼容），切回仍在降智的中转时验证失败、保留当前渠道并自动解除暂停。成功切到主渠道或第三方后恢复监测，切到 Official 后停止监测。需已执行 use，且没有未处理的异常。
 
 主配置及第三方目标须加入 CCSwitch 4.0.15 Stack，保留公司默认。Official 仅支持无 managed account 的当前 CLI 原生 ChatGPT 登录，网关转发到固定官方 HTTPS 地址。网关会接收认证头，不读取凭据存储、不解析或保存 token，也不修改 CCSwitch 数据库。独立 web search/images 端点尚不支持；加密历史不一定能跨路由使用。
 

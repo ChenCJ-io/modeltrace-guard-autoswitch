@@ -120,7 +120,7 @@ export function isDue(state, now) {
 
 export function isMismatch(sample) {
   return Boolean(sample.expected && sample.prediction && sample.expected !== sample.prediction && Number.isFinite(sample.expectedWeight)
-    && !['missing_expected_model', 'unknown_expected_model'].includes(sample.outcome));
+    && !['missing_expected_model', 'unknown_expected_model'].includes(sample.outcome) && !sameConfusableGroup(sample));
 }
 
 export function interruptConfirmation(state, now, reason) {
@@ -249,18 +249,32 @@ export function issue(state, now, draw = randomInt) {
   return state.pending;
 }
 
-export function classifySample(result, expected, previous = []) {
+export function classifySample(result, expected, previous = [], confusableGroups = []) {
   const candidate = result.results.find((item) => item.model === expected);
   const top = result.results[0];
-  let outcome = 'inconclusive';
+  let outcome = 'inconclusive', confusableGroup = null;
   if (!expected) outcome = 'missing_expected_model';
   else if (!candidate) outcome = 'unknown_expected_model';
   else if (top.model === expected && top.probability >= 0.5) outcome = 'compatible';
-  else if (top.model !== expected && top.probability >= 0.8 && candidate.probability <= 0.15 && top.probability - candidate.probability >= 0.65) outcome = 'difference_signal';
+  else {
+    // The bank cannot separate members of a validated confusable group: a top
+    // candidate inside the expected model's group is not mismatch evidence.
+    const group = confusableGroups.find((item) => item.models.includes(expected) && item.models.includes(top.model));
+    const groupWeight = group ? result.results.filter((item) => group.models.includes(item.model)).reduce((sum, item) => sum + item.probability, 0) : 0;
+    if (group && groupWeight >= group.minimumGroupWeight) {
+      outcome = 'compatible';
+      confusableGroup = { id: group.id, models: [...group.models], groupWeight };
+    } else if (top.model !== expected && top.probability >= 0.8 && candidate.probability <= 0.15 && top.probability - candidate.probability >= 0.65) outcome = 'difference_signal';
+  }
   const recent = [...previous.slice(-2), { prediction: top.model, outcome }];
   if (outcome === 'difference_signal' && recent.filter((sample) => sample.prediction === top.model && ['difference_signal', 'repeated_difference'].includes(sample.outcome)).length >= 2) outcome = 'repeated_difference';
-  return { outcome, prediction: top.model, closedSetWeight: top.probability, expectedWeight: candidate?.probability ?? null };
+  return { outcome, prediction: top.model, closedSetWeight: top.probability, expectedWeight: candidate?.probability ?? null,
+    ...(confusableGroup ? { confusableGroup } : {}) };
 }
+
+// A group-compatible sample: its candidate differs only within a validated group.
+export const sameConfusableGroup = (sample) => Boolean(sample?.outcome === 'compatible' && Array.isArray(sample.confusableGroup?.models)
+  && sample.confusableGroup.models.includes(sample.expected) && sample.confusableGroup.models.includes(sample.prediction));
 
 export function recentComparable(state, pending) {
   // A same-language hit must also be one of the last TWO physical checkpoints,

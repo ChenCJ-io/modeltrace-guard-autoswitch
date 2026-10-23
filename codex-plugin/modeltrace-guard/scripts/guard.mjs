@@ -7,7 +7,7 @@ import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
-import { approveSwitch, declineSwitch, proposeSwitch, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
+import { approveSwitch, declineSwitch, proposeSwitch, requestManualSwitch, resolveSwitchTarget, failAutoSwitch, finishVerification, haltBlocksProbe, isRecoveryActive, needsPersonalMonitoringStop, queueAutoSwitch, switchControlContext } from './switch-policy.mjs';
 export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
@@ -29,9 +29,22 @@ export async function loadArtifacts() {
     if (digest(bankBytes) !== metadata.bankSha256 || digest(scorerBytes) !== metadata.scorerSha256) throw new Error('Bundled bank/scorer checksum mismatch; rebuild or reinstall the plugin');
     const bank = JSON.parse(bankBytes);
     const { analyzeGlobalOutputs } = await import('./fingerprint-core.mjs');
-    return { bank, metadata, analyzeGlobalOutputs };
+    const groups = await readFile(path.join(ROOT, 'assets', 'confusable-groups.json'), 'utf8').then(JSON.parse, () => null);
+    return { bank, metadata, analyzeGlobalOutputs, confusableGroups: confusableGroupsFor(groups, metadata, bank) };
   })();
   return artifacts;
+}
+
+// Groups were validated against one exact bank. A rebuilt bank, malformed file
+// or unknown model disables them, so scoring falls back to the strict rule
+// (more alerts, never silently fewer).
+export function confusableGroupsFor(file, metadata, bank) {
+  if (file?.schema !== 1 || file.bankSha256 !== metadata?.bankSha256 || !Array.isArray(file.groups)) return [];
+  const known = new Set((bank?.models || []).map(model => model.id));
+  return file.groups.filter(group => typeof group?.id === 'string' && Array.isArray(group.models) && group.models.length >= 2
+    && group.models.every(model => known.has(model)) && Number.isFinite(group.minimumGroupWeight)
+    && group.minimumGroupWeight >= 0.5 && group.minimumGroupWeight <= 1)
+    .map(({ id, models, minimumGroupWeight }) => ({ id, models: [...models], minimumGroupWeight }));
 }
 
 const quote = (value) => `'${String(value).replace(/'/g, process.platform === 'win32' ? "''" : "'\\''")}'`;
@@ -68,7 +81,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
+  return /(?:guard|autoswitch)\.mjs['"\s]+(?:start|submit|probe|wait|propose-switch|approve-switch|decline-switch|wait-switch|switch-route|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|use|connect|disconnect|connection-status|enable|disable|gateway-status|gateway-start|gateway-stop)\b/.test(command);
 }
 
 // Splits one simple command the way the host shell would, mirroring `quote`
@@ -125,7 +138,7 @@ export function isControlCommand(event) {
     return true;
   }
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
-  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
+  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
@@ -328,7 +341,7 @@ function parseArguments(args) {
     help: [], doctor: ['fork'], models: [], hook: [], 'background-hook': [], wait: ['confirmation'], status: [], stop: [], resume: ['halt'], dashboard: [], 'dashboard-stop': [], acknowledge: ['alert'], label: ['name'],
     start: ['expected', 'name', ...fields], configure: ['expected', 'name', ...fields], submit: ['challenge', 'numbers'], probe: ['challenge'],
     'propose-switch': ['request', 'target-name', 'target-provider'], 'approve-switch': ['request', 'target-provider'],
-    'decline-switch': ['request'], 'wait-switch': ['request'],
+    'decline-switch': ['request'], 'wait-switch': ['request'], 'switch-route': ['target-name', 'target-provider'],
   };
   if (!Object.hasOwn(perCommand, command)) throw new Error(`Unknown command: ${command}`);
   for (const key of Object.keys(options)) if (!['data-dir', 'session', ...perCommand[command]].includes(key)) throw new Error(`Unknown ${command} option --${key}`);
@@ -354,7 +367,7 @@ export async function run(args, env = process.env, receipt = null) {
   const { command, options, fields } = parseArguments([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return {
-    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'dashboard', 'dashboard-stop', 'label'],
+    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'propose-switch', 'approve-switch', 'decline-switch', 'wait-switch', 'switch-route', 'dashboard', 'dashboard-stop', 'label'],
     execution: 'Native async hooks run probes in the background. Normal results are silent; wait is only for an active mismatch confirmation.',
     name: 'start --name <task title> or label --name <display name>; metadata only, does not rename the Codex task or change sampling',
     session: 'Defaults to CODEX_THREAD_ID; otherwise pass --session from a trusted hook. Never invent a task id.',
@@ -407,11 +420,9 @@ export async function run(args, env = process.env, receipt = null) {
     const { waitForSwitch } = await import('./background.mjs');
     return waitForSwitch(directory, session, options.request);
   }
-  if (['propose-switch', 'approve-switch', 'decline-switch'].includes(command)) {
-    if (command === 'propose-switch') await proposeSwitch(directory, session, options.request,
-      { name: options['target-name'], id: options['target-provider'] });
-    if (command === 'decline-switch') await declineSwitch(directory, session, options.request);
-    if (command === 'approve-switch') {
+  if (['propose-switch', 'approve-switch', 'decline-switch', 'switch-route'].includes(command)) {
+    // Native login/model and trusted hooks, checked right before a canary starts.
+    const nativeReadiness = async () => {
       const { openAppServer } = await import('./app-server-client.mjs');
       const { sourceSettings } = await import('./fork-snapshot.mjs');
       const { requireTrustedGuard } = await import('./fork-runner.mjs');
@@ -421,9 +432,28 @@ export async function run(args, env = process.env, receipt = null) {
           client.request('account/read', { refreshToken: false }), sourceSettings(client, session),
         ]);
         await requireTrustedGuard(client, settings.cwd);
-        await approveSwitch(directory, session, options.request, options['target-provider'],
-          { accountType: account?.type, modelProvider: settings.provider, model: settings.model });
+        return { accountType: account?.type, modelProvider: settings.provider, model: settings.model };
       } finally { await client.close(); }
+    };
+    // An unreachable Official target would only burn this consent on a canary
+    // that cannot run. Check egress first, before the user's reply is consumed.
+    const requireReachable = async (target) => {
+      if (target?.transport !== 'official') return;
+      const { requireOfficialReachable } = await import('./network-route.mjs');
+      await requireOfficialReachable(directory);
+    };
+    if (command === 'propose-switch') await proposeSwitch(directory, session, options.request,
+      { name: options['target-name'], id: options['target-provider'] });
+    if (command === 'decline-switch') await declineSwitch(directory, session, options.request);
+    if (command === 'approve-switch') {
+      const observed = await readState(directory, session);
+      if (observed?.switchRequest?.id === options.request) await requireReachable(observed.switchRequest.target);
+      await approveSwitch(directory, session, options.request, options['target-provider'], await nativeReadiness());
+    }
+    if (command === 'switch-route') {
+      const selection = { name: options['target-name'], id: options['target-provider'] };
+      await requireReachable(await resolveSwitchTarget(directory, selection));
+      await requestManualSwitch(directory, session, selection, await nativeReadiness());
     }
     const state = await readState(directory, session);
     return { ...summarize(state, directory), controlContext: controlContext(state, directory),
@@ -442,7 +472,7 @@ export async function run(args, env = process.env, receipt = null) {
   if (command === 'label') return withState(directory, session, (state) => { setTaskName(state, options.name, now); return summarize(state, directory, now); });
   if (command === 'submit') {
     if (receipt?.key !== forkSubmission) throw new Error('In-context --numbers submissions are disabled. Use probe --challenge; numbers must stay in a disposable Codex fork.');
-    const { bank, metadata, analyzeGlobalOutputs } = await loadArtifacts();
+    const { bank, metadata, analyzeGlobalOutputs, confusableGroups } = await loadArtifacts();
     return withState(directory, session, (state) => {
       // A background submission can wait behind a slow writer. Check expiry
       // at lock acquisition, not against the time before that wait began.
@@ -461,7 +491,7 @@ export async function run(args, env = process.env, receipt = null) {
       const numbers = validateNumbers(options.numbers, p.count);
       const result = analyzeGlobalOutputs([{ text: JSON.stringify(numbers), expected_count: p.count }], bank);
       const previous = recentComparable(state, p);
-      const evidence = classifySample(result, state.expected, previous);
+      const evidence = classifySample(result, state.expected, previous, confusableGroups);
       const sample = {
         at: now, epoch: state.epoch, challenge: p.id, reportedModel: state.model, expected: state.expected,
         requestedCount: p.count, actualCount: numbers.length, countMatched: numbers.length === p.count,
@@ -560,4 +590,7 @@ export async function main(args = process.argv.slice(2)) {
   finally { dispatchQueuedCleanups(); }
 }
 
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+// No top-level await: wait/wait-switch lazily import background.mjs, which
+// imports this module back. Suspending this module's evaluation would leave that
+// cycle unsettled and Node would exit 13 before the command runs.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) void main();

@@ -224,6 +224,20 @@ test('one approved Official success preserves thread/history and stops later mon
   assert.equal(queueAutoSwitch(state, Date.now()), false);
 });
 
+test('a target candidate inside the validated confusable group verifies; a forged or out-of-group label does not', () => {
+  const group = { id: 'expected~sibling', models: ['expected', 'sibling'], groupWeight: 0.52 };
+  const ok = approvedState(), okCheckpoint = ok.pending;
+  finishVerification(ok, { ...canary(ok), prediction: 'sibling', confusableGroup: group }, okCheckpoint, Date.now());
+  assert.equal(ok.switchRequest.status, 'succeeded'); assert.equal(ok.taskHalt, null);
+  for (const mutate of [sample => { delete sample.confusableGroup; }, sample => { sample.prediction = 'other'; },
+    sample => { sample.confusableGroup = { ...group, models: ['sibling', 'other'] }; }, sample => { sample.outcome = 'inconclusive'; }]) {
+    const state = approvedState(), checkpoint = state.pending, sample = { ...canary(state), prediction: 'sibling', confusableGroup: group };
+    mutate(sample);
+    finishVerification(state, sample, checkpoint, Date.now());
+    assert.ok(state.taskHalt); assert.equal(state.autoSwitch.phase, 'failed');
+  }
+});
+
 test('failed, stale, wrong-target or revoked receipts cannot clear the halt', () => {
   for (const mutate of [(s, a) => { a.fork.routing.success = false; }, (s, a) => { a.prediction = 'other'; },
     (s, a) => { a.outcome = 'inconclusive'; }, (s, a) => { a.fork.routing.revision = 1; },

@@ -41,7 +41,7 @@
 
 1. **路由**：一次性接入后，Codex 的默认入口指向本机网关。网关按会话把请求转给 CCSwitch 的主渠道，并为每个请求留下路由回执，用来证明"这个会话实际走的是哪条路"。
 2. **抽样**：开启监测的会话每 16–32 次工具调用抽查一次；会话恢复、上下文压缩或模型标签变化后也会各查一次。
-3. **指纹**：探针让模型"直接挑出 N 个 1–355 之间的整数"。不同模型挑数的分布有稳定差异，插件把结果与内置指纹库（GPT 与 Claude 系列共 18 个模型）比对，判断最像哪一个。
+3. **指纹**：探针让模型"直接挑出 N 个 1–355 之间的整数"。不同模型挑数的分布有稳定差异，插件把结果与内置指纹库（GPT 与 Claude 系列共 19 个模型，包括 `gpt-6.1-sol`）比对，判断最像哪一个。
 4. **决策**：结果与预期一致就静默记录；不一致就进入"等待你决定"的状态，具体流程见下文。
 
 指纹库、评分算法和探针框架来自上游 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace)，本项目在此基础上增加了网关路由、异常询问和同会话切换。
@@ -56,6 +56,28 @@
 | sqlite3 | 命令行版本，且支持 `sha3()`（用于只读检查 CCSwitch 配置） |
 
 另外，CCSwitch 的默认卡需要是你选定的主渠道，并且要**关闭自动故障转移**。插件每次转发前都会检查这两项，不一致就拒绝转发，而不是悄悄换路。
+
+### 访问 OpenAI Official 的网络（代理）
+
+备用渠道是 OpenAI Official 时，请求由本机网关（Node 进程）直接发往 `chatgpt.com`。Codex 本身会走系统代理，Node 不会；而网关常由 hook 或工具调用拉起，环境里不一定带 `HTTPS_PROXY`。所以网关按下面的顺序自己决定出网方式（`auto`，默认，无需配置）：
+
+1. 网关进程的 `HTTPS_PROXY` / `https_proxy`（同时遵守 `NO_PROXY`）
+2. 操作系统的系统 HTTPS 代理：macOS 读 `scutil --proxy`，Windows 读「Internet 设置」；Linux 没有统一的系统代理，只看环境变量
+3. 直连
+
+出网方式大约每 15 秒、以及每次连接失败后重新判断一次。开关 VPN、换代理端口都不用重启网关。需要固定某个代理时：
+
+```sh
+AUTOSWITCH=codex-plugin/modeltrace-guard/scripts/autoswitch.mjs
+node "$AUTOSWITCH" network                                          # 查看网关实际的出网方式，并做一次不带凭证的连通性检查
+node "$AUTOSWITCH" network --official-proxy http://127.0.0.1:7890   # 固定代理，立即生效
+node "$AUTOSWITCH" network --official-proxy direct                  # 强制直连
+node "$AUTOSWITCH" network --official-proxy auto                    # 恢复自动
+```
+
+这个设置只影响网关去 Official 的出网方式，不属于主备配置：不用停网关，不会生成新的配置 ID，也不影响已有会话的路由和切换同意。代理只承载到 `chatgpt.com` 的 TLS 隧道。只支持 HTTP(S) 代理；系统代理只开了 SOCKS 或 PAC 时，`network` 会提示 `socks_unsupported` / `pac_unsupported`，请改填 HTTP 代理端口。代理地址里的账号密码会以 0600 权限保存在数据目录的 `network.json`，所有输出都会打码。
+
+批准切到 Official 前，插件会先检查网关能否连到 Official；连不上会返回 `OFFICIAL_UNREACHABLE`。这时不会记录批准，请求保持待确认，修好网络后再确认一次即可。
 
 ## 快速开始
 
@@ -113,6 +135,17 @@ node "$AUTOSWITCH" connection-status  # 检查接入状态
 
 切换、拒绝或恢复，都只接受你在异常报告**之后**发出的回复，而且一条回复只能用于一次决定。Codex 不能在报告的同一轮里替你点头，你的沉默、超时或之前的笼统授权也都不算同意。
 
+## 在对话中主动切换渠道
+
+没有异常时，你也可以直接让 Codex 切换当前会话的渠道，例如「切回主渠道」「切到 API2 copy」「切到 OpenAI Official」：
+
+- **只改当前会话**：走插件网关按会话选路，不改 CCSwitch 的默认卡，不影响其他会话，Codex 也不用重启。
+- **先验证再切**：和异常切换一样，先向目标渠道发一次探针，要求回执完整、指纹相符才切。切回主渠道时，如果它还是降智的模型，验证不通过，会话保留在当前渠道，暂停自动解除，Codex 会告诉你原因。每次切换消耗目标渠道的一次探针。
+- **切换后**：切到主渠道或第三方渠道后自动恢复监测，之后再出现异常仍会提醒；切到 Official 后照旧停止监测。
+- **前提**：当前会话已经说过「使用 modeltrace-guard-autoswitch」，并且没有未处理的异常（有异常时按上面的流程回复）。主渠道和 Official 以外的渠道需要先在 CCSwitch 界面里加入 Stack。
+
+切换只在你明确要求时发生，Codex 不会自己发起，也不会在失败后自动重试。
+
 ## 命令参考
 
 日常使用中，这些命令都由插件技能代为执行，你只需要用自然语言和 Codex 交流。下面列出来，方便排查问题和手动管理。
@@ -128,6 +161,7 @@ node "$AUTOSWITCH" connection-status  # 检查接入状态
 | `use --session ID` / `disable --session ID` | 为会话开启 / 停止监测 |
 | `status --session ID` | 查看会话的路由和监测状态 |
 | `gateway-status` / `gateway-start` / `gateway-stop` | 管理本机网关进程 |
+| `network [--official-proxy auto\|direct\|URL]` | 查看或设置网关访问 OpenAI Official 的出网方式，立即生效 |
 
 **异常处理**（`node codex-plugin/modeltrace-guard/scripts/guard.mjs <命令>`）
 
@@ -137,6 +171,7 @@ node "$AUTOSWITCH" connection-status  # 检查接入状态
 | `approve-switch --request ID --target-provider ID` | 记录你对本次目标的同意，并开始验证 |
 | `wait-switch --request ID` | 等待验证结果 |
 | `decline-switch --request ID` | 不切换，保留当前渠道继续 |
+| `switch-route --target-name NAME` | 你在对话里主动要求切换当前会话的渠道（含切回主渠道）；先验证指纹再切，失败则保留当前渠道 |
 | `dashboard` | 打开本地监测仪表盘 |
 | `doctor` | 检查插件资源完整性；`doctor --fork true` 额外检查原生分支能力 |
 
@@ -151,6 +186,7 @@ node "$AUTOSWITCH" connection-status  # 检查接入状态
 | `gateway_configuration_changed` | 主备配置已经变更，新开一个会话 |
 | `gateway_not_ready` | CCSwitch 未运行、默认卡不是主渠道，或自动故障转移未关闭 |
 | `upgrade_required` | 插件升级后旧网关进程仍在运行，执行 `gateway-stop` 再 `gateway-start` |
+| `OFFICIAL_UNREACHABLE` / `official_network_unreachable` | 网关连不上 OpenAI Official（如 `ECONNRESET via a direct connection`），是本机网络或代理问题，不是账号或指纹问题。用 `network` 查看，必要时用 `network --official-proxy` 指定代理 |
 
 如果网关起不来（例如 hooks 用到的 `node` 版本太旧），新会话开始时会提示具体原因，并给出 `disconnect` 命令，让你先恢复原来的 Codex 入口。
 
@@ -185,10 +221,41 @@ codex plugin marketplace remove modeltrace-autoswitch
 
 ## 开发
 
+### 为新模型采集参考指纹
+
+仅在用户明确要求并授权额度消耗时运行。`collect-native-reference.mjs` 使用当前 Codex home 的原生登录和 CCSwitch 中无账号绑定的 `OpenAI Official`，独立创建一次性会话。它保留全局默认卡，通过网关选择官方固定 HTTPS 路径；不会读取认证文件，也不使用手写推理请求。
+
+```sh
+node scripts/collect-native-reference.mjs \
+  --plugin-root /absolute/installed/plugin/cache \
+  --model gpt-6.1-sol --reasoning-effort max \
+  --output /absolute/new/collection-directory \
+  --limit 36 --max-credits 65
+```
+
+每次请求仅回答一次，原始输出和 token 用量先落盘，再验证完整官方 `response.completed` 回执。拒绝响应中断、路由变化、明显数量偏离及规则序列；不会自动写入训练库。输出目录必须是新目录，`--offset N --limit M` 可从已完成的任务之后分段续采。采集按每百万非缓存输入/缓存输入/输出 token 为 50/2.5/250 credits 估算用量，并在下一条请求前预留 2.5 credits；这是请求前估算，单条真实消耗仍可能超过预留，不代表订阅额度的百分比。
+
+`--split heldout --suite-json /absolute/new-challenges.json` 用于不进入训练的独立验证。验证任务应使用新的 challenge ID 和真实监测提示词；参考数据和留出数据须分别保存。新模型需完整覆盖现有 12 个环境、36 个 `query-*`，确认来源与质量后才合并到 `data/gpt_reference.jsonl`，重建 GPT、统一库和静态站点数据，执行下面的打包与检查。参考采集入口不由普通监测自动调用。
+
+合并参考并重建库后，使用独立样本离线评分：
+
+```sh
+node scripts/evaluate-native-reference.mjs \
+  --bank data/unified_bank.json --model gpt-6.1-sol \
+  --samples /absolute/heldout-directory/samples.jsonl
+```
+
+该评估检查官方回执、训练/留出分离和重复输出，仅报告候选及相似度；少量独立样本不能证明长期或同上下文的误报率。
+
+`gpt-6.1-sol` 的本次参考设置是 `max`、Standard、Codex CLI 0.163.0。其他推理强度、长上下文和更多语言的准确率仍需分别验证。
+
+**已知区分限制：** 这批数据中 `gpt-6.1-sol` 与 `gpt-6-astra` 的数字分布容易混淆。新增模型的单次分组交叉验证仅正确 19/36，实际监测提示词的独立官方样本正确 4/6，另 2 条被归为 `gpt-6-astra`。指纹已收录，但这对模型的单次结果不足以可靠识别替换。因此插件把这两个模型登记为**已知混淆组**（`codex-plugin/modeltrace-guard/assets/confusable-groups.json`）：预期是其中一个、第一候选是另一个，且组内合计权重 ≥ 0.5 时按兼容计，不暂停、不发起切换；切换到 Official 的目标验证也按同一口径通过。代价是这两个模型之间的真实替换检测不到（本来就分不清）；组外模型（例如被判成 `gpt-5.6-luna`）的判定不变。混淆组绑定指纹库哈希，重建指纹库后自动失效，直到重新验证。完整采集与验证记录见 [验收记录](docs/GPT-6.1-SOL-REFERENCE.md)。
+
 ```sh
 npm test                               # 运行全部测试
 npm run build                          # 重新打包插件资源
 MODELTRACE_PYTHON=python3 npm run check  # 分发检查 + Python/JS 评分一致性（需要 NumPy）
+node codex-plugin/validate-reference-data.mjs # 已登记模型的来源、数量与质量检查
 ```
 
 ```text

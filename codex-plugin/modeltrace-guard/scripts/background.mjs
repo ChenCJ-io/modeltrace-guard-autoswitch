@@ -26,6 +26,13 @@ async function backgroundNotice(event, directory, session, confirmationId) {
   return withState(directory, session, (state) => {
     if (state.autoSwitch?.noticePending) {
       state.autoSwitch.noticePending = false;
+      const r = state.switchRequest;
+      if (r?.kind === 'manual' && r.status === 'failed') {
+        const sample = state.samples.at(-1);
+        // Only a sample scored during this request is its canary result.
+        const candidate = sample && sample.at >= r.createdAt ? ` Fingerprint candidate: ${JSON.stringify(sample.prediction)} (outcome ${JSON.stringify(sample.outcome)}).` : '';
+        return injected(event, `ModelTrace AutoSwitch: the user-requested switch to ${JSON.stringify(r.target.name)} did not pass verification (${JSON.stringify(r.reason)}). This thread keeps ${JSON.stringify(state.autoSwitch.current?.name)} and the pause is released.${candidate} Tell the user briefly; a fingerprint candidate is not proof of substitution. Continue the original task on the current route only if it is still requested; another attempt needs a new explicit user request.`);
+      }
       const personal = state.autoSwitch.current?.transport === 'official';
       const monitoring = !personal ? 'Monitoring continues on the selected third-party route; any later switch requires new consent.' : state.enabled
         ? 'Diagnostic monitoring is currently enabled again; its probes use the personal subscription. Automatic switching remains stopped.'
@@ -133,5 +140,6 @@ export async function waitForSwitch(directory, session, id, { timeoutMs = 30000,
   } while (true);
   return { ...summarize(state, directory), waiting: isRecoveryActive(state), controlContext: controlContext(state, directory),
     notificationContext: notificationContext(state, directory), agentAction: state.switchRequest.status === 'succeeded'
-      ? 'autoswitch_verified' : isRecoveryActive(state) ? 'wait_for_route_verification' : 'stop_and_notify_user' };
+      ? 'autoswitch_verified' : isRecoveryActive(state) ? 'wait_for_route_verification'
+        : state.switchRequest.kind === 'manual' ? 'report_switch_failed_current_route_kept' : 'stop_and_notify_user' };
 }

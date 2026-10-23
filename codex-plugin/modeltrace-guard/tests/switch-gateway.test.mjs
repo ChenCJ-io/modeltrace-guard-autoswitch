@@ -235,6 +235,9 @@ test('HTTP 200 failures, missing terminals and unterminated SSE frames never bec
     { data: 'data: {"type":"response.output_text.delta","delta":"response.completed"}\n\n', event: null },
     { data: 'event: response.completed\ndata: {"type":"response.failed"}\n\n', event: 'response.completed' },
     { data: 'data: {"type":"response.completed","response":{"status":"failed"}}\n\n', event: 'response.completed' },
+    { data: 'event: response.output_text.delta\ndata: {"type":"response.completed"}\n\n', event: 'response.completed' },
+    { data: 'data: {"type":"response.output_text.delta","status":"completed"}\n\n', event: null },
+    { data: DONE + 'data: [DONE]' + ' '.repeat(64) + 'malformed\n\n', event: 'response.completed' },
   ];
   const f = await fixture(t, (_req, res, _seen, index) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(cases[index - 1].data); });
   for (const [index, expected] of cases.entries()) {
@@ -260,6 +263,76 @@ test('large SSE events remain byte-exact and completion can be observed with a b
   }
 });
 
+test('oversized terminal data must be complete valid JSON and all status/type metadata must agree', async (t) => {
+  const output = 'synthetic'.repeat(30_000);
+  const valid = JSON.stringify({ type: 'response.completed', response: { output, status: 'completed' } });
+  const invalidData = [
+    valid.slice(0, -1),
+    valid + ' trailing',
+    JSON.stringify({ type: 'response.completed', response: { output, status: 'failed' } }),
+    JSON.stringify({ type: 'response.completed', response: { output, status: 'incomplete' } }),
+    JSON.stringify({ response: { output, status: 'completed' }, type: 'response.failed' }),
+    JSON.stringify({ response: { output, status: 'completed' }, type: 'response.output_text.delta' }),
+    `{"type":"response.completed","response":{"output":"${output}" BROKEN,"status":"completed"}}`,
+    `{"type":"response.completed","response":{"output":"${output}","status":"completed"},"type":"response.failed"}`,
+    JSON.stringify({ type: 'response.completed', response: { output, status: 'completed' }, error: { message: 'synthetic' } }),
+  ];
+  const cases = invalidData.flatMap(data => [
+    { body: `event: response.completed\ndata: ${data}\n\n`, headers: {} },
+    { body: `event: response.completed\ndata: ${data}\n\n`, headers: { 'content-type': 'text/event-stream' } },
+  ]);
+  const f = await fixture(t, (_req, res, _seen, index) => {
+    const { body, headers } = cases[index - 1];
+    res.writeHead(200, headers); res.end(body);
+  });
+  for (const [index, expected] of cases.entries()) {
+    assert.equal((await send(f.gateway)).body, expected.body);
+    await until(() => f.receipts.length === index + 1);
+    assert.equal(f.receipts[index].completed, true);
+    assert.equal(f.receipts[index].success, false, `oversized case ${index}`);
+  }
+});
+
+test('terminal JSON validates nested values, escapes and numeric grammar without retaining output strings', async (t) => {
+  const valid = [
+    '{"type":"response.completed","response":{"status":"completed","output":{"a":[],"b":{},"c":[true,false,null,0,-1,1.5,-3e+20]}},"error":null}',
+    '{"type":"response.completed","response":{"status":"completed","output":"quote: \\" slash: \\\\ control: \\n unicode: \\u4e2d"}}',
+    '{"\\u0074ype":"response.completed","response":{"\\u0073tatus":"completed"}}',
+    JSON.stringify({ type: 'response.completed', response: { status: 'completed', output: 'x'.repeat(270_000) } }),
+  ];
+  const malformed = [
+    '{"type":"response.completed","output":[1,]}',
+    '{"type":"response.completed",}',
+    '{"type":"response.completed","output":{"x" 1}}',
+    '{"type":"response.completed","output":01}',
+    '{"type":"response.completed","output":1.}',
+    '{"type":"response.completed","output":1e}',
+    '{"type":"response.completed","output":tru}',
+    '{"type":"response.completed","output":"\\q"}',
+    '{"type":"response.completed","output":"\\u0xz0"}',
+    '{"type":"response.completed","output":"raw\nnewline"}',
+    '{"type":"response.completed","response":{"status":"completed","status":"failed"}}',
+    '{"type":"response.completed","response":{"status":"completed"},"response":{"status":"failed"}}',
+    '{"type":"response.completed","response":{"status":null}}',
+    '{"type":"response.completed","type":null}',
+  ];
+  const cases = [...valid.map(body => ({ body, success: true })), ...malformed.map(body => ({ body, success: false }))]
+    .flatMap(row => [{ ...row, format: 'sse' }, { ...row, format: 'json' }]);
+  const f = await fixture(t, (_req, res, _seen, index) => {
+    const { body, format } = cases[index - 1];
+    res.writeHead(200, { 'content-type': format === 'sse' ? 'text/event-stream' : 'application/json' });
+    const text = format === 'sse' ? `data: ${body}\n\n` : body;
+    for (let offset = 0; offset < text.length; offset += 127) res.write(text.slice(offset, offset + 127));
+    res.end();
+  });
+  for (const [index, expected] of cases.entries()) {
+    const result = await send(f.gateway);
+    assert.equal(result.body, expected.format === 'sse' ? `data: ${expected.body}\n\n` : expected.body);
+    await until(() => f.receipts.length === index + 1);
+    assert.equal(f.receipts[index].success, expected.success, `JSON grammar case ${index}`);
+  }
+});
+
 test('JSON response terminal statuses work while compaction cannot masquerade as a generation canary', async (t) => {
   const bodies = [{ object: 'response', status: 'completed' }, { object: 'response', status: 'failed' }, { error: { message: 'synthetic' } },
     { object: 'response.compaction', output: [{ type: 'compaction', encrypted_content: 'synthetic' }] }];
@@ -271,6 +344,75 @@ test('JSON response terminal statuses work while compaction cannot masquerade as
     assert.equal(f.receipts[i].success, i === 0);
   }
   assert.equal(f.received[3].path, '/v1/responses/compact');
+});
+
+test('missing Content-Type accepts only complete SSE or JSON terminal evidence and preserves response bytes', async (t) => {
+  const cases = [
+    { body: ': upstream ping\r\n\r\n' + DONE, success: true, event: 'response.completed' },
+    { body: '\ufeffevent: response.created\ndata: {"type":"response.created"}\n\n' + DONE, success: true, event: 'response.completed' },
+    { body: ' \n{"object":"response","status":"completed"}', success: true, event: 'response.completed' },
+    { body: `data: ${JSON.stringify({ type: 'response.completed', response: { output: 'synthetic'.repeat(30_000), status: 'completed' } })}\n\n`, success: true, event: 'response.completed' },
+    { body: 'data: {"type":"response.failed"}\n\n', success: false, event: 'response.failed' },
+    { body: DONE + 'data: {"type":"response.incomplete"}\n\n', success: false, event: 'response.incomplete' },
+    { body: 'event: error\ndata: {"error":{"message":"synthetic"}}\n\n', success: false, event: 'error' },
+    { body: '{"status":"failed"}', success: false, event: 'response.failed' },
+    { body: '{"error":{"message":"synthetic"}}', success: false, event: 'error' },
+    { body: 'data: [DONE]\n\n', success: false, event: null },
+    { body: 'data: {"type":"response.completed"}', success: false, event: null },
+    { body: 'data: {"type":"response.completed"}\n', success: false, event: null },
+    { body: 'event: response.completed\ndata: {"type":"response.failed"}\n\n', success: false, event: 'response.completed' },
+    { body: 'data: {"type":"response.completed","response":{"status":"failed"}}\n\n', success: false, event: 'response.completed' },
+    { body: 'data: {"type":"response.completed" invalid}\n\n', success: false, event: null },
+    { body: '{"status":"completed"', success: false, event: null },
+    { body: '{"status":"completed"} trailing', success: false, event: null },
+    { body: '<html>response.completed</html>', success: false, event: null },
+    { body: 'x'.repeat(128_000) + DONE, success: false, event: null },
+    { body: DONE, headers: { 'content-type': 'text/plain' }, success: false, event: null },
+    { body: DONE, headers: { 'content-encoding': 'synthetic-unknown' }, success: false, event: null },
+  ];
+  const f = await fixture(t, (_req, res, _seen, index) => {
+    const { body, headers } = cases[index - 1];
+    res.writeHead(200, headers || {});
+    if (index <= 3) {
+      for (const byte of Buffer.from(body)) res.write(Buffer.from([byte]));
+    } else res.write(body);
+    res.end();
+  });
+  for (const [index, expected] of cases.entries()) {
+    const result = await send(f.gateway);
+    assert.equal(result.body, expected.body);
+    assert.equal(result.headers['content-type'], expected.headers?.['content-type']);
+    await until(() => f.receipts.length === index + 1);
+    assert.equal(f.receipts[index].completed, true);
+    assert.equal(f.receipts[index].success, expected.success, `case ${index}`);
+    assert.equal(f.receipts[index].responseEvent, expected.event, `case ${index}`);
+  }
+});
+
+test('missing Content-Type recognition survives separately delivered UTF-8 BOM and SSE prefix chunks', async (t) => {
+  const chunks = [Buffer.from([0xef]), Buffer.from([0xbb]), Buffer.from([0xbf]), Buffer.from('ev'), Buffer.from('ent:'), Buffer.from(DONE.slice(6))];
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200); res.flushHeaders();
+    void (async () => {
+      for (const chunk of chunks) { res.write(chunk); await delay(1); }
+      res.end();
+    })();
+  });
+  assert.equal((await send(f.gateway)).body, '\ufeff' + DONE);
+  await until(() => f.receipts.length === 1);
+  assert.equal(f.receipts[0].success, true); assert.equal(f.receipts[0].responseEvent, 'response.completed');
+});
+
+test('missing Content-Type cannot make an interrupted response successful after a terminal event', async (t) => {
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200); res.write(DONE);
+    setTimeout(() => res.destroy(), 20);
+  });
+  const result = await send(f.gateway, { tolerateAbort: true });
+  assert.equal(result.body, DONE); assert.equal(result.aborted, true);
+  await until(() => f.receipts.length === 1);
+  assert.equal(f.receipts[0].completed, false); assert.equal(f.receipts[0].success, false);
+  assert.equal(f.received.length, 1);
 });
 
 test('bounded gzip, deflate and available zstd decoding retain request content and remove encoding headers', async (t) => {
@@ -673,4 +815,65 @@ test('an interrupted official error body and an already-streaming SSE error are 
   assert.equal((await send(f.gateway, { body })).status, 200);
   assert.equal(f.received.length, 2);
   await until(() => f.receipts.length === 2); assert.ok(f.receipts.every((receipt) => !receipt.success));
+});
+
+test('an unreachable Official upstream reports its socket code and redacted egress in the 502 and the receipt', async t => {
+  const closed = createServer();
+  await new Promise((resolve) => closed.listen(0, '127.0.0.1', resolve));
+  const deadPort = closed.address().port;
+  await new Promise((resolve) => closed.close(resolve));
+  let invalidated = 0;
+  const f = await fixture(t, undefined, {
+    resolveRoute: async () => ({ route: 'fallback', transport: 'official', providerId: 'official-test', revision: 3 }),
+    officialNetwork: { resolve: async () => ({ mode: 'auto', source: 'system', proxy: 'http://synthetic-user:synthetic-password@127.0.0.1:7897', proxyEnv: {} }),
+      invalidate() { invalidated++; } },
+    officialRequestImpl: (target, settings, callback) => httpRequest(`http://127.0.0.1:${deadPort}${target.pathname}`, { method: settings.method, headers: settings.headers, agent: false }, callback),
+  });
+  const response = await send(f.gateway);
+  assert.equal(response.status, 502);
+  assert.equal(JSON.parse(response.body).error.message, 'Official transport is unavailable (ECONNREFUSED; network system: http://***@127.0.0.1:7897)');
+  assert.doesNotMatch(response.body, /synthetic-(user|password)/);
+  await until(() => f.receipts.length === 1);
+  const receipt = f.receipts[0];
+  assert.equal(receipt.statusCode, 502); assert.equal(receipt.success, false); assert.equal(receipt.completed, false);
+  assert.equal(receipt.transportError, 'ECONNREFUSED'); assert.equal(receipt.networkSource, 'system');
+  assert.doesNotMatch(JSON.stringify(receipt), /synthetic|7897/);
+  assert.equal(invalidated, 1, 'the next request re-resolves egress');
+  assert.equal(f.received.length, 0);
+});
+
+test('the network endpoint reports this process egress with a credential-free reachability check', async t => {
+  const forced = [];
+  const f = await officialFixture(t, (_req, res) => { res.writeHead(405, { 'content-type': 'application/json' }); res.end('{}'); }, {
+    officialNetwork: { resolve: async ({ force }) => { forced.push(force); return { mode: 'explicit', source: 'setting',
+      proxy: 'http://synthetic-user:synthetic-password@proxy.invalid:8080', proxyEnv: {} }; } },
+  });
+  const response = await send(f.gateway, { path: '/network', method: 'GET', body: null, thread: null });
+  assert.equal(response.status, 200);
+  const { official, implementationVersion } = JSON.parse(response.body);
+  assert.equal(implementationVersion, GATEWAY_IMPLEMENTATION_VERSION);
+  assert.equal(typeof official.elapsedMs, 'number'); delete official.elapsedMs;
+  assert.deepEqual(official, { mode: 'explicit', source: 'setting', proxy: 'http://***@proxy.invalid:8080', reachable: true, statusCode: 405 });
+  assert.deepEqual(forced, [true], 'the check always re-reads the setting and system proxy');
+  assert.deepEqual(f.officialCalls, [{ url: 'https://chatgpt.com/backend-api/codex/responses', headers: {}, rejectUnauthorized: true }],
+    'no native authorization or capability reaches the reachability request');
+  assert.equal(f.received[0].method, 'GET');
+  assert.doesNotMatch(response.body, /synthetic-(user|password)/);
+  assert.equal((await send(f.gateway, { path: '/network', body: null, thread: null })).status, 405);
+  assert.equal((await send(f.gateway, { rawPath: '/wrong-capability-123456/v1/network', method: 'GET', body: null, thread: null })).status, 404);
+  assert.equal((await send(f.gateway, { rawPath: `/${TOKEN}/v1/network?x=1`, method: 'GET', body: null, thread: null })).status, 404);
+  assert.equal(f.receipts.length, 0, 'a network check is not a routed request');
+});
+
+test('an unsupported Official environment is reported by the network endpoint without failing the gateway', async t => {
+  const previous = process.env.ALL_PROXY;
+  process.env.ALL_PROXY = 'socks5://synthetic-user:synthetic-password@proxy.invalid:1080';
+  t.after(() => { if (previous === undefined) delete process.env.ALL_PROXY; else process.env.ALL_PROXY = previous; });
+  const f = await officialFixture(t, undefined, { officialNetwork: { resolve: async () => assert.fail('unsupported environments never resolve egress') } });
+  const response = await send(f.gateway, { path: '/network', method: 'GET', body: null, thread: null });
+  assert.equal(response.status, 200);
+  const { official } = JSON.parse(response.body);
+  assert.equal(official.reachable, false); assert.equal(official.error, 'OFFICIAL_TRANSPORT_UNSUPPORTED_ENV');
+  assert.match(official.message, /ALL_PROXY/); assert.doesNotMatch(response.body, /synthetic-password/);
+  assert.equal(f.officialCalls.length, 0);
 });

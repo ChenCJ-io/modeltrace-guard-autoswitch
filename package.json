@@ -1,6 +1,6 @@
 {
   "name": "modeltrace-guard-autoswitch-workspace",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "description": "ModelTrace monitoring in ordinary Codex conversations with one-time gateway setup and per-incident consent for route switching.",
   "author": "xqy2006",

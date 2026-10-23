@@ -12,7 +12,7 @@ import { ROOT, handleHook, loadArtifacts, run } from '../scripts/guard.mjs';
 import { handleBackgroundHook, waitForSwitch } from '../scripts/background.mjs';
 import { readState, sessionPath, withState } from '../scripts/state.mjs';
 import {
-  atomicJSON, approveSwitch, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig,
+  atomicJSON, approveSwitch, configPath, configureGateway, enableAutoSwitch, loadGatewayConfig, requestManualSwitch,
   readReceipt, resolveSessionRoute, saveReceipt, verifyGatewayRoute,
 } from '../scripts/switch-policy.mjs';
 import { startSwitchGateway } from '../scripts/switch-gateway.mjs';
@@ -47,7 +47,11 @@ async function fixture(t) {
   const originalHistory = [{ id: 'original-turn', status: 'completed', goal: 'Keep the original task unchanged' }];
   const historyBefore = structuredClone(originalHistory);
   const fallbackStarted = deferred(), releaseFallback = deferred();
-  let holdFallback = false, fallbackValue = 7, clientsClosed = 0, gateway, config;
+  let holdFallback = false, fallbackValue = 7, clientsClosed = 0, gateway, config, officialDown = false, lateEof = false, nativeClose = false, sourceValue = 1;
+  const closed = createServer();
+  await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
+  const deadPort = closed.address().port;
+  await new Promise(resolve => closed.close(resolve));
   const upstream = createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -60,12 +64,15 @@ async function fixture(t) {
       await releaseFallback.promise;
     }
     if (res.destroyed) return;
-    const text = sampleText(counts.get(threadId) || 300, route === 'source' ? 1 : fallbackValue);
+    const text = sampleText(counts.get(threadId) || 300, route === 'source' ? sourceValue : fallbackValue);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.end(`data: ${JSON.stringify({ type: 'response.completed', response: {
+    const completed = `data: ${JSON.stringify({ type: 'response.completed', response: {
       status: 'completed', model: body.model,
       output: [{ type: 'message', content: [{ type: 'output_text', text }] }],
-    } })}\n\n`);
+    } })}\n\n`;
+    // Official through a proxy can close the stream a moment after response.completed.
+    if (route === 'fallback' && lateEof) { res.write(completed); setTimeout(() => res.end(), 300); }
+    else res.end(completed);
   });
   t.after(async () => {
     releaseFallback.resolve();
@@ -98,7 +105,7 @@ async function fixture(t) {
     resolveRoute: (thread, initial) => resolveSessionRoute(directory, config, thread, initial),
     officialRequestImpl: (target, { method, headers }, callback) => {
       assert.equal(target.origin, 'https://chatgpt.com');
-      return httpRequest(`http://127.0.0.1:${upstreamPort}${target.pathname}`, { method, headers, agent: false }, callback);
+      return httpRequest(`http://127.0.0.1:${officialDown ? deadPort : upstreamPort}${target.pathname}`, { method, headers, agent: false }, callback);
     },
     onReceipt: async receipt => {
       // Exercise the real race: response completion precedes receipt publication.
@@ -114,9 +121,26 @@ async function fixture(t) {
       headers: { 'content-type': 'application/json', 'thread-id': threadId },
       body: JSON.stringify({ model: expected.model, stream: true, input: [{ role: 'user', content: 'Synthetic workflow fixture' }] }),
     });
+    // Like Codex after its retries: the final error carries the gateway's text.
+    if (response.status !== 200 && officialDown) throw Object.assign(new Error('Codex probe inference failed; no sample accepted'),
+      { upstream: { message: await response.text(), kind: 'responseTooManyFailedAttempts', httpStatusCode: response.status } });
     assert.equal(response.status, 200);
     const event = JSON.parse((await response.text()).trim().slice('data: '.length));
     return event.response.output[0].content[0].text;
+  }
+  // Like native Codex: stop reading as soon as response.completed has arrived.
+  async function nativeRequest(base, threadId) {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/responses`, { method: 'POST', redirect: 'error', signal: controller.signal,
+      headers: { 'content-type': 'application/json', 'thread-id': threadId },
+      body: JSON.stringify({ model: expected.model, stream: true, input: [{ role: 'user', content: 'Synthetic workflow fixture' }] }),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let raw = '';
+    while (!raw.includes('\n\n')) { const { value, done } = await reader.read(); if (done) break; raw += decoder.decode(value, { stream: true }); }
+    controller.abort();
+    return JSON.parse(raw.trim().slice('data: '.length)).response.output[0].content[0].text;
   }
   await request(session);
   await until(async () => (await readReceipt(directory, session))?.success);
@@ -145,6 +169,11 @@ async function fixture(t) {
       assert.equal(await isCancelled(), false);
       assert.ok(forks.includes(forkId));
       counts.set(forkId, pending.count);
+      if (nativeClose) {
+        // Use the base URL the fork was really given (the draining relay).
+        const fork = nativeCalls.findLast(call => call.method === 'thread/fork' && call.params.ephemeral);
+        return { text: await nativeRequest(fork.params.config.openai_base_url, forkId) };
+      }
       return { text: await request(forkId) };
     },
   };
@@ -167,6 +196,11 @@ async function fixture(t) {
     return approveSwitch(directory, session, current.switchRequest.id, current.switchRequest.target.id,
       { accountType: 'chatgpt', modelProvider: 'openai', model: expected.model });
   }
+  // A user-requested switch; the user's message (reply) precedes the command.
+  async function manualSwitch(name) {
+    await reply();
+    return requestManualSwitch(directory, session, { name }, { accountType: 'chatgpt', modelProvider: 'openai', model: expected.model });
+  }
   async function reachHalt() {
     await background();
     const current = await state();
@@ -180,10 +214,10 @@ async function fixture(t) {
     assert.ok(current.samples.every(row => row.fork.routing.route === 'source' && row.fork.routing.success));
     return current;
   }
-  return { directory, session, sibling, state, background, acknowledge, reply, approve, reachHalt, request,
+  return { directory, session, sibling, state, background, acknowledge, reply, approve, reachHalt, request, manualSwitch,
     bases, forks, nativeCalls, upstreamRequests, originalHistory, historyBefore, clientsClosed: () => clientsClosed,
     holdFallback() { holdFallback = true; }, fallbackStarted: fallbackStarted.promise,
-    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; } };
+    releaseFallback: () => releaseFallback.resolve(), mismatchFallback() { fallbackValue = 1; }, officialUnreachable() { officialDown = true; }, officialLateEof() { lateEof = true; nativeClose = true; }, primaryRecovered() { sourceValue = 7; } };
 }
 
 test('first mismatch asks, acknowledgement spends no backup quota, and explicit consent verifies and switches this thread', async t => {
@@ -270,6 +304,120 @@ test('a completed fallback request with an incompatible fingerprint retains the 
   assert.equal(current.probeRun, null);
   assert.equal(current.forkSnapshot, null);
   assert.deepEqual(f.originalHistory, f.historyBefore);
+});
+
+test('an unreachable Official canary fails with gateway evidence and keeps the halt and source route', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  f.officialUnreachable();
+  await f.acknowledge();
+  await f.reply();
+  await f.approve();
+  await f.background();
+  const current = await f.state();
+  assert.equal(current.autoSwitch.phase, 'failed'); assert.equal(current.autoSwitch.route, 'source');
+  assert.equal(current.switchRequest.status, 'failed'); assert.equal(current.switchRequest.reason, 'fork_probe_failed');
+  assert.equal(current.taskHalt.id, halted.taskHalt.id);
+  const { diagnostic } = current.forkHealth;
+  assert.equal(diagnostic.stage, 'inference'); assert.equal(diagnostic.code, 'probe_failed');
+  assert.deepEqual(diagnostic.gateway, { statusCode: 502, completed: false, success: false, responseEvent: null,
+    transport: 'official', transportError: 'ECONNREFUSED', networkSource: 'environment' });
+  assert.match(diagnostic.upstream.message, /Official transport is unavailable \(ECONNREFUSED; network environment: direct\)/);
+  assert.equal(diagnostic.upstream.httpStatusCode, 502);
+  assert.ok(current.events.some(e => e.type === 'fork_probe_failed' && e.diagnostic.gateway?.transportError === 'ECONNREFUSED'));
+  const result = await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
+  assert.equal(result.agentAction, 'stop_and_notify_user');
+  assert.equal(current.probeRun, null); assert.equal(current.forkSnapshot, null);
+  assert.deepEqual(f.originalHistory, f.historyBefore);
+});
+
+test('Official closing its stream after response.completed still verifies when native Codex stops reading early', async t => {
+  const f = await fixture(t), halted = await f.reachHalt();
+  f.officialLateEof();
+  await f.acknowledge();
+  await f.reply();
+  await f.approve();
+  await f.background();
+  const current = await f.state();
+  const result = await waitForSwitch(f.directory, f.session, halted.switchRequest.id, { timeoutMs: 0 });
+  assert.equal(result.agentAction, 'autoswitch_verified', JSON.stringify(current.forkHealth));
+  assert.equal(current.autoSwitch.phase, 'switched'); assert.equal(current.autoSwitch.route, 'fallback');
+  assert.equal(current.taskHalt, null);
+  const routing = current.samples.at(-1).fork.routing;
+  assert.equal(routing.transport, 'official'); assert.equal(routing.completed, true); assert.equal(routing.success, true);
+  assert.equal(routing.threadId, f.forks.at(-1));
+  assert.deepEqual(f.originalHistory, f.historyBefore);
+});
+
+test('switching back to the primary verifies first: a still-degraded primary keeps Official, a recovered one is restored and monitored', async t => {
+  const f = await fixture(t);
+  await f.reachHalt();
+  await f.acknowledge(); await f.reply(); await f.approve(); await f.background();
+  let current = await f.state();
+  assert.equal(current.autoSwitch.current.transport, 'official'); assert.equal(current.enabled, false);
+  const official = current.autoSwitch.current, stoppedAt = current.autoSwitch.monitoringStoppedAt;
+
+  // The primary still serves the other model: the canary must stop the switch.
+  const degraded = await f.manualSwitch('API2');
+  assert.equal(degraded.kind, 'manual'); assert.equal(degraded.status, 'verifying');
+  assert.ok((await f.state()).taskHalt, 'work pauses while the target is verified');
+  const failedNotice = await f.background();
+  current = await f.state();
+  assert.equal(current.switchRequest.status, 'failed'); assert.equal(current.switchRequest.reason, 'approved_target_verification_failed');
+  assert.deepEqual(current.autoSwitch.current, official, 'the thread keeps Official');
+  assert.equal(current.taskHalt, null, 'a failed user-requested switch releases the pause');
+  assert.equal(current.enabled, false); assert.equal(current.monitoringStoppedReason, 'personal_route');
+  assert.equal(current.autoSwitch.enabled, false); assert.equal(current.autoSwitch.monitoringStoppedAt, stoppedAt);
+  assert.equal(current.autoSwitch.phase, 'switched'); assert.equal(current.pending, null);
+  assert.notEqual(current.samples.at(-1).prediction, current.expected);
+  assert.match(failedNotice.hookSpecificOutput.additionalContext, /did not pass verification[\s\S]*keeps "Official"/);
+  assert.equal((await waitForSwitch(f.directory, f.session, degraded.id, { timeoutMs: 0 })).agentAction, 'report_switch_failed_current_route_kept');
+  assert.equal(f.upstreamRequests.at(-1).route, 'source', 'the canary really went through the primary route');
+  await f.request(f.session);
+  assert.equal(f.upstreamRequests.at(-1).route, 'fallback', 'ordinary requests still use Official');
+
+  // After the primary recovers, the same request passes and monitoring resumes there.
+  f.primaryRecovered();
+  const recovered = await f.manualSwitch('API2');
+  const notice = await f.background();
+  current = await f.state();
+  assert.equal(current.switchRequest.id, recovered.id); assert.equal(current.switchRequest.status, 'succeeded');
+  assert.equal(current.autoSwitch.current.id, current.autoSwitch.primary.id); assert.equal(current.autoSwitch.route, 'source');
+  assert.equal(current.taskHalt, null); assert.equal(current.enabled, true, 'monitoring resumes on the primary');
+  assert.equal(current.autoSwitch.enabled, true); assert.equal(current.monitoringStoppedReason, null);
+  assert.ok(current.nextTools > current.workTools, 'a later checkpoint is scheduled');
+  assert.match(notice.hookSpecificOutput.additionalContext, /verification completed successfully/);
+  await f.request(f.session);
+  assert.equal(f.upstreamRequests.at(-1).route, 'source');
+  assert.deepEqual(f.originalHistory, f.historyBefore);
+});
+
+test('a user-requested switch needs the user message, a different route and no open incident', async t => {
+  const f = await fixture(t);
+  f.primaryRecovered(); // the queued routine checkpoint stays compatible
+  const readiness = { accountType: 'chatgpt', modelProvider: 'openai', model: (await f.state()).model };
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Official' }, readiness), /user's reply/, 'the agent cannot switch on its own');
+  await f.reply();
+  assert.equal((await f.state()).taskHalt, null);
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'API2' }, readiness), /already uses/);
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Official' }, { ...readiness, model: 'other' }), /settings changed/);
+  await assert.rejects(requestManualSwitch(f.directory, f.session, { name: 'Missing card' }, readiness), /not found/);
+  await assert.rejects(requestManualSwitch(f.directory, f.sibling, { name: 'Official' }, readiness), /enable it with use first/);
+  // During an incident the incident flow (propose/approve/decline) owns the decision.
+  const g = await fixture(t);
+  await g.reachHalt();
+  await g.reply();
+  await assert.rejects(requestManualSwitch(g.directory, g.session, { name: 'Official' }, readiness), /incident or switch request is still open/);
+});
+
+test('switching to Official on request verifies once and then stops personal monitoring', async t => {
+  const f = await fixture(t);
+  f.primaryRecovered();
+  await f.manualSwitch('Official');
+  await f.background();
+  const current = await f.state();
+  assert.equal(current.switchRequest.status, 'succeeded'); assert.equal(current.autoSwitch.current.transport, 'official');
+  assert.equal(current.enabled, false); assert.equal(current.monitoringStoppedReason, 'personal_route');
+  assert.equal(f.upstreamRequests.filter(row => row.route === 'fallback').length, 1, 'exactly one personal-subscription canary');
 });
 
 test('Interrupt during a fallback request prevents a later successful receipt from clearing the halt', async t => {

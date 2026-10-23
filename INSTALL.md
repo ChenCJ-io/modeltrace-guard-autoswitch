@@ -1,4 +1,4 @@
-# 安装 ModelTrace Guard Autoswitch 0.4.2
+# 安装 ModelTrace Guard Autoswitch 0.4.3
 
 这是安装前给 Codex 和使用者的入口。用户提供仓库 URL 或本地目录后，先读取本文件，再运行仓库自带安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
 
@@ -58,6 +58,8 @@ node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs configure \
 安装完成后，在兼容 Codex CLI 的 `/hooks` 中由用户审阅并信任插件。v0.4 增加同步 `SessionStart` 启动 hook，旧版信任不保证覆盖新定义；不要替用户执行信任修改。加载新插件后，由技能处理后续 setup 或“使用 modeltrace-guard-autoswitch”请求，不再让用户手输专用启动器。
 
 主配置和第三方备用须通过 CCSwitch 4.0.15 界面加入 Stack；保留公司默认，不把 Official 设为全局默认。完整网关流程推荐 Node.js 24.5+；22.x 至少为 22.21，25+ 也支持，同时需要 zstd 和官方 HTTPS 的原生 `proxyEnv` 能力；配置检查需要带 `sha3()` 的 `sqlite3` CLI。接入要求当前 Codex home 的原生 ChatGPT 登录与 `openai` 契约；Official 目标还须没有 managed account 或存储的登录快照。
+
+备用为 Official 且本机需要代理才能访问 `chatgpt.com` 时，接入后执行 `node codex-plugin/modeltrace-guard/scripts/autoswitch.mjs network` 确认 `gateway.reachable` 为 `true`。默认 `auto` 会自动使用网关进程的 `HTTPS_PROXY` 或系统 HTTPS 代理；只有用户明确给出代理地址时，才执行 `network --official-proxy http://HOST:PORT`。
 
 0.4.1 的主通道实际使用普通 CCSwitch 默认路由，保留 Codex 协议头和模型名，避免 Stack 清理客户端标记引发 “only allows Codex official clients” 403。默认卡必须仍为配置的主通道，且 CCSwitch 自动故障切换必须关闭；插件只检查，不替用户改卡。第三方备用仍走 Stack，需要单独验证兼容性；Official 备用不受该分支影响。
 
