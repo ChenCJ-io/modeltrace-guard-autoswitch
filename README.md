@@ -87,19 +87,28 @@ node "$AUTOSWITCH" network --official-proxy auto                    # 恢复自�
 
 ### 1. 安装
 
-最简单的方式是把下面这段话发给 Codex（把渠道名换成你在 CCSwitch 里的实际名称）：
+在终端运行两条命令，不需要下载源码：
 
-> 请从 https://github.com/ChenCJ-io/modeltrace-guard-autoswitch 安装这个插件。先读取 INSTALL.md，检查运行环境，完成插件安装、主备配置和普通 Codex 入口接入。主用 CCSwitch 的「我的主渠道」，备用「OpenAI Official」（备用可不填，它只是异常时清单里的推荐项）；配置不存在或重名时列出候选让我选择。需要登录或在 /hooks 中信任插件时引导我完成。
+```sh
+codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch
+codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch
+```
 
-也可以手动安装：
+也可以把下面这段话发给 Codex，让它代劳（渠道名换成你在 CCSwitch 里的实际名称）：
+
+> 请安装 ModelTrace Guard Autoswitch：运行 `codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch` 和 `codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch`，然后按仓库里的 INSTALL.md 检查运行环境、把 CCSwitch 的「我的主渠道」设为主渠道，并接入普通 Codex 入口。配置不存在或重名时列出候选让我选择；需要登录或在 /hooks 中信任插件时引导我完成。
+
+升级到新版本：运行 `codex plugin marketplace upgrade modeltrace-autoswitch`，重启 Codex，再说一次“检查 ModelTrace 环境”；提示网关是旧版本时，让 Codex 重启插件网关。
+
+开发或无法访问 GitHub 时，可以从源码安装：
 
 ```sh
 git clone https://github.com/ChenCJ-io/modeltrace-guard-autoswitch.git
 cd modeltrace-guard-autoswitch
-node scripts/install-plugin.mjs --primary-name "我的主渠道" --backup-name "OpenAI Official"
+node scripts/install-plugin.mjs --primary-name "我的主渠道"
 ```
 
-安装助手只做两件事：安装插件，以及保存你明确给出的主备偏好。它不会改 Codex 默认入口，不会启动网关或监测，也不会替你信任 hooks。
+安装助手只做两件事：安装插件，以及保存你明确给出的主渠道（和可选的推荐备用）。它不会改 Codex 默认入口，不会启动网关或监测，也不会替你信任 hooks。注意源码安装用的是本地插件市场：Codex 每次重启都会把这个目录当时的文件同步进去，在里面切分支或改文件会直接改变正在用的插件，日常使用建议用上面的 GitHub 方式。
 
 ### 2. 信任 hooks
 

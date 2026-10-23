@@ -1,21 +1,32 @@
 # 安装 ModelTrace Guard Autoswitch 0.5.0
 
-这是安装前给 Codex 和使用者的入口。用户提供仓库 URL 或本地目录后，先读取本文件，再运行仓库自带安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
+这是安装前给 Codex 和使用者的入口。用户给出仓库地址时，优先用 Git 插件市场安装（不需要克隆）；给出本地目录时，运行仓库自带的安装助手。不要用关键词解析器猜测主备；由 Codex 将用户表达映射为明确配置名称，实际选择由 CLI 校验。
 
-**安装和配置主备都不授权切换，也不会开启监测或接管原生默认入口。** v0.4 完成一次性接入后，用户照常运行 `codex`，在需要监测的对话里说“使用 modeltrace-guard-autoswitch”。每次首次指纹异常仍须暂停询问，获得本次目标的同意后才验证与切换。
+**安装和配置主备都不授权切换，也不会开启监测或接管原生默认入口。** 完成一次性接入后，用户照常运行 `codex`，在需要监测的对话里说“开启指纹监测”（或“使用 modeltrace-guard-autoswitch”）。每次首次指纹异常仍须暂停询问，获得本次目标的同意后才验证与切换。
 
-## 取得用户指定的源码
+## 推荐：从 GitHub 安装
 
 本 fork 的安装源为 **https://github.com/ChenCJ-io/modeltrace-guard-autoswitch**。上游 `xqy2006/ModelTrace` 是另一项目，不要将其作为本 fork 的安装地址。
 
-若用户给的是 URL，先将其克隆到明确的本地目录，再读该 checkout 的 `INSTALL.md`：
+Codex CLI 0.163+ 可以直接把 Git 仓库加为插件市场，不需要克隆：
+
+```sh
+codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch
+codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch
+```
+
+如果之前用本地目录添加过同名市场 `modeltrace-autoswitch`，先执行 `codex plugin marketplace remove modeltrace-autoswitch`。升级用 `codex plugin marketplace upgrade modeltrace-autoswitch`，再重启 Codex。插件装在 `${CODEX_HOME:-~/.codex}/plugins/cache/modeltrace-autoswitch/modeltrace-guard-autoswitch/<版本>/`，下文的 `codex-plugin/modeltrace-guard/scripts/...` 对应其中的 `scripts/...`。安装后用户说出主渠道时，由技能执行 `autoswitch.mjs configure`。
+
+## 从源码安装
+
+开发或无法访问 GitHub 时，先把仓库克隆到明确的本地目录，再读该 checkout 的 `INSTALL.md`：
 
 ```sh
 git clone https://github.com/ChenCJ-io/modeltrace-guard-autoswitch.git
 cd modeltrace-guard-autoswitch
 ```
 
-若已经有本地源码，直接进入该目录。安装助手只接受本地 checkout，不代为下载远端代码。
+若已经有本地源码，直接进入该目录。安装助手只接受本地 checkout，不代为下载远端代码。源码安装注册的是本地插件市场：Codex 每次重启都会同步该目录当时的文件，切分支或修改文件会直接改变正在使用的插件。
 
 ## 运行安装助手
 

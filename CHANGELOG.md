@@ -3,6 +3,7 @@
 ## 0.5.0（开发中）
 
 - 新增环境检查 `autoswitch.mjs check`（对 Codex 说“检查 ModelTrace 环境”即可）：只读地按顺序检查 Node、sqlite3、Codex 登录、hooks 信任、CCSwitch 代理模式、主渠道（是否仍是那张卡、是否为默认卡、故障转移是否关闭）、网关版本与运行状态、普通入口接入和可切换渠道，每项给出“通过 / 待完成 / 未通过”和修法，`next` 指向第一件要做的事。新用户安装后先跑一次，就知道还差哪几步。
+- 安装简化：Codex CLI 0.163+ 可以直接从 GitHub 添加插件市场，安装只需 `codex plugin marketplace add ChenCJ-io/modeltrace-guard-autoswitch` 和 `codex plugin add modeltrace-guard-autoswitch@modeltrace-autoswitch` 两条命令，升级用 `codex plugin marketplace upgrade modeltrace-autoswitch`（已在隔离的 CODEX_HOME 里实测安装与升级）。源码安装保留给开发，文档注明本地插件市场会在 Codex 重启时同步目录当时的文件。
 - 新增开场渠道提示：会话打开或恢复时，同步启动 hook 直接向用户显示一行，说明本会话走哪个渠道、指纹监测是否开启，以及开启方法（对 Codex 说“开启指纹监测”）。没经过插件网关的会话（例如 CCSwitch 改写了 Codex 配置、或在接入前创建的旧会话）会说明实际去向，如 CCSwitch 当前卡或 OpenAI 官方个人订阅，避免在不知情时消耗个人额度。提示只描述路由类型和渠道名，不输出 URL、网关凭证或登录信息；上下文压缩不重复提示；语言跟随 `MODELTRACE_LANG`、POSIX locale 或 macOS 首选语言。
 - 技能可由“开启指纹监测”“enable fingerprint monitoring”等说法触发，原有“使用 modeltrace-guard-autoswitch”继续有效。
 - 异常时列出全部渠道：新增 `guard.mjs candidates`，实时读取 CCSwitch 中所有 Codex 配置，可选的按“推荐备用、主渠道、官方、其他”编号，写明切换后停止还是继续监测，以及这张卡最近一次的抽查结果（读本地记录）；未加入 CCSwitch 聚合、绑定其他 ChatGPT 账号、官方卡带登录快照、主渠道不再是默认卡或开着故障转移等不可选的卡也会列出并说明原因。列出时把编号绑定到卡的身份（ID + 配置指纹）。
