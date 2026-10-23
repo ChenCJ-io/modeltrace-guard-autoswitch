@@ -1,6 +1,6 @@
 ---
 name: modeltrace-guard
-description: Set up ModelTrace Guard Autoswitch for ordinary codex and use it in the current conversation. Connect future conversations once, enable monitoring per thread, and ask for consent to each target before verification or switching. Installation and setup do not enable monitoring for every conversation or authorize switches.
+description: Set up ModelTrace Guard Autoswitch for ordinary codex and use it in the current conversation. Use when the user says “使用 modeltrace-guard-autoswitch”, “开启指纹监测”, “enable fingerprint monitoring”, asks which route this conversation uses, or asks to switch routes (“切换渠道”). Connect future conversations once, enable monitoring per thread, and ask for consent to each target before verification or switching. Installation and setup do not enable monitoring for every conversation or authorize switches.
 ---
 
 # ModelTrace Guard Autoswitch
@@ -15,7 +15,7 @@ These management instructions apply to the original task. In a runner-created fo
 
 ## Use in an ordinary Codex conversation
 
-When the user says “使用 modeltrace-guard-autoswitch” in a normal `codex` conversation, execute `node <autoswitch> use --session <actual-thread-id>`. Use `CODEX_THREAD_ID` or the trusted native session ID; never invent an ID or monitor another task. Do not ask the user to type a special launcher or start another CLI on their behalf. `use` enables monitoring only after this thread has a successful primary-route gateway receipt; it never grants switch approval.
+When the user says “使用 modeltrace-guard-autoswitch” or asks to turn on fingerprint monitoring (“开启指纹监测”, “enable fingerprint monitoring”) in a normal `codex` conversation, execute `node <autoswitch> use --session <actual-thread-id>`. Use `CODEX_THREAD_ID` or the trusted native session ID; never invent an ID or monitor another task. Do not ask the user to type a special launcher or start another CLI on their behalf. `use` enables monitoring only after this thread has a successful primary-route gateway receipt; it never grants switch approval.
 
 Interpret the result truthfully. `monitoring_enabled` or `alreadyEnabled` applies only to this thread. `personal_route_unmonitored` leaves the initial or selected Official route without automatic probes. `existing_policy` preserves its route, disabled policy and halt; repeated use does not re-arm it. Explicit ordinary personal diagnostics can use `guard start`, but never start those merely to make `use` appear successful.
 
@@ -43,7 +43,7 @@ Setup and ordinary startup must discover the same data directory. `connect` reje
 
 CCSwitch exit, restart or a user card change can rewrite the two defaults; setup does not permanently own them. On a renewed user setup/use request, explicit `connect` may restore gateway defaults only while CCSwitch still selects the configured primary and each current key equals its saved original or old owned value. Any other value remains a conflict. Report the actual result; never bypass these checks or perform background reconnection. This restores future defaults, not a running thread or incident approval.
 
-The synchronous `SessionStart` handler in `startup.mjs` ensures the gateway is started only when this plugin's owned integration is ready. It never enables monitoring, rewrites native defaults or repairs CCSwitch drift automatically. Respect native hook trust; a newly added or changed startup hook needs the user's review in `/hooks`. `gateway-start` alone starts a service and does not connect ordinary Codex defaults.
+The synchronous `SessionStart` handler in `startup.mjs` ensures the gateway is started only when this plugin's owned integration is ready. It never enables monitoring, rewrites native defaults or repairs CCSwitch drift automatically. When a conversation opens or resumes (not after compaction), it also shows the user one line naming the route this conversation uses and whether monitoring is on, and how to turn it on; a conversation that bypasses the gateway is told where it actually goes (for example CCSwitch's current card or a personal Official subscription). The user already sees this line, so do not repeat it unless asked. For a new conversation it names the route its first request will receive; actual routing evidence remains the gateway receipt, and the notice is never consent. Respect native hook trust; a newly added or changed startup hook needs the user's review in `/hooks`. `gateway-start` alone starts a service and does not connect ordinary Codex defaults.
 
 `connection-status` reports `readyForNewThreads` and the future-default integration state. Actual routing for the current thread requires its successful gateway receipt and route state. Account identity, quota UI, a healthy gateway, config-file contents or a successful write are not current-route evidence. Keep these scopes separate in reports.
 

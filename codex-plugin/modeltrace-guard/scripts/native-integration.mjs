@@ -254,10 +254,54 @@ async function installDefaults(directory, env, connect, reconnect) {
   });
 }
 
-export async function nativeIntegrationStatus(directory, env = process.env, { connect = openAppServer } = {}) {
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
+const routeLabel = value => (typeof value === 'string' && value.trim() && value.length <= 80 && !/[\x00-\x1f\x7f]/.test(value) ? value.trim() : null);
+// Where requests of `providerId` (default: the effective model_provider) go,
+// reduced to a coarse kind. No URL, path, header or token leaves this module:
+// the gateway capability lives in its URL path.
+export function classifyRoute(config, providerId, ownedBaseURL) {
+  const id = routeLabel(providerId) || routeLabel(config?.model_provider) || 'openai';
+  const provider = plainObject(config?.model_providers) && plainObject(config.model_providers[id]) ? config.model_providers[id] : null;
+  const label = routeLabel(provider?.name) || id;
+  const url = id === 'openai' ? config?.openai_base_url : provider?.base_url;
+  if (id === 'openai' && (url == null || url === '')) return { kind: 'openai' };
+  if (id === 'openai' && typeof ownedBaseURL === 'string' && url === ownedBaseURL) return { kind: 'gateway' };
+  if (typeof url !== 'string') return { kind: 'unknown', provider: label };
+  try {
+    const parsed = new URL(url);
+    if (LOOPBACK.has(parsed.hostname)) return { kind: 'loopback', port: Number(parsed.port) || null, provider: label };
+    return { kind: 'custom', provider: label };
+  } catch { return { kind: 'unknown', provider: label }; }
+}
+
+// Startup notice only: describe the effective route of new threads and, for a
+// resumed thread, the provider it was created with. Failures are omitted.
+async function describeRoutes(client, view, record, threadId) {
+  const owned = record.owned.openai_base_url, config = view.response.config;
+  const result = { effectiveRoute: classifyRoute(config, null, owned) };
+  if (UUID.test(threadId || '')) {
+    try {
+      const { thread } = await client.request('thread/read', { threadId, includeTurns: false });
+      if (thread?.id === threadId && routeLabel(thread.modelProvider)) result.threadRoute = classifyRoute(config, thread.modelProvider, owned);
+    } catch {}
+  }
+  if ((result.threadRoute || result.effectiveRoute).kind === 'openai') {
+    try {
+      const { account } = await client.request('account/read', { refreshToken: false });
+      result.accountType = account?.type === 'chatgpt' ? 'chatgpt' : account?.type ? 'other' : null;
+    } catch { result.accountType = null; }
+  }
+  return result;
+}
+
+export async function nativeIntegrationStatus(directory, env = process.env, { connect = openAppServer, describe = false, threadId = null } = {}) {
   const record = await loadRecord(directory);
   if (!record || record.phase === 'removed') return publicResult(record);
-  return usingClient(env, connect, async client => publicResult(record, await readView(client, record.profileFile), await currentGateway(directory)));
+  return usingClient(env, connect, async client => {
+    const view = await readView(client, record.profileFile);
+    const result = publicResult(record, view, await currentGateway(directory));
+    return describe ? { ...result, ...await describeRoutes(client, view, record, threadId) } : result;
+  });
 }
 
 export async function removeNativeIntegration(directory, env = process.env, { connect = openAppServer } = {}) {

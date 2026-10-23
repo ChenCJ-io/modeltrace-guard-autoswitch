@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dataDirectory } from './state.mjs';
 import { nativeIntegrationStatus } from './native-integration.mjs';
+import { startupNotice } from './session-notice.mjs';
 // Keep this import lazy: `autoswitch connect` imports the trust check while its
 // CLI top-level await is active. A static import back would deadlock that CLI.
 const startGateway = async directory => (await import('./autoswitch.mjs')).startGateway(directory);
@@ -30,19 +31,29 @@ export async function requireTrustedStartupHook(client, cwd) {
 
 // A synchronous startup hook supplies transport readiness before the first
 // request. It never enables monitoring or rewrites user/CCSwitch preferences.
+// When a conversation opens it also tells the user which route it uses, so a
+// personal subscription or an unmonitored route is never used unnoticed.
 export async function ensureGatewayForStartup(event, directory, env = process.env, {
-  integrationStatus = nativeIntegrationStatus, start = startGateway,
+  integrationStatus = nativeIntegrationStatus, start = startGateway, notice = startupNotice,
 } = {}) {
   if (env.MODELTRACE_PROBE_PROCESS === '1' || event?.hook_event_name !== 'SessionStart'
     || event.agent_id || event.parent_session_id) return {};
+  // Compaction keeps the conversation's route; announce only when one opens.
+  const announce = event.source !== 'compact';
   try {
-    const connection = await integrationStatus(directory, env);
+    const connection = await integrationStatus(directory, env, announce
+      ? { describe: true, threadId: event.source === 'resume' ? event.session_id : null } : {});
     if (['not_installed', 'removed'].includes(connection.phase)) return {};
-    if (!connection.readyForNewThreads) return { systemMessage:
-      'ModelTrace: ordinary Codex gateway setup is no longer current. Check connection-status before enabling; existing provider choices were not changed and monitoring was not enabled.' };
+    const route = connection.threadRoute || connection.effectiveRoute;
+    if (!connection.readyForNewThreads) {
+      const message = announce && route && route.kind !== 'gateway' ? await notice(event, directory, connection, env) : null;
+      return { systemMessage: message
+        || 'ModelTrace: ordinary Codex gateway setup is no longer current. Check connection-status before enabling; existing provider choices were not changed and monitoring was not enabled.' };
+    }
     const gateway = await start(directory);
     if (!gateway.running || gateway.readiness !== 'ready') throw new Error('Gateway is not ready');
-    return {};
+    const message = announce ? await notice(event, directory, connection, env) : null;
+    return message ? { systemMessage: message } : {};
   } catch (error) {
     // Ordinary Codex may already point at this gateway, so the model may be
     // unreachable. Tell the user directly how to restore their provider. Only

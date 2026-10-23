@@ -8,7 +8,7 @@ import { tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { atomicJSON, configPath, gatewayURL } from '../scripts/provider-config.mjs';
-import { installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from '../scripts/native-integration.mjs';
+import { classifyRoute, installNativeIntegration, nativeIntegrationStatus, removeNativeIntegration } from '../scripts/native-integration.mjs';
 
 const KEYS = ['model_provider', 'openai_base_url'];
 const clone = value => structuredClone(value);
@@ -442,4 +442,52 @@ test('reconnect handles recorded absence and a new gateway without losing the or
   const connections = f.model.connections.length;
   await assert.rejects(f.install({ reconnect: true }), error => error.code === 'NATIVE_INTEGRATION_RECONNECT_UNAVAILABLE');
   assert.equal(f.model.connections.length, connections);
+});
+
+test('route classification names only a coarse route kind, never a URL, path or token', () => {
+  const owned = `http://127.0.0.1:15722/${'c'.repeat(64)}/v1`;
+  const config = { model_provider: 'openai', openai_base_url: owned, model_providers: {
+    custom: { name: 'custom', base_url: 'http://127.0.0.1:15721/v1', experimental_bearer_token: 'secret-bearer' },
+    relay: { name: 'Relay A', base_url: 'https://relay.invalid/v1?key=secret-query' }, broken: { name: 'Broken', base_url: 'not a url' } } };
+  assert.deepEqual(classifyRoute(config, null, owned), { kind: 'gateway' });
+  assert.deepEqual(classifyRoute({ ...config, openai_base_url: undefined }, null, owned), { kind: 'openai' });
+  assert.deepEqual(classifyRoute({ model_provider: 'custom', model_providers: config.model_providers }, null, owned), { kind: 'loopback', port: 15721, provider: 'custom' });
+  assert.deepEqual(classifyRoute(config, 'relay', owned), { kind: 'custom', provider: 'Relay A' });
+  assert.deepEqual(classifyRoute(config, 'broken', owned), { kind: 'unknown', provider: 'Broken' });
+  assert.deepEqual(classifyRoute(config, 'oss', owned), { kind: 'unknown', provider: 'oss' });
+  // A stale gateway capability is still loopback to the gateway port, not the gateway.
+  assert.deepEqual(classifyRoute({ openai_base_url: `http://127.0.0.1:15722/${'d'.repeat(64)}/v1` }, null, owned), { kind: 'loopback', port: 15722, provider: 'openai' });
+  const encoded = JSON.stringify(['custom', 'relay', 'broken'].map(id => classifyRoute(config, id, owned)));
+  for (const secret of ['secret-bearer', 'secret-query', 'relay.invalid', '127.0.0.1', 'c'.repeat(64)]) assert.ok(!encoded.includes(secret));
+});
+
+test('startup description reads the effective route, a resumed thread provider and the login type without leaking values', async t => {
+  const f = await fixture(t);
+  await f.install();
+  f.model.user.model_providers = { custom: { name: 'custom', base_url: 'http://127.0.0.1:15721/v1', experimental_bearer_token: 'secret-bearer' } };
+  const thread = randomUUID(), requested = [];
+  const connect = async (...args) => {
+    const inner = await f.connect(...args);
+    return { close: inner.close, request: async (method, params) => {
+      requested.push(method);
+      if (method === 'thread/read') return { thread: { id: params.threadId, modelProvider: 'custom' } };
+      if (method === 'account/read') return { account: { type: 'chatgpt', email: 'private@example.invalid' } };
+      return inner.request(method, params);
+    } };
+  };
+  const plain = await nativeIntegrationStatus(f.directory, f.env, { connect });
+  assert.equal(plain.effectiveRoute, undefined);
+  assert.deepEqual(requested, ['config/read'], 'Ordinary status must not read threads or accounts');
+  const described = await nativeIntegrationStatus(f.directory, f.env, { connect, describe: true, threadId: thread });
+  assert.equal(described.readyForNewThreads, true);
+  assert.deepEqual(described.effectiveRoute, { kind: 'gateway' });
+  assert.deepEqual(described.threadRoute, { kind: 'loopback', port: 15721, provider: 'custom' });
+  assert.equal(described.accountType, undefined, 'Login type is only read for an Official route');
+  assertPublic(described, f);
+  assert.ok(!JSON.stringify(described).includes('secret-bearer'));
+  f.model.user.openai_base_url = undefined; delete f.model.user.openai_base_url;
+  const official = await nativeIntegrationStatus(f.directory, f.env, { connect, describe: true });
+  assert.deepEqual(official.effectiveRoute, { kind: 'openai' });
+  assert.equal(official.accountType, 'chatgpt');
+  assert.ok(!JSON.stringify(official).includes('private@example.invalid'));
 });

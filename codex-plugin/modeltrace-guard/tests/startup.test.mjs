@@ -73,3 +73,47 @@ test('the gateway requires a Node runtime with zstd request bodies and native pr
   for (const version of ['18.20.4', '20.19.0', '22.20.0', '23.11.0', '24.4.1']) assert.match(gatewayRuntimeProblem(version, zstd), /22\.21\+ or 24\.5\+/, version);
   assert.match(gatewayRuntimeProblem('24.11.1', {}), /zstd/);
 });
+
+test('opening a conversation shows its route notice; compaction stays quiet and reads no extra state', async () => {
+  const thread = '01a16277-104c-79e2-b928-933686fef68f';
+  for (const [source, threadId] of [['startup', null], ['resume', thread], ['clear', null], [undefined, null]]) {
+    const seen = [];
+    const output = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', session_id: thread, source }, '/fixture', {}, {
+      integrationStatus: async (directory, env, options) => { seen.push(options); return { phase: 'installed', readyForNewThreads: true, effectiveRoute: { kind: 'gateway' } }; },
+      start: async () => ({ running: true, readiness: 'ready' }),
+      notice: async (event, directory, connection) => { assert.equal(connection.effectiveRoute.kind, 'gateway'); return 'ModelTrace：本会话走「主渠道」'; },
+    });
+    assert.deepEqual(output, { systemMessage: 'ModelTrace：本会话走「主渠道」' }, String(source));
+    assert.deepEqual(seen, [{ describe: true, threadId }], String(source));
+  }
+  const seen = [];
+  const compact = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', session_id: thread, source: 'compact' }, '/fixture', {}, {
+    integrationStatus: async (directory, env, options) => { seen.push(options); return { phase: 'installed', readyForNewThreads: true }; },
+    start: async () => ({ running: true, readiness: 'ready' }), notice: async () => assert.fail('compaction keeps the route'),
+  });
+  assert.deepEqual(compact, {}); assert.deepEqual(seen, [{}]);
+  const silent = await ensureGatewayForStartup({ hook_event_name: 'SessionStart' }, '/fixture', {}, {
+    integrationStatus: async () => ({ phase: 'installed', readyForNewThreads: true }),
+    start: async () => ({ running: true, readiness: 'ready' }), notice: async () => null,
+  });
+  assert.deepEqual(silent, {});
+});
+
+test('a broken connection names the route a bypassing conversation actually uses, without starting the gateway', async () => {
+  const bypass = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', source: 'startup' }, '/fixture', {}, {
+    integrationStatus: async () => ({ phase: 'conflict', readyForNewThreads: false, effectiveRoute: { kind: 'openai' }, accountType: 'chatgpt' }),
+    start: async () => assert.fail('must not start'), notice: async () => 'ModelTrace：本会话没有经过 ModelTrace 网关，实际走 OpenAI 官方',
+  });
+  assert.deepEqual(bypass, { systemMessage: 'ModelTrace：本会话没有经过 ModelTrace 网关，实际走 OpenAI 官方' });
+  // Still routed to the gateway, but not owned as configured: keep the generic repair warning.
+  const overridden = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', source: 'startup' }, '/fixture', {}, {
+    integrationStatus: async () => ({ phase: 'overridden', readyForNewThreads: false, effectiveRoute: { kind: 'gateway' } }),
+    start: async () => assert.fail('must not start'), notice: async () => assert.fail('the gateway route is not a bypass'),
+  });
+  assert.match(overridden.systemMessage, /no longer current.*monitoring was not enabled/);
+  const undescribed = await ensureGatewayForStartup({ hook_event_name: 'SessionStart', source: 'startup' }, '/fixture', {}, {
+    integrationStatus: async () => ({ phase: 'conflict', readyForNewThreads: false, effectiveRoute: { kind: 'custom', provider: 'relay' } }),
+    start: async () => assert.fail('must not start'), notice: async () => null,
+  });
+  assert.match(undescribed.systemMessage, /no longer current/);
+});
