@@ -1,0 +1,29 @@
+{
+  "note": "配合 mock_relay.py 用：四个渠道都声称是 gpt-6.1-sol，实际给的模型写在 base_url 里。key_env 随便设一个值即可。",
+  "channels": [
+    {
+      "name": "真货",
+      "base_url": "http://127.0.0.1:18765/serve/gpt-6.1-sol/v1",
+      "model": "gpt-6.1-sol",
+      "key_env": "MOCK_KEY"
+    },
+    {
+      "name": "换成 gpt-5.6-luna",
+      "base_url": "http://127.0.0.1:18765/serve/gpt-5.6-luna/v1",
+      "model": "gpt-6.1-sol",
+      "key_env": "MOCK_KEY"
+    },
+    {
+      "name": "换成 gpt-5.5",
+      "base_url": "http://127.0.0.1:18765/serve/gpt-5.5/v1",
+      "model": "gpt-6.1-sol",
+      "key_env": "MOCK_KEY"
+    },
+    {
+      "name": "换成 gpt-6-astra",
+      "base_url": "http://127.0.0.1:18765/serve/gpt-6-astra/v1",
+      "model": "gpt-6.1-sol",
+      "key_env": "MOCK_KEY"
+    }
+  ]
+}

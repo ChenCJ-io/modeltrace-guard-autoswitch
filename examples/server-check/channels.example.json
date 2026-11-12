@@ -1,0 +1,24 @@
+{
+  "note": "复制成 channels.json 再改。密钥只写环境变量名（key_env），不要把密钥本身写进来。model 是请求时填的名字；库里的名字不一样时用 expect 指明。",
+  "channels": [
+    {
+      "name": "中转 A",
+      "base_url": "https://relay-a.example.com/v1",
+      "model": "gpt-6.1-sol",
+      "key_env": "RELAY_A_KEY"
+    },
+    {
+      "name": "中转 B",
+      "base_url": "https://relay-b.example.com/v1",
+      "model": "gpt-6.1-sol-max",
+      "expect": "gpt-6.1-sol",
+      "key_env": "RELAY_B_KEY"
+    },
+    {
+      "name": "中转 A 的 5.6",
+      "base_url": "https://relay-a.example.com/v1",
+      "model": "gpt-5.6-terra",
+      "key_env": "RELAY_A_KEY"
+    }
+  ]
+}
